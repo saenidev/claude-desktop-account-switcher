@@ -283,20 +283,28 @@ cmd_resume() {
   for id in $(jq -r '.resume[].sessionId' "$HANDOFF"); do send_link "$app" "claude://resume?session=$id" && log "resume: reopened session $id"; sleep 3; done
 }
 
-# ---- Keeping one window per profile folder -------------------------------------------
+# ---- Keeping each account in its own app, one window per profile folder ----------------
 #
-# The app has no single-instance lock, and Dock, Spotlight and Finder launches never
-# pass --user-data-dir, so they always open the default folder. So the account in the
-# default folder uses the real app, and every other account uses an untouched copy
-# (still Anthropic-signed: no Keychain prompts, nothing re-signed) kept where Spotlight
-# doesn't look. The guard catches whatever still slips through.
+# The app has no single-instance lock, and Dock, Spotlight and Finder launches never pass
+# --user-data-dir, so any app opened by hand opens the default folder. An account can have
+# its own app in accounts.json: an untouched copy of the real app (still Anthropic-signed,
+# so no Keychain prompts, and it updates itself) with a Finder custom icon ("icon"). The
+# sync job keeps each copy on the real app's version and its icon on; the guard closes any
+# window opened in the wrong app or on a folder that already has one.
 
-ICON="$DIR/blue.icns"
 SETICON="$DIR/seticon.swift"
 
 app_version() { plutil -extract CFBundleShortVersionString raw "$1/Contents/Info.plist" 2>/dev/null; }
 
-# Bring an account's app copy up to the real app's version before it's launched.
+# The custom icon for an app copy (accounts.json "icon"), if any.
+icon_for_app() {
+  local i; i=$(jq -r --arg a "$1" --arg h "$HOME" '.accounts[] | select(.app != null) | select((.app | sub("^~"; $h)) == $a) | .icon // empty' "$ACCOUNTS" | head -1)
+  [ -n "$i" ] && expand "$i"
+}
+# Every app copy named in accounts.json.
+copies() { jq -r '.accounts[].app // empty' "$ACCOUNTS" | while read -r a; do expand "$a"; echo; done; }
+
+# Put an app copy on the real app's version (only while it isn't running).
 refresh_copy() {
   local app="$1"
   [ "$app" = "$APP" ] && return 0
@@ -305,18 +313,28 @@ refresh_copy() {
   [ "$want" = "$have" ] && return 0
   local tmp="$app.new.$$"
   ditto "$APP" "$tmp" || { log "refresh: copying $APP failed"; return 1; }
-  # The real app carries the blue Finder icon; copies keep the stock one.
-  swift "$SETICON" - "$tmp" >/dev/null 2>&1
+  set_icon "$tmp"
   [ -d "$app" ] && mv "$app" "$HOME/.Trash/$(basename "$app" .app) $have $(date +%Y%m%d-%H%M%S).app"
   mv "$tmp" "$app"
   log "refresh: $app ${have:-missing} -> $want"
 }
 
-# Put the blue Finder icon back on the real app (an update replaces the bundle and drops it).
-cmd_reicon() {
-  [ -f "$ICON" ] || die "reicon: no $ICON"
-  if [ -e "$APP/Icon"$'\r' ]; then return 0; fi
-  swift "$SETICON" "$ICON" "$APP" >/dev/null 2>&1 && log "reicon: blue icon put back on $APP ($(app_version "$APP"))" || log "reicon: could not set the icon on $APP"
+# Give a copy its account's icon. The copy updates itself, and an update drops the icon.
+set_icon() {
+  local app="$1" icon; icon=$(icon_for_app "${2:-$1}")
+  [ -n "$icon" ] && [ -f "$icon" ] || return 0
+  [ -e "$app/Icon"$'\r' ] && return 0
+  swift "$SETICON" "$icon" "$app" >/dev/null 2>&1 || log "icon: could not set $icon on $app"
+}
+
+# What the sync agent runs: every copy on the real app's version, with its icon.
+cmd_sync() {
+  local app
+  while read -r app; do
+    [ -n "$app" ] || continue
+    refresh_copy "$app"
+    [ -d "$app" ] && [ ! -e "$app/Icon"$'\r' ] && { set_icon "$app"; log "sync: icon put back on $app ($(app_version "$app"))"; }
+  done < <(copies)
 }
 
 # Profile folder of a main process, from its command line.
@@ -325,11 +343,27 @@ folder_of() {
   if [[ "$args" == *"--user-data-dir="* ]]; then printf '%s' "${args#*--user-data-dir=}"; else printf '%s' "$DEFAULT_DIR"; fi
 }
 started_at() { date -j -f "%a %b %d %T %Y" "$(ps -o lstart= -p "$1" | sed 's/  */ /g; s/^ //; s/ $//')" +%s 2>/dev/null; }
+quit_pid() { kill -TERM "$1"; wait_gone "$1" 20 || kill -KILL "$1"; }
 
-# If two windows share a profile folder, quit the newer one. The older one has the
-# folder's sessions and sign-in in use; the newcomer has had no time to do anything.
+# Two rules, checked every few seconds:
+#  1. A window running the wrong app for its folder (the orange app opened by hand lands
+#     on saenidev's folder) is closed, and the folder is opened in its own app instead.
+#  2. If two windows share a folder, the newer one is closed: the older one has the
+#     folder's sessions and sign-in in use, and the newcomer has had no time to do anything.
 cmd_guard() {
-  local pid rows=""
+  local pid
+  for pid in $(all_instances); do
+    local f app want; f=$(folder_of "$pid"); app=$(app_of_pid "$pid"); want=$(app_for_dir "$f")
+    jq -e --arg d "$f" --arg h "$HOME" '.accounts[] | select((.userDataDir | sub("^~"; $h)) == $d)' "$ACCOUNTS" >/dev/null || continue
+    [ "$app" = "$want" ] && continue
+    log "guard: $f opened in $app (pid $pid), but it belongs in $want; moving it"
+    quit_pid "$pid"
+    if [ -z "$(instance_pid "$f")" ]; then
+      launch_app "$f"
+      notify "$(basename "$want" .app) opened instead: that account lives there."
+    fi
+  done
+  local rows=""
   for pid in $(all_instances); do rows+="$(started_at "$pid") $pid $(folder_of "$pid")"$'\n'; done
   [ -n "$rows" ] || return 0
   local dup; dup=$(printf '%s' "$rows" | sort -n | awk '{f=$0; sub(/^[0-9]+ [0-9]+ /,"",f); if (seen[f]++) print $2}')
@@ -337,12 +371,12 @@ cmd_guard() {
     local f; f=$(folder_of "$pid")
     log "guard: a second window (pid $pid, $(app_of_pid "$pid")) opened on $f; quitting it"
     notify "A second Claude window opened on $(basename "$f"), the same account as one already open. It was closed."
-    kill -TERM "$pid"; wait_gone "$pid" 20 || kill -KILL "$pid"
+    quit_pid "$pid"
   done
 }
 
-# Two standing launchd agents: the guard every 15 seconds, and reicon whenever the real
-# app's Info.plist changes (an update) and at login.
+# Two standing launchd agents: the guard every 5 seconds, and sync whenever an app's
+# Info.plist changes (an update), every 5 minutes, and at login.
 cmd_install_agents() {
   local uid; uid=$(id -u)
   local agents="$HOME/Library/LaunchAgents"; mkdir -p "$agents"
@@ -363,8 +397,12 @@ EOF
     launchctl bootout "gui/$uid/$label" 2>/dev/null
     launchctl bootstrap "gui/$uid" "$plist" && echo "loaded $label"
   }
-  write_agent "$LABEL.guard" guard "  <key>StartInterval</key><integer>15</integer>"
-  write_agent "$LABEL.reicon" reicon "  <key>WatchPaths</key><array><string>$APP/Contents/Info.plist</string></array>"
+  write_agent "$LABEL.guard" guard "  <key>StartInterval</key><integer>5</integer>"
+  local watch="<string>$APP/Contents/Info.plist</string>" c
+  while read -r c; do [ -n "$c" ] && watch+="<string>$c/Contents/Info.plist</string>"; done < <(copies)
+  launchctl bootout "gui/$uid/$LABEL.reicon" 2>/dev/null; rm -f "$agents/$LABEL.reicon.plist"
+  write_agent "$LABEL.sync" sync "  <key>WatchPaths</key><array>$watch</array>
+  <key>StartInterval</key><integer>300</integer>"
 }
 
 case "${1:-}" in
@@ -375,7 +413,7 @@ case "${1:-}" in
   status) cmd_status ;;
   relaunch) shift; cmd_relaunch "$@" ;;
   relaunch-later) shift; cmd_relaunch_later "$@" ;;
-  reicon) cmd_reicon ;;
+  sync)   cmd_sync ;;
   guard)  cmd_guard ;;
   install-agents) cmd_install_agents ;;
   *) echo "usage: relay.sh launch|switch|plan --from <accountUuid> [--resets-at <iso>] | status | relaunch[-later] <name> [--resume <id>] | resume" >&2; exit 2 ;;

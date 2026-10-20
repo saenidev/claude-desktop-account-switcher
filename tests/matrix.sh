@@ -3,8 +3,8 @@
 # from outside (process table, open files, LaunchServices) against one rule: no profile folder
 # ever has more than one window, and each account opens in its own app.
 #
-#   tests/matrix.sh start   run it under launchd (it closes every Claude window, including the
-#                           one you started it from, and reopens saenidev and --resume <id> at the end)
+#   tests/matrix.sh start [--resume <id>]   run it under launchd (it closes every Claude window, including the
+#                           one you started it from, and reopens blue and the session <id> at the end)
 #   tests/matrix.sh run [--resume <sessionId>]   what launchd runs
 #
 # Results: tests/results/<time>/results.md plus the raw evidence next to it.
@@ -14,8 +14,7 @@ export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RELAY="$HOME/.claude/account-relay/relay.sh"
 REAL=/Applications/Claude.app
-COPY="$HOME/.claude/account-relay/apps/Claude second.app"
-OLD_BLUE="$HOME/Applications/Claude Blue.app"
+BLUE="$HOME/Applications/Claude Blue.app"
 SAEN="$HOME/Library/Application Support/Claude"
 JEY="$HOME/Library/Application Support/Claude-second"
 LSR=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
@@ -63,9 +62,9 @@ mains() {
     echo "$pid|$app|$folder"
   done < <(ps -axo pid=,args=)
 }
-short() { # app@folder as R/C/B/? @ S/J/?
+short() { # app@folder as R/B/? @ S/J/?
   local app="$1" folder="$2" a="?" f="?"
-  case "$app" in "$REAL") a=R ;; "$COPY") a=C ;; "$OLD_BLUE") a=B ;; esac
+  case "$app" in "$REAL") a=R ;; "$BLUE") a=B ;; esac
   case "$folder" in "$SAEN") f=S ;; "$JEY") f=J ;; esac
   printf '%s@%s' "$a" "$f"
 }
@@ -92,14 +91,15 @@ quit_all() {
 }
 setup() {
   quit_all
-  case "$1" in saen|both) open -n -a "$REAL" ;; esac
-  case "$1" in jey|both) open -n -a "$COPY" --args "--user-data-dir=$JEY" ;; esac
+  case "$1" in saen|both) open -n -a "$BLUE" ;; esac
+  case "$1" in jey|both) open -n -a "$REAL" --args "--user-data-dir=$JEY" ;; esac
   [ "$1" = none ] || sleep 12
 }
 act() {
   case "$1" in
-    hand-real) open -a "$REAL" ;;                      # Dock, Spotlight and Finder go through this same LaunchServices call
-    hand-copy) open -a "$COPY" ;;                      # the hidden copy, if it were ever pinned to the Dock
+    # Dock, Spotlight and Finder all open an app through this same LaunchServices call.
+    hand-blue)   open -a "$BLUE" ;;
+    hand-orange) open -a "$REAL" ;;
     # A bare link (browser sign-in callbacks route the same way). The session id is made up, so
     # the link only tests where macOS delivers it and imports nothing.
     link)      open "claude://resume?session=00000000-0000-4000-8000-000000000000" ;;
@@ -107,20 +107,19 @@ act() {
   esac
 }
 want() { # desired windows after <state> + <entry>
+  # saenidev always ends up in blue (B@S), second in orange (R@J). The orange app opened by
+  # hand, or a link that starts it, lands on saenidev's folder; the guard moves that to blue.
   case "$1:$2" in
-    none:hand-real|saen:hand-real|none:link|saen:link) echo "R@S" ;;
-    jey:hand-real|both:hand-real|jey:link|both:link) echo "C@J R@S" ;;
-    none:hand-copy) echo "C@S" ;;
-    saen:hand-copy) echo "R@S" ;;
-    jey:hand-copy|jey:relay-jey|none:relay-jey) echo "C@J" ;;
-    both:hand-copy|saen:relay-jey|both:relay-jey) echo "C@J R@S" ;;
+    jey:hand-orange|jey:link|jey:relay-jey|none:relay-jey) echo "R@J" ;;
+    saen:relay-jey) echo "B@S R@J" ;;
+    none:*|saen:*) echo "B@S" ;;
+    *) echo "B@S R@J" ;;
   esac
 }
 
 note "start; windows: $(summary)"
 { echo "# Window matrix, $(date '+%Y-%m-%d %H:%M')"; echo
-  echo "Real app $(plutil -extract CFBundleShortVersionString raw "$REAL/Contents/Info.plist"), second copy $(plutil -extract CFBundleShortVersionString raw "$COPY/Contents/Info.plist")."
-  echo "R = /Applications/Claude.app, C = hidden second copy; S = saenidev folder, J = second folder. Checked 20 s after each action (the guard runs every 15 s)."; echo
+  echo "R = /Applications/Claude.app (orange, the original), B = ~/Applications/Claude Blue.app (untouched copy, blue icon); S = saenidev folder, J = second folder. Checked 25 s after each action (the guard runs every 5 s)."; echo
   echo "| start | entry | want | got | most windows on one folder | Cookies holders S/J | Keychain prompt | result |"
   echo "|---|---|---|---|---|---|---|---|"; } > "$RES"
 
@@ -128,15 +127,17 @@ log stream --style compact --predicate 'process == "lsd" OR subsystem == "com.ap
 LOGPID=$!
 
 quit_all
-# Retire the re-signed blue copy: the real app now carries the blue icon.
-if [ -d "$OLD_BLUE" ]; then "$LSR" -u "$OLD_BLUE"; mv "$OLD_BLUE" "$HOME/.Trash/" && note "retired $OLD_BLUE"; fi
+# The blue copy may still be the old re-signed build; sync replaces it with an untouched copy.
+bash "$RELAY" sync
+note "orange $(plutil -extract CFBundleShortVersionString raw "$REAL/Contents/Info.plist"), blue $(plutil -extract CFBundleShortVersionString raw "$BLUE/Contents/Info.plist")"
+codesign -dv "$BLUE" 2>&1 | grep -E 'TeamIdentifier' > "$OUT/blue-signature.txt"
 "$LSR" -dump 2>/dev/null | awk '/^-{20,}/{if(b ~ /identifier: +com\.anthropic\.claudefordesktop\n/) print b; b=""; next}{b=b $0 "\n"}' | grep -E '^(path|version|reg date|claimed schemes):' > "$OUT/lsregister.txt"
 
 pass=0; fail=0
-for entry in hand-real hand-copy link relay-jey; do
+for entry in hand-blue hand-orange link relay-jey; do
   for state in none saen jey both; do
     setup "$state"; note "cell $state x $entry; before: $(summary)"
-    act "$entry"; sleep 20
+    act "$entry"; sleep 25
     got=$(summary); w=$(want "$state" "$entry")
     most=$(mains | cut -d'|' -f3 | sort | uniq -c | awk 'BEGIN{m=0}{if($1>m)m=$1}END{print m}')
     cs=$(cookie_owners "$SAEN"); cj=$(cookie_owners "$JEY")
@@ -148,30 +149,31 @@ for entry in hand-real hand-copy link relay-jey; do
   done
 done
 
-# Fault: an app update. The second copy falls behind, and the real app loses its custom icon.
+# Fault: an app update. The blue copy falls behind the orange app, and an update drops its icon.
 quit_all
-plutil -replace CFBundleShortVersionString -string 0.0.1 "$COPY/Contents/Info.plist"
-bash "$RELAY" relaunch second; sleep 5
-cv=$(plutil -extract CFBundleShortVersionString raw "$COPY/Contents/Info.plist"); rv=$(plutil -extract CFBundleShortVersionString raw "$REAL/Contents/Info.plist")
-codesign --verify "$COPY" 2>/dev/null && csig=valid || csig=INVALID
-[ "$cv" = "$rv" ] && [ $csig = valid ] && [ "$(summary)" = "C@J" ] && u1=pass || u1=FAIL
-rm -f "$REAL/Icon"$'\r'; touch "$REAL/Contents/Info.plist"; sleep 15
-[ -e "$REAL/Icon"$'\r' ] && codesign --verify "$REAL" 2>/dev/null && u2=pass || u2=FAIL
+plutil -replace CFBundleShortVersionString -string 0.0.1 "$BLUE/Contents/Info.plist"
+bash "$RELAY" relaunch saenidev; sleep 5
+bv=$(plutil -extract CFBundleShortVersionString raw "$BLUE/Contents/Info.plist"); rv=$(plutil -extract CFBundleShortVersionString raw "$REAL/Contents/Info.plist")
+codesign --verify "$BLUE" 2>/dev/null && bsig=valid || bsig=INVALID
+[ "$bv" = "$rv" ] && [ $bsig = valid ] && [ -e "$BLUE/Icon"$'\r' ] && [ "$(summary)" = "B@S" ] && u1=pass || u1=FAIL
+w1=$(summary); quit_all
+rm -f "$BLUE/Icon"$'\r'; touch "$BLUE/Contents/Info.plist"; sleep 15
+[ -e "$BLUE/Icon"$'\r' ] && codesign --verify "$BLUE" 2>/dev/null && u2=pass || u2=FAIL
 pgrep -x SecurityAgent >/dev/null && kc=YES || kc=no
 { echo; echo "## App update"; echo
-  echo "- second copy behind (version set to 0.0.1), then the relay opens second: copy now $cv (real $rv), signature $csig, windows $(summary): **$u1**"
-  echo "- real app loses its icon and its Info.plist changes: icon back and signature valid: **$u2**"
+  echo "- blue copy behind (version set to 0.0.1), then the relay opens saenidev: blue now $bv (orange $rv), signature $bsig, windows $w1: **$u1**"
+  echo "- blue copy loses its icon and its Info.plist changes: icon back and signature valid: **$u2**"
   echo "- Keychain prompt during the matrix: $kc"; } >> "$RES"
 [ $u1 = pass ] && pass=$((pass+1)) || fail=$((fail+1)); [ $u2 = pass ] && pass=$((pass+1)) || fail=$((fail+1))
 
 kill $LOGPID 2>/dev/null
 grep -iE 'claude' "$OUT/launchservices.log" > "$OUT/launchservices-claude.log"
 echo >> "$RES"; echo "**$pass passed, $fail failed.**" >> "$RES"
-grep -E 'guard:|refresh:|reicon:' "$HOME/.claude/account-relay/relay.log" | tail -20 > "$OUT/relay-log-excerpt.txt"
+grep -E 'guard:|refresh:|sync:|icon:' "$HOME/.claude/account-relay/relay.log" | tail -30 > "$OUT/relay-log-excerpt.txt"
 
-# Back to normal: saenidev in the real app, and the session that started this reopened.
+# Back to normal: saenidev in blue, and the session that started this reopened.
 quit_all
-open -a "$REAL"; sleep 15
-[ -n "$SESSION" ] && open -a "$REAL" "claude://resume?session=$SESSION"
+open -a "$BLUE"; sleep 15
+[ -n "$SESSION" ] && open -a "$BLUE" "claude://resume?session=$SESSION"
 osascript -e "display notification \"$pass passed, $fail failed\" with title \"Claude window matrix\"" >/dev/null 2>&1
 note "done: $pass passed, $fail failed"
