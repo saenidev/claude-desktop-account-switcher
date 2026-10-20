@@ -208,74 +208,6 @@ cmd_relaunch() {
   fi
 }
 
-cmd_switch() {
-  parse_args "$@"
-  [ -n "$FROM" ] || die "switch needs --from"
-
-  # One switch at a time, however many sessions hit the limit together.
-  if ! mkdir "$LOCK" 2>/dev/null; then
-    if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then rmdir "$LOCK"; mkdir "$LOCK" || exit 0
-    else log "switch: another switch holds the lock; nothing to do"; exit 0; fi
-  fi
-  trap 'rmdir "$LOCK" 2>/dev/null' EXIT
-
-  # A second trigger from the account we already left is a no-op.
-  local last; last=$(jq -r '.switches[-1] // empty | select(.from != null) | "\(.from) \(.at)"' "$STATE")
-  if [ -n "$last" ] && [ "${last%% *}" = "$FROM" ] && [ $(( $(date -u +%s) - ${last##* } )) -lt 300 ]; then
-    log "switch: already left $FROM in the last 5 minutes; nothing to do"; exit 0
-  fi
-
-  local cool="${RESETS_AT:-$(date -u -v+1H +%Y-%m-%dT%H:%M:%SZ)}"
-  jq_write "$STATE" --arg u "$FROM" --arg t "$cool" '.cooldowns[$u] = $t'
-  log "switch: $(account_field "$FROM" name) is out; cooling down until $cool"
-
-  local target; target=$(pick_target "$FROM")
-  [ -n "$target" ] || die "every account is out of usage; staying put"
-
-  local from_dir to_dir from_pid
-  from_dir=$(expand "$(account_field "$FROM" userDataDir)")
-  to_dir=$(expand "$(account_field "$target" userDataDir)")
-  [ "$(folder_account "$to_dir")" = "$target" ] || die "$(account_field "$target" name)'s folder is not signed in as that account; sign in there once"
-
-  from_pid=$(instance_pid "$from_dir")
-  log "switch: $(account_field "$FROM" name) (pid ${from_pid:-none}) -> $(account_field "$target" name) in $to_dir"
-
-  if [ -n "$from_pid" ]; then
-    kill -TERM "$from_pid"
-    wait_gone "$from_pid" 30 || { log "switch: app still up after 30 s; SIGKILL"; kill -KILL "$from_pid"; wait_gone "$from_pid" 5; }
-  fi
-
-  if [ -n "$(instance_pid "$to_dir")" ]; then
-    log "switch: $(account_field "$target" name)'s app is already open; using it"
-  else
-    launch_app "$to_dir"
-  fi
-  if ! wait_up "$to_dir" 60; then
-    log "switch: $to_dir did not start; going back to $from_dir"
-    launch_app "$from_dir"
-    die "could not open $(account_field "$target" name)'s app; went back"
-  fi
-  jq_write "$STATE" --arg f "$FROM" --arg t "$target" --argjson at "$(date -u +%s)" '.switches += [{from: $f, to: $t, at: $at}] | .switches |= .[-20:]'
-
-  # Give the app time to load its web login before handing it links.
-  sleep 12
-  # Links go to the target's app, but macOS picks among several instances of
-  # that app, so only send them when the target is its app's one instance.
-  local to_app; to_app=$(app_for_dir "$to_dir")
-  if [ "$(instances_of "$to_app" | wc -l | tr -d ' ')" -gt 1 ]; then
-    log "switch: another window of $to_app is running; not sending resume links (they could land in the wrong one)"
-    notify "Switched to $(account_field "$target" name), but another Claude window is open, so sessions were not reopened. Close it and run: relay.sh resume"
-    log "switch: done (resumes held)"; return
-  fi
-  local ids; ids=$(jq -r '.resume[].sessionId' "$HANDOFF")
-  for id in $ids; do
-    send_link "$to_app" "claude://resume?session=$id" && log "switch: reopened session $id"
-    sleep 3
-  done
-  notify "Switched to $(account_field "$target" name). Reopened $(echo "$ids" | grep -c . | tr -d ' ') session(s)."
-  log "switch: done"
-}
-
 cmd_resume() {
   local pids; pids=$(all_instances)
   [ "$(echo "$pids" | grep -c .)" -eq 1 ] || { echo "run this with exactly one Claude window open" >&2; exit 1; }
@@ -412,12 +344,120 @@ EOF
   <key>StartInterval</key><integer>300</integer>"
 }
 
+# ---- Switching in place --------------------------------------------------------------
+#
+# The app's account is its claude.ai sign-in: the Cookies file in its profile folder
+# (encrypted with the app's own Keychain key). Everything else in the folder (settings,
+# extensions, session lists) stays put. A switch quits Claude, parks the current account's
+# Cookies in park/<accountUuid>/, moves the target's in, and opens the same app again. The
+# app sees the new sign-in and mints that account's Code tokens itself. Each sign-in is
+# moved, never copied, so only one copy of it is ever in use.
+
+PARK="$DIR/park"
+
+# Every Claude window on the default folder, whatever app it runs.
+default_pids() { local pid; for pid in $(all_instances); do [ "$(folder_of "$pid")" = "$DEFAULT_DIR" ] && echo "$pid"; done; }
+
+quit_default() {
+  local pids pid; pids=$(default_pids)
+  [ -n "$pids" ] || return 0
+  kill -TERM $pids 2>/dev/null
+  for pid in $pids; do wait_gone "$pid" 30 || { kill -KILL "$pid"; wait_gone "$pid" 5; }; done
+}
+
+# Move the sign-in files: park the folder's current ones under $1, bring $2's in.
+move_signin() {
+  local out="$1" in="$2" f
+  mkdir -p "$PARK/$out"
+  for f in Cookies Cookies-journal; do [ -e "$DEFAULT_DIR/$f" ] && mv "$DEFAULT_DIR/$f" "$PARK/$out/$f"; done
+  for f in Cookies Cookies-journal; do [ -e "$PARK/$in/$f" ] && mv "$PARK/$in/$f" "$DEFAULT_DIR/$f"; done
+  return 0
+}
+
+# Switch the one Claude window to account $1 (a uuid). Returns non-zero, with the
+# previous account restored, if the new sign-in doesn't come up.
+swap_to() {
+  local target="$1" cur; cur=$(folder_account "$DEFAULT_DIR")
+  [ "$cur" = "$target" ] && { log "swap: already on $(account_field "$target" name)"; return 0; }
+  [ -f "$PARK/$target/Cookies" ] || { log "swap: no parked sign-in for $(account_field "$target" name)"; return 1; }
+  quit_default
+  move_signin "$cur" "$target"
+  open -a "$APP"
+  local n=0; while [ "$(folder_account "$DEFAULT_DIR")" != "$target" ] && [ $n -lt 45 ]; do sleep 1; n=$((n+1)); done
+  if [ "$(folder_account "$DEFAULT_DIR")" = "$target" ]; then
+    log "swap: $(account_field "$cur" name) -> $(account_field "$target" name)"
+    return 0
+  fi
+  log "swap: $(account_field "$target" name)'s sign-in did not come up; going back to $(account_field "$cur" name)"
+  quit_default
+  move_signin "$target" "$cur"
+  open -a "$APP"
+  return 1
+}
+
+# Reopen the handed-off sessions in the (one) Claude window.
+reopen_handoff() {
+  local ids id; ids=$(jq -r '.resume[].sessionId' "$HANDOFF")
+  for id in $ids; do send_link "$APP" "claude://resume?session=$id" && log "switch: reopened session $id"; sleep 3; done
+  echo "$ids" | grep -c .
+}
+
+cmd_switch() {
+  parse_args "$@"
+  [ -n "$FROM" ] || die "switch needs --from"
+
+  # One switch at a time, however many sessions hit the limit together.
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then rmdir "$LOCK"; mkdir "$LOCK" || exit 0
+    else log "switch: another switch holds the lock; nothing to do"; exit 0; fi
+  fi
+  trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+  # A second trigger from the account we already left is a no-op.
+  local last; last=$(jq -r '.switches[-1] // empty | select(.from != null) | "\(.from) \(.at)"' "$STATE")
+  if [ -n "$last" ] && [ "${last%% *}" = "$FROM" ] && [ $(( $(date -u +%s) - ${last##* } )) -lt 300 ]; then
+    log "switch: already left $FROM in the last 5 minutes; nothing to do"; exit 0
+  fi
+
+  local until="${RESETS_AT:-$(date -u -v+5H +%FT%TZ)}"
+  jq_write "$STATE" --arg a "$FROM" --arg u "$until" '.cooldowns[$a] = $u'
+  log "switch: $(account_field "$FROM" name) is out; cooling down until $until"
+
+  local target; target=$(pick_target "$FROM")
+  if [ -z "$target" ]; then
+    notify "$(account_field "$FROM" name) is out of usage, and every other account is too."
+    die "switch: no account to switch to"
+  fi
+  swap_to "$target" || die "could not switch to $(account_field "$target" name); stayed on $(account_field "$FROM" name)"
+  jq_write "$STATE" --arg f "$FROM" --arg t "$target" --argjson at "$(date -u +%s)" '.switches += [{from: $f, to: $t, at: $at}] | .switches |= .[-20:]'
+  sleep 12   # let the app load before handing it links
+  local n; n=$(reopen_handoff)
+  notify "Switched to $(account_field "$target" name). Reopened $n session(s)."
+  log "switch: done"
+}
+
+# By hand: relay.sh swap <name> [--resume <sessionId>]. Run under launchd by swap-later.
+cmd_swap() {
+  local id; id=$(account_by_name "${1:-}"); [ -n "$id" ] || die "swap: no account named ${1:-}"
+  local session=""; [ "${2:-}" = "--resume" ] && session="${3:-}"
+  sleep 10   # let the caller's turn finish before its window quits
+  swap_to "$id" || die "swap to ${1} failed; stayed put"
+  if [ -n "$session" ]; then
+    sleep 12
+    jq_write "$HANDOFF" --arg s "$session" --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: $s, cwd: "", reason: "swap", at: $at}]'
+    reopen_handoff >/dev/null
+  fi
+}
+cmd_swap_later() { [ -n "$(account_by_name "${1:-}")" ] || die "swap-later: no account named ${1:-}"; run_job swap "$@" && log "swap: $1 queued under launchd"; }
+
 case "${1:-}" in
   resume) cmd_resume ;;
   launch) shift; cmd_launch "$@" ;;
   switch) shift; cmd_switch "$@" ;;
   plan)   shift; cmd_plan "$@" ;;
   status) cmd_status ;;
+  swap)   shift; cmd_swap "$@" ;;
+  swap-later) shift; cmd_swap_later "$@" ;;
   relaunch) shift; cmd_relaunch "$@" ;;
   relaunch-later) shift; cmd_relaunch_later "$@" ;;
   sync)   cmd_sync ;;
