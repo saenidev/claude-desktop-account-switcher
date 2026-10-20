@@ -29,7 +29,7 @@ const REOPENED: Record<string, { text: string; toast: string }> = {
   swap: { text: `The desktop app was switched to another account by hand and reopened this session. ${CARRY_ON}`, toast: 'Switched account; carrying on.' },
 }
 
-type Handoff = { resume: { sessionId: string; cwd: string; reason: string; at: string }[] }
+type Handoff = { resume: { sessionId: string; cwd: string; reason: string; at: string }[]; closedAt?: string }
 type Busy = { sessionId: string; cwd: string; account: string; busy: boolean; at: number }
 
 async function paths($: Host) {
@@ -53,9 +53,13 @@ async function log($: Host, text: string) {
 }
 
 // Only Code tab sessions in the desktop app run on the app's login; a terminal
-// `claude` runs on the Keychain login, which this relay does not move.
+// `claude` runs on the Keychain login, which the app switch does not move. A `claude -p`
+// started from a Code tab session's shell inherits CLAUDE_CODE_ENTRYPOINT and the app's
+// CLAUDE_CODE_ACCOUNT_UUID, but also CLAUDECODE and CLAUDE_CODE_CHILD_SESSION, which Claude
+// Code sets only for the processes it starts; the app sets neither on its sessions.
 async function isDesktop($: Host) {
-  return (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) === 'claude-desktop'
+  if ((await $.env.get('CLAUDE_CODE_ENTRYPOINT')) !== 'claude-desktop') return false
+  return !(await $.env.get('CLAUDECODE')) && !(await $.env.get('CLAUDE_CODE_CHILD_SESSION'))
 }
 
 async function markBusy($: Host, sessionId: string, cwd: string, busy: boolean) {
@@ -83,19 +87,32 @@ async function relay($: Host, sessionId: string, cwd: string, reason: string, re
     if (b && b.busy && b.account === account && now - b.at < BUSY_FRESH_MS && !resume.has(b.sessionId))
       resume.set(b.sessionId, { sessionId: b.sessionId, cwd: b.cwd, reason: 'mid-turn when the account ran out', at: new Date(now).toISOString() })
   }
-  const handoff = await readJson<Handoff>($, p.handoff, { resume: [] })
-  for (const r of handoff.resume) if (!resume.has(r.sessionId)) resume.set(r.sessionId, r)
-  await $.fs.write(p.handoff, JSON.stringify({ resume: [...resume.values()] }, null, 2))
-
   const { armed } = await readJson($, p.config, { armed: false })
   if (!armed) {
-    await log($, `disarmed: would switch away from ${account} (${reason}); hand-off lists ${resume.size} session(s)`)
-    return `disarmed: hand-off written for ${resume.size} session(s); the app was not touched`
+    await log($, `disarmed: would switch away from ${account} (${reason}); would reopen ${resume.size} session(s)`)
+    return `disarmed: would reopen ${resume.size} session(s); the app was not touched`
   }
+  const handoff = await readJson<Handoff>($, p.handoff, { resume: [] })
+  for (const r of handoff.resume) if (!resume.has(r.sessionId)) resume.set(r.sessionId, r)
+  await $.fs.write(p.handoff, JSON.stringify({ ...handoff, resume: [...resume.values()] }, null, 2))
+
   const argv = ['/bin/bash', p.relay, 'launch', '--from', account, ...(resetsAt ? ['--resets-at', isoZ(resetsAt)] : [])]
   const ran = await $.process.run(argv, { timeoutMs: 15_000 })
   await log($, `launched relay away from ${account} (${reason}), exit ${ran.exitCode}`)
-  return ran.exitCode === 0 ? `switching away from this account; ${resume.size} session(s) will reopen` : `relay failed to start: ${ran.stderr.trim()}`
+  if (ran.exitCode === 0) return `switching away from this account; ${resume.size} session(s) will reopen`
+  await $.fs.write(p.handoff, JSON.stringify(handoff, null, 2)) // no switch coming: take the entries back
+  return `relay failed to start: ${ran.stderr.trim()}`
+}
+
+// A hand-off entry counts only when Claude was closed after it was written (relay.sh
+// stamps closedAt as it quits Claude) and recently: a switch, restart or sign-in reopens
+// its sessions within a few minutes (a sign-in waits up to 10). Anything else is left over
+// from a switch that never happened.
+const HANDOFF_MAX_MS = 15 * 60 * 1000
+
+function live(h: Handoff, entry: Handoff['resume'][number], now: number) {
+  const closed = Date.parse(h.closedAt ?? '')
+  return closed + 1000 >= Date.parse(entry.at) && now - closed < HANDOFF_MAX_MS
 }
 
 export const register: Register = on => {
@@ -108,10 +125,17 @@ export const register: Register = on => {
     // the same developer change a launched Anthropic-signed bundle, so this runs from here
     // (inside Claude) rather than from a launchd agent. Detached: it never delays the session.
     await $.process.run(['/bin/sh', '-c', 'nohup /bin/bash "$1" sync >/dev/null 2>&1 &', 'sh', p.relay]).catch(() => undefined)
+    // Only a session coming back after Claude closed; a compact or clear starts a session too.
+    if (e.source !== 'resume' && e.source !== 'startup') return r
     const handoff = await readJson<Handoff>($, p.handoff, { resume: [] })
-    const mine = handoff.resume.find(x => x.sessionId === e.session_id)
+    const now = await $.clock.now()
+    const stale = handoff.resume.filter(x => !live(handoff, x, now) && now - Date.parse(x.at) >= HANDOFF_MAX_MS)
+    const mine = handoff.resume.find(x => x.sessionId === e.session_id && live(handoff, x, now))
+    if (mine === undefined && stale.length === 0) return r
+    const keep = handoff.resume.filter(x => x !== mine && !stale.includes(x))
+    await $.fs.write(p.handoff, JSON.stringify({ ...handoff, resume: keep }, null, 2))
+    if (stale.length > 0) await log($, `dropped ${stale.length} stale hand-off entr${stale.length === 1 ? 'y' : 'ies'} (${stale.map(x => x.sessionId).join(', ')})`)
     if (mine === undefined) return r
-    await $.fs.write(p.handoff, JSON.stringify({ resume: handoff.resume.filter(x => x.sessionId !== e.session_id) }, null, 2))
     const msg = REOPENED[mine.reason] ?? { text: CONTINUE, toast: 'Reopened on another Claude account; carrying on.' }
     await log($, `reopened ${e.session_id} (${e.source}, ${mine.reason}); sending the carry-on message`)
     $.ui.toast(msg.toast, { timeoutMs: 8000 })

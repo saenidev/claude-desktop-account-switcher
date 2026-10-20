@@ -580,6 +580,8 @@ default_pids() { local pid; for pid in $(all_instances); do [ "$(folder_of "$pid
 quit_default() {
   local pids pid; pids=$(default_pids)
   [ -n "$pids" ] || return 0
+  # The mod honours a hand-off entry only if Claude was closed after it was written.
+  jq_write "$HANDOFF" --arg at "$(date -u +%FT%TZ)" '.closedAt = $at'
   kill -TERM $pids 2>/dev/null
   for pid in $pids; do wait_gone "$pid" 30 || { kill -KILL "$pid"; wait_gone "$pid" 5; }; done
 }
@@ -625,6 +627,11 @@ hand_off() {
     '.resume = ([.resume[] | select(.sessionId != $s)] + [{sessionId: $s, cwd: "", reason: $r, at: $at}])'
 }
 drop_hand_off() { jq_write "$HANDOFF" --arg s "$1" '.resume |= map(select(.sessionId != $s))'; }
+# The entries the mod wrote for a usage limit, when no switch happened after all.
+drop_limit_hand_offs() {
+  jq_write "$HANDOFF" '.resume |= map(select(.reason | test("^(limit hit|mid-turn)") | not))'
+  log "switch: dropped the hand-off entries for this limit"
+}
 
 # Reopen the handed-off sessions in the (one) Claude window.
 reopen_handoff() {
@@ -657,9 +664,10 @@ cmd_switch() {
   local target; target=$(pick_target "$FROM")
   if [ -z "$target" ]; then
     notify "$(account_field "$FROM" name) is out of usage, and every other account is too."
+    drop_limit_hand_offs
     die "switch: no account to switch to"
   fi
-  swap_to "$target" || die "could not switch to $(account_field "$target" name); stayed on $(account_field "$FROM" name)"
+  swap_to "$target" || { drop_limit_hand_offs; die "could not switch to $(account_field "$target" name); stayed on $(account_field "$FROM" name)"; }
   jq_write "$STATE" --arg f "$FROM" --arg t "$target" --argjson at "$(date -u +%s)" '.switches += [{from: $f, to: $t, at: $at}] | .switches |= .[-20:]'
   sleep 12   # let the app load before handing it links
   local n; n=$(reopen_handoff)
