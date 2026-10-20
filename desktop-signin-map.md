@@ -57,11 +57,13 @@ Every top-level entry of `Claude/` was compared with `Claude-second/`.
 | In-app browser sign-ins (`Partitions`) | **Copied** | Same Mac, same safeStorage key |
 | Login (`Cookies`, `oauth:tokenCacheV2`) | Separate | That's what makes it a different account |
 | Worktree list (`git-worktrees.json`) | Separate, on purpose | Two windows managing the same worktrees could fight. Effect: archiving a second session made in a worktree before today leaves its worktree on disk instead of removing it |
-| Scratch "No folder" workspaces | **Linked** (`Claude-second/scratch-workspaces` → `Claude/scratch-workspaces`) | The 23 second scratch sessions point at `Claude/scratch-workspaces/`; without the link the second window listed each as its own project instead of "No folder" |
+| Scratch "No folder" workspaces | **Linked** (`Claude-second/scratch-workspaces` → `Claude/scratch-workspaces`), and the second sessions' saved `cwd`/`originCwd` rewritten to the `Claude-second/…` spelling | A window treats a session as "No folder" only when its saved path, compared as text, is under that window's own `scratch-workspaces`. Backup of the session files: `backups/2026-10-20-before-scratch-path-rewrite/` |
 | Cowork VM (`vm_bundles`, 10 GB; `claude-code-vm`) | Not copied | The app downloads it again the first time Cowork runs in that window |
 | Web page state (`Local Storage`, `IndexedDB`, `Session Storage`) | Not copied | Holds claude.ai page state tied to the signed-in account. Some UI state (possibly sidebar filters) may live here and need setting once in that window |
 | Caches, GPU caches, crash reports, usage-history charts | Not copied | Rebuilt by the app |
 
 The worktree clean-up was checked because the second window started with an empty worktree list: in every log since 2026-09-20, `untracked-dir GC` has removed 0 folders, and it keeps folders it didn't make ("kept … (not-ours)"). Five worktrees in the main list are missing, together with their `claude/…` branches. They were last logged on 2026-10-03/04 and were removed outside the app.
+
+**Linking a scratch folder without rewriting the saved paths deletes folders.** On launch, each window sweeps its own `scratch-workspaces/<account>/<org>`. It deletes (`rm -rf`, not to the Trash) every folder that no session refers to by exact path, if the folder is empty and more than an hour old, or if nothing in it has changed for 7 days. After the link alone, no second session matched, and the sweep at 2026-10-20 20:00:24 removed 21 folders. Checked against their transcripts: every file those sessions wrote went to an absolute path outside the folder, so nothing was lost. The one scratch folder with work in it (`scratch-2026-09-28-9a1f5b`) was recent and survived. Always rewrite the paths first, with that window closed.
 
 Copies don't sync: a preference or extension added in one window later has to be added in the other too.
