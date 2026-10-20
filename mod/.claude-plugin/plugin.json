@@ -1,0 +1,1 @@
+{ "name": "account-relay", "version": "0.1.0", "description": "When a Claude account runs out, hand Code tab sessions to the next signed-in profile folder and reopen them there" }

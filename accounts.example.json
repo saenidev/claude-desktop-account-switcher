@@ -1,0 +1,16 @@
+{
+  "accounts": [
+    {
+      "name": "first",
+      "email": "first@example.com",
+      "accountUuid": "00000000-0000-0000-0000-000000000001",
+      "userDataDir": "~/Library/Application Support/Claude"
+    },
+    {
+      "name": "second",
+      "email": "second@example.com",
+      "accountUuid": "00000000-0000-0000-0000-000000000002",
+      "userDataDir": "~/Library/Application Support/Claude-second"
+    }
+  ]
+}

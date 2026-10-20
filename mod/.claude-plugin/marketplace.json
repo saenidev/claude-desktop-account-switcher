@@ -1,0 +1,5 @@
+{
+  "name": "account-relay-local",
+  "owner": { "name": "Jun" },
+  "plugins": [{ "name": "account-relay", "source": "./" }]
+}
