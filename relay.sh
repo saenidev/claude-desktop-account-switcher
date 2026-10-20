@@ -89,11 +89,15 @@ version_tested() { local v; v=$(app_version); for t in $TESTED_VERSIONS; do [[ "
 # Claude Desktop keeps its sign-in and session list in files it never promised to keep the
 # same. Before closing Claude to move anything, check they're where this expects; an app
 # update that moved them stops the switch instead of losing a sign-in. Prints what's wrong.
+# Being signed out isn't a changed layout: Cookies is still the app's cookie database, only
+# without a claude.ai sign-in, and a switch or sign-in from there is fine (the signed-out
+# Cookies is parked like any other, and counts as signed out).
 check_app() {
   [ -n "$(folder_account "$DEFAULT_DIR")" ] || { echo "config.json has no lastKnownAccountUuid"; return 1; }
-  [ "$(signin_cookies "$DEFAULT_DIR/Cookies")" -ge 1 ] 2>/dev/null || { echo "Cookies holds no claude.ai sign-in"; return 1; }
+  sqlite3 "file:$DEFAULT_DIR/Cookies?mode=ro&immutable=1" "select count(*) from cookies" >/dev/null 2>&1 || { echo "there's no Cookies database"; return 1; }
   [ -d "$DEFAULT_DIR/claude-code-sessions" ] || { echo "there's no claude-code-sessions folder"; return 1; }
 }
+signed_in_now() { [ "$(signin_cookies "$DEFAULT_DIR/Cookies" live)" -ge 1 ] 2>/dev/null; }
 
 # How many claude.ai sessionKey cookies the Cookies file $1 holds (one per claude.ai host it
 # was set on); with "live", only those that haven't expired. Only names, hosts and expiry
@@ -635,6 +639,7 @@ cmd_doctor() {
   else warn "Claude Desktop $v hasn't been tested with this switcher (tested: $TESTED_VERSIONS); switches still check the app's files first"; fi
   if update_waiting || shipit_running; then ok "a Claude update is downloaded and installs at the next quit (a switch or restart lets it finish first)"; fi
   why=$(check_app) && ok "Claude's sign-in and session files are where the switcher expects" || fail "Claude's files aren't where the switcher expects ($why): switching is off until this is fixed"
+  [ -z "$why" ] && ! signed_in_now && warn "Claude is signed out of $(account_field "$(folder_account "$DEFAULT_DIR")" name): sign in in Claude, or switch to another account (relay.sh use <name>)"
   [ -L "$DIR/relay.sh" ] && [ -e "$DIR/relay.sh" ] && ok "relay.sh -> $(readlink "$DIR/relay.sh")" || fail "$DIR/relay.sh is not a working link (relay.sh setup)"
   [ -L "$DIR/mod" ] && [ -e "$DIR/mod/hooks/hooks.json" ] && ok "mod -> $(readlink "$DIR/mod")" || fail "$DIR/mod is not a working link (relay.sh setup)"
   jq -e --arg p "$PLUGIN" '.enabledPlugins[$p] == true' "$HOME/.claude/settings.json" >/dev/null 2>&1 && ok "mod installed and enabled" || fail "mod not enabled (relay.sh setup)"
@@ -815,7 +820,7 @@ report_lost() {
 signin_state() {
   if [ "$(folder_account "$DEFAULT_DIR")" = "$1" ]; then echo "in Claude now"
   elif parked_live "$1"; then echo "parked, ready to switch to (sign-in good until $(signin_expires "$1") UTC)"
-  elif [ -f "$PARK/$1/Cookies" ]; then echo "parked sign-in ran out on $(signin_expires "$1") UTC (relay.sh signin $(account_field "$1" name))"
+  elif [ -n "$(signin_expires "$1")" ]; then echo "parked sign-in ran out on $(signin_expires "$1") UTC (relay.sh signin $(account_field "$1" name))"
   else echo "not signed in (relay.sh signin $(account_field "$1" name))"; fi
 }
 
@@ -979,7 +984,9 @@ cmd_launch() {
     0) log "launch: switch away from $FROM queued under launchd" ;;
     # Several sessions hit the limit together, or a switch was already going: the one
     # running reopens the sessions the mod listed, so this is fine, not a failure.
-    2) log "launch: a switch is already under way; not starting another" ;;
+    # The account is still out: its cooldown is kept, so whatever comes next doesn't pick it.
+    2) jq_write "$STATE" --arg a "$FROM" --arg u "${RESETS_AT:-$(date -u -v+5H +%FT%TZ)}" '.cooldowns[$a] = $u'
+       log "launch: a switch is already under way; not starting another ($(account_field "$FROM" name) cools down until $(jq -r --arg a "$FROM" '.cooldowns[$a]' "$STATE"))" ;;
     *) die "launch: couldn't start the switch under launchd" ;;
   esac
 }
@@ -1260,11 +1267,17 @@ cmd_signin() {
   log "signin: waiting for ${name} to be signed in$([ -z "$id" ] && echo " (a new account)")"
   # While signed out the app still reports the last account, so a new one shows as a change.
   local now n=0
-  signed_in() { now=$(folder_account "$DEFAULT_DIR"); if [ -n "$id" ]; then [ "$now" = "$id" ]; else [ -n "$now" ] && [ "$now" != "$cur" ]; fi; }
+  # Signing in to another account already set up instead of <name> counts too: it's kept
+  # under its own name, rather than thrown away after the wait.
+  signed_in() { now=$(folder_account "$DEFAULT_DIR"); if [ -n "$id" ]; then [ "$now" = "$id" ] || { [ "$now" != "$cur" ] && [ -n "$(account_field "$now" name)" ]; }; else [ -n "$now" ] && [ "$now" != "$cur" ]; fi; }
   while ! signed_in && [ $n -lt 600 ]; do sleep 2; n=$((n+2)); done
   local new=""
   if signed_in; then
-    new="$now"; log "signin: ${name} signed in"
+    new="$now"
+    if [ -n "$id" ] && [ "$new" != "$id" ]; then
+      log "signin: that sign-in is $(account_field "$new" name), not ${name}; kept as $(account_field "$new" name)"
+      notify "That was $(account_field "$new" name), not ${name}. Kept it as $(account_field "$new" name)."
+    else log "signin: ${name} signed in"; fi
     # The app makes the account's session folder, which names its org, once the Code tab loads.
     n=0; while [ -z "$(new_org "$new")" ] && [ $n -lt 30 ]; do sleep 2; n=$((n+2)); done
     pause 8
@@ -1350,6 +1363,7 @@ cmd_setup() {
   for t in jq sqlite3 plutil; do command -v "$t" >/dev/null || die "setup: needs $t (brew install $t)"; done
   v=$(app_version); [ -n "$v" ] || die "setup: Claude Desktop isn't in $APP"
   why=$(check_app) || die "setup: Claude Desktop $v doesn't keep its files where this expects ($why). Sign in to Claude first; if you are, this version isn't supported yet."
+  signed_in_now || die "setup: Claude is signed out; sign in to Claude first."
   version_tested || echo "~~  Claude Desktop $v hasn't been tested with this switcher (tested: $TESTED_VERSIONS). Switches check the app's files first, but watch the first one."
   mkdir -p "$DIR/backups" "$PARK"
   [ -f "$ACCOUNTS" ] || echo '{"accounts":[]}' > "$ACCOUNTS"

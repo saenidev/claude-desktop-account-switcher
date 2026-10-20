@@ -65,7 +65,7 @@ check() {   # check "<what>" <command...>
 job_pid() { cat "$H/launchd.pids/local.desktop-account-switcher" 2>/dev/null; }
 # Each section starts once the last one's job has finished: a job still running would turn
 # the next command away (as it should).
-section() { wait_for "[ -z \"\$(job_pid)\" ]" 30; echo; echo "$*"; }
+section() { wait_for "[ -z \"\$(job_pid)\" ]" 30; echo; echo "$*  (${SECONDS}s)"; }
 
 # ---- A Mac with Claude signed in to one account ----
 cookies "$P/Cookies" "$A"; open -a "$APPDIR"
@@ -299,6 +299,19 @@ check "bob's sign-in is parked as bob's, not alice's" test "$(signed_in_as "$D/p
 check "Claude is running after the restart" wait_for "running && [ -z \"\$(job_pid)\" ]" 30
 check "doctor is happy" relay doctor
 
+section "signin <name>, signing in to another account already set up instead"
+# bob's parked sign-in no longer works, so Claude opens signed out; you sign in to carol.
+cp "$D/park/$B/Cookies" "$T/bob.cookies"; cp "$D/park/$C/Cookies" "$T/carol.cookies"; dud_signin "$D/park/$B/Cookies"
+mark; check "signin bob is queued" relay signin bob
+check "Claude opens signed out" wait_for "running && [ -f '$P/Cookies' ] && [ -z \"\$(signed_in_as '$P/Cookies')\" ]" 20
+sign_in "$C"
+check "it's kept as carol" wait_log "that sign-in is carol, not bob; kept as carol" 30
+check "and alice comes back" wait_log "signin: back on alice" 30
+check "carol's new sign-in is parked as carol's" test "$(signed_in_as "$D/park/$C/Cookies")" = "$C"
+check "her previous one is kept in backups" sh -c "ls '$D'/backups/*-replaced-signin/Cookies"
+check "Claude is on alice" test "$(signed_in_as "$P/Cookies")" = "$A"
+mv "$T/bob.cookies" "$D/park/$B/Cookies"
+
 section "signing in to a known account under a new name (one with quotes, & and <>)"
 DAVE="d'ave & <co> \"x\""
 mark; check "add $DAVE is queued" relay add "$DAVE"
@@ -332,9 +345,11 @@ mark; check "use bob is queued" relay use bob
 check "a restart while it runs is refused" sh -c "! '$REPO/relay.sh' restart 2>'$T/err' && grep -q 'a switch or sign-in is running' '$T/err'"
 check "the mod's launch while it runs is fine" relay launch --from "$B"
 check "and only logs that a switch is under way" wait_log "launch: a switch is already under way" 5
+check "bob's cooldown is kept all the same" jq -e --arg b "$B" '.cooldowns[$b] > (now | todate)' "$D/state.json"
 check "the first switch finishes" wait_log "swap: alice -> bob" 40
 check "Claude is on bob" test "$(signed_in_as "$P/Cookies")" = "$B"
 check "nothing else ran" sh -c "! tail -n +$((MARK + 1)) '$D/relay.log' | grep -qE 'restart : queued|switch: .* is out'"
+jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
 
 section "a sign-in cut off while it waits for you"
 mark; check "add erin is queued" relay add erin
@@ -373,6 +388,84 @@ sleep 30 & young=$!; echo "$young" > "$D/switch.lock/pid"; touch -t "$(date -v-1
 check "doctor counts a lock whose pid was reused as left over" sh -c "'$REPO/relay.sh' doctor | grep -q 'a lock is left from a run that was cut off'"
 kill "$young" 2>/dev/null
 rm -rf "$D/switch.lock"
+
+# One hook event in a Code tab session (account $1, session $2), through the mod's real hooks
+# in the stand-in Claude Code host. What the session would show goes to mod-host.log.
+mod_event() { local a="$1" s="$2"; shift 2; CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_ACCOUNT_UUID="$a" MOD_SESSION="$s" bun "$REPO/tests/fakes/mod-host.ts" "$@"; }
+shown() { grep -F "\"session\":\"$1\"" "$H/mod-host.log" 2>/dev/null | grep -F "\"kind\":\"$2\"" | grep -qF "$3"; }
+in_handoff() { jq -e --arg s "$1" 'any(.resume[]; .sessionId == $s)' "$D/handoff.json" >/dev/null; }
+FULL='[{"kind":"five_hour","percentUsed":100,"resetsAt":"'"$(date -u -v+3H +%FT%TZ)"'"}]'
+
+section "the mod: two sessions hit the limit at the same moment"
+mod_event "$B" m-busy classic.UserPromptSubmit '{"session_id":"m-busy","cwd":"/tmp"}'
+check "a session mid-turn is marked busy" test -f "$D/busy/m-busy.json"
+mark
+MOD_USAGE="$FULL" mod_event "$B" m-one classic.StopFailure '{"session_id":"m-one","cwd":"/tmp","error":"rate_limit"}' &
+MOD_USAGE="$FULL" mod_event "$B" m-two classic.StopFailure '{"session_id":"m-two","cwd":"/tmp","error":"rate_limit"}' &
+wait
+check "both sessions and the busy one are listed, once each" jq -e '[.resume[].sessionId | select(startswith("m-"))] | sort == ["m-busy","m-one","m-two"]' "$D/handoff.json"
+check "the session is told a switch is coming" shown m-one toast "Switching to another account"
+check "it switches away from bob" wait_log "swap: bob -> alice" 40
+check "bob cools down" jq -e --arg b "$B" '.cooldowns[$b] > (now | todate)' "$D/state.json"
+for s in m-one m-two m-busy; do check "$s is reopened" wait_for "grep -q 'session=$s' '$H/links.log'" 30; done
+wait_log "switch: done" 20
+for s in m-one m-two m-busy; do mod_event "$A" "$s" classic.SessionStart '{"session_id":"'"$s"'","source":"resume","transcript_path":"/dev/null"}' & done
+wait
+for s in m-one m-two m-busy; do check "$s gets the carry-on message" shown "$s" prompt "ran out of usage"; done
+check "and every entry is used up, none put back by another session" sh -c "! jq -e 'any(.resume[]; .sessionId | startswith(\"m-\"))' '$D/handoff.json'"
+mod_event "$A" m-one classic.SessionStart '{"session_id":"m-one","source":"resume","transcript_path":"/dev/null"}'
+check "starting again doesn't send it twice" test "$(grep -c '"session":"m-one","kind":"prompt"' "$H/mod-host.log")" = 1
+jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+
+section "the mod: sessions cut off mid-turn by a switch by hand, or a restart"
+mod_event "$A" m-cut classic.UserPromptSubmit '{"session_id":"m-cut","cwd":"/tmp"}'
+mark; check "use bob" relay use bob
+check "the switch finishes" wait_log "swap: alice -> bob" 40
+check "the cut-off session is reopened" wait_for "grep -q 'session=m-cut' '$H/links.log'" 30
+wait_for "[ -z \"\$(job_pid)\" ]" 30
+mod_event "$B" m-cut classic.SessionStart '{"session_id":"m-cut","source":"resume","transcript_path":"/dev/null"}'
+check "it's told it was moved to another account mid-turn" shown m-cut prompt "moved to another Claude account while this session was mid-turn"
+mod_event "$B" m-cut2 classic.UserPromptSubmit '{"session_id":"m-cut2","cwd":"/tmp"}'
+mark; check "a restart" relay restart
+check "the session cut off by it is reopened" wait_for "grep -q 'session=m-cut2' '$H/links.log'" 40
+wait_for "[ -z \"\$(job_pid)\" ]" 30
+mod_event "$B" m-cut2 classic.SessionStart '{"session_id":"m-cut2","source":"resume","transcript_path":"/dev/null"}'
+check "it's told Claude was closed and reopened mid-turn" shown m-cut2 prompt "closed and reopened while this session was mid-turn"
+hand_entry() { jq --arg s "$1" --arg at "$(date -u -v-1S +%FT%TZ)" '.resume += [{sessionId: $s, cwd: "", reason: "restart", account: "", at: $at}]' "$D/handoff.json" > "$T/h" && mv "$T/h" "$D/handoff.json"; }
+hand_entry m-cut3
+mod_event "$B" m-cut3 classic.SessionStart '{"session_id":"m-cut3","source":"compact","transcript_path":"/dev/null"}'
+check "a compact doesn't count as a reopen" sh -c "! grep -q '\"session\":\"m-cut3\"' '$H/mod-host.log' && jq -e 'any(.resume[]; .sessionId == \"m-cut3\")' '$D/handoff.json'"
+
+section "the mod: a limit with auto-switch off, and a switch that can't start"
+jq '.armed = false' "$D/config.json" > "$T/c" && mv "$T/c" "$D/config.json"
+MOD_USAGE="$FULL" mod_event "$B" m-off classic.StopFailure '{"session_id":"m-off","cwd":"/tmp","error":"rate_limit"}'
+check "auto-switch off: it says so" shown m-off toast "Auto-switch is off"
+check "and lists nothing to reopen" sh -c "! jq -e 'any(.resume[]; .sessionId == \"m-off\")' '$D/handoff.json'"
+jq '.armed = true' "$D/config.json" > "$T/c" && mv "$T/c" "$D/config.json"
+mv "$D/relay.sh" "$D/relay.sh.off"
+MOD_USAGE="$FULL" mod_event "$B" m-fail classic.StopFailure '{"session_id":"m-fail","cwd":"/tmp","error":"rate_limit"}'
+mv "$D/relay.sh.off" "$D/relay.sh"
+check "a switch that can't start: it says so" shown m-fail toast "the switch couldn't start"
+check "and takes its entry back" sh -c "! jq -e 'any(.resume[]; .sessionId == \"m-fail\")' '$D/handoff.json'"
+check "Claude stays on bob" test "$(signed_in_as "$P/Cookies")" = "$B"
+MOD_USAGE='[{"kind":"five_hour","percentUsed":40}]' mod_event "$B" m-rate classic.StopFailure '{"session_id":"m-rate","cwd":"/tmp","error":"rate_limit"}'
+check "a rate limit with usage left doesn't switch" sh -c "! jq -e 'any(.resume[]; .sessionId == \"m-rate\")' '$D/handoff.json' && grep -q 'rate_limit in m-rate but no window near full' '$D/relay.log'"
+CLAUDE_CODE_ENTRYPOINT=cli MOD_SESSION=m-term MOD_IDENTITY=api-key MOD_USAGE="$FULL" bun "$REPO/tests/fakes/mod-host.ts" classic.StopFailure '{"session_id":"m-term","cwd":"/tmp","error":"rate_limit"}'
+check "a terminal claude's limit on an API key lists nothing" sh -c "! jq -e 'any(.resume[]; .sessionId == \"m-term\")' '$D/handoff.json'"
+check "and moves nothing" test "$(signed_in_as "$P/Cookies")" = "$B"
+
+section "switching while Claude is signed out"
+cp "$P/Cookies" "$T/bob.live"
+pkill -f "^$APPDIR/Contents/MacOS/Claude"; wait_for "! running" 10
+sqlite3 "$T/out" "create table cookies(host_key text, name text, value text, expires_utc integer);" && mv "$T/out" "$P/Cookies"
+open -a "$APPDIR"; wait_for running 5
+check "doctor says Claude is signed out of bob" sh -c "'$REPO/relay.sh' doctor | grep -q 'Claude is signed out of bob'"
+mark; check "use alice is queued" relay use alice
+check "it switches" wait_log "swap: bob -> alice" 40
+check "Claude is on alice" test "$(signed_in_as "$P/Cookies")" = "$A"
+check "status says bob isn't signed in" sh -c "'$REPO/relay.sh' status | grep -q 'bob .*not signed in'"
+check "a limit switch wouldn't pick bob" sh -c "'$REPO/relay.sh' plan --from $A | grep -q nobody"
+mv "$T/bob.live" "$D/park/$B/Cookies"
 
 section "moving from the old launchd label"
 cp "$H/Library/LaunchAgents/local.desktop-account-switcher.keepalive.plist" "$H/Library/LaunchAgents/com.jun.desktop-account-switcher.keepalive.plist"

@@ -79,11 +79,20 @@ A pass over the switcher's logic: the states the Mac can be in, every action in 
 - **Status and plan** say when a parked sign-in has run out, instead of "parked, ready to switch to".
 - **Terminal follows the app** even when the live terminal login item is missing: there's nothing to save first. Before, the swap was refused.
 - **Reopening:** the relay reopens only the entries the mod will act on (written before the last close, within 15 minutes, for this account or any). Before, it sent links for every entry, including ones left from a switch that went back.
+- **The e2e suite** prints each section's start time, to see where a slow run spends it.
 - **The e2e test of an update installing during a switch** failed sometimes: its stand-in ShipIt slept a fixed 4 seconds. It now waits for Claude to quit, as the real one does.
 
-## Left as they are
+## Fixed in a second pass
 
-- Switching while Claude is signed out and nothing is parked for its account is refused (`check_app` can't tell that from the app's files having moved). Sign in in Claude first.
-- `add`/`signin` while Claude is signed out is refused the same way.
-- During `signin <name>`, signing in to a different account than `<name>` isn't taken; after 10 minutes the previous account comes back.
-- A limit switch that is turned away because another relay job is running records no cooldown. If that job brings Claude back on the spent account (a restart), the reopened session hits the limit again and starts the switch then.
+- **Signed out.** `use`, `add` and `signin` while Claude is signed out were refused, because the app-files check counted "no claude.ai sign-in in `Cookies`" as the app's files having moved. The check now asks only that `Cookies` is the app's cookie database. Being signed out is a state like any other: the signed-out `Cookies` is parked, counts as "not signed in" (status, the row, a limit switch never picks it), and `doctor` warns. `setup` still needs a sign-in.
+- **Signing in to another account than asked.** During `signin <name>`, signing in to another account already set up was ignored, and after 10 minutes it was thrown away. Now it's kept as that account (its old parked sign-in goes to `backups/`), and you're told.
+- **A limit switch turned away by a running job** recorded no cooldown, so a restart could bring Claude back on the spent account and pick it again. The cooldown is now recorded either way.
+
+## The mod
+
+The mod runs only inside Claude Code, so `tests/fakes/mod-host.ts` stands in for the host: one session's process running the mod's real hooks for one event. Files, `relay.sh` and the clock are real; toasts and submitted prompts go to a log. The e2e suite drives it for:
+- two sessions hitting the limit at the same moment, with a third mid-turn: all three listed once, the switch, all three reopened, all three starting together and each getting its message once
+- a session cut off mid-turn by a switch by hand ("moved to another Claude account") and by a restart ("closed and reopened")
+- a compact not counting as a reopen, auto-switch off, a switch that can't start (its entry taken back), a rate limit with usage left, a terminal `claude` on an API key
+
+What it can't show is the real host's own behaviour: which events fire, in what order, with what fields. Those are as `register.tsx` already assumed, unchanged by this pass.
