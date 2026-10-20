@@ -95,4 +95,17 @@ The mod runs only inside Claude Code, so `tests/fakes/mod-host.ts` stands in for
 - a session cut off mid-turn by a switch by hand ("moved to another Claude account") and by a restart ("closed and reopened")
 - a compact not counting as a reopen, auto-switch off, a switch that can't start (its entry taken back), a rate limit with usage left, a terminal `claude` on an API key
 
-What it can't show is the real host's own behaviour: which events fire, in what order, with what fields. Those are as `register.tsx` already assumed, unchanged by this pass.
+## The mod in Claude Code's own engine
+
+`claude plugin test` loads a mod in Claude Code's own engine, with its rules for registering hooks, the events' fields and what each hook must return; `tests/host/mod.test.ts` stands in only for the host's services (files in memory, processes recorded). The suite runs it. What it found:
+
+- **The mod in the repo didn't load at all.** It registered `turn.complete` twice without a matcher, which the engine refuses, and with it the whole mod: no limit switch, no carry-on message, no row. This was so before this pass; the Mac kept working only because Claude Code runs a cached older copy (0.3.0). The two hooks are one now, and the stand-in host refuses the same thing.
+- **The live setup mixed versions.** The relay in use is the repo's (a link), the mod the cached 0.3.0, which leaves markers in `busy/` still saying busy hours after their turn (one 277 minutes old was found). The new relay would have reopened that session with "carry on". Now only markers the new mod writes (`v: 2`) count, in the relay and the mod. The mod's version is 0.4.0, so `claude plugin update desktop-account-switcher@desktop-account-switcher-local` installs it.
+- **In the engine:** a limit lists the session and the ones mid-turn (not an old marker) under `handoff.json.lock` and starts the switch; a reopened session is told why once, a compact doesn't count, and a session cut off mid-turn is told it was moved.
+- **Still failing in the engine:** the mod's `turn.complete` hook is skipped ("next() passed an argument with no { answer }"), though it passes on the event it was given unchanged. Until that's understood, on the real host a turn's end doesn't clear its busy marker or save usage; markers are still cleared when the session starts again and whenever the relay has closed Claude. The suite reports it as a failure.
+
+## What the stand-in can't show
+
+Which events the real host fires, and in what order, in a live session. The live relay log shows the real host firing the two that matter, with the fields the mod reads: a limit (`StopFailure`, `rate_limit`, a weekly window at 100%, three times) and a reopen (`SessionStart` with `source: resume`, five times).
+
+The one 12-minute run of the suite has no timings (they were added after it); the next timed run took about six minutes. Why that one was slow is not known.

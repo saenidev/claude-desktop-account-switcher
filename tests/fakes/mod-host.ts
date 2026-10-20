@@ -75,6 +75,9 @@ type Next = ((e: unknown) => Promise<unknown>) & { called: boolean }
 const handlers: { name: string; filter?: Record<string, unknown>; run: Handler; onError?: Handler }[] = []
 const on = (name: string, a: Handler | Record<string, unknown>, b?: Handler) => {
   const h = typeof a === 'function' ? { name, run: a } : { name, filter: a, run: b as Handler }
+  // Claude Code's own rule: one hook per event without a matcher, or the mod doesn't load.
+  if (h.filter === undefined && handlers.some(x => x.name === name && x.filter === undefined))
+    throw new Error(`on("${name}") is registered twice without a matcher`)
   handlers.push(h)
   return { catch: (f: Handler) => void ((h as { onError?: Handler }).onError = f) }
 }

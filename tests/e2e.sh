@@ -23,6 +23,7 @@ cp "$REPO/tests/fakes/app-start" "$APPDIR/Contents/Resources/start"; chmod +x "$
 plutil -create xml1 "$APPDIR/Contents/Info.plist"; plutil -insert CFBundleShortVersionString -string 3.1623.0 "$APPDIR/Contents/Info.plist"
 echo "$OA" > "$H/orgs/$A"; echo "$OB" > "$H/orgs/$B"; echo "$OC" > "$H/orgs/$C"
 
+REAL_CLAUDE=$(command -v claude || echo claude); REAL_HOME="$HOME"   # for claude plugin test, which the stand-ins would shadow
 export HOME="$H" ACCOUNT_SWITCHER_APP="$APPDIR" ACCOUNT_SWITCHER_FAST=1
 export PATH="$H/.local/bin:$PATH"
 relay() { "$REPO/relay.sh" "$@"; }
@@ -266,7 +267,7 @@ jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
 
 section "sessions mid-turn when Claude closes are reopened, on any switch"
 mkdir -p "$D/busy"
-jq -n --arg a "$A" --argjson at "$(date +%s)000" '{sessionId: "busy-1", cwd: "/tmp", account: $a, busy: true, at: $at}' > "$D/busy/busy-1.json"
+jq -n --arg a "$A" --argjson at "$(date +%s)000" '{sessionId: "busy-1", cwd: "/tmp", account: $a, busy: true, v: 2, at: $at}' > "$D/busy/busy-1.json"
 jq --arg c "$C" --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: "for-carol", cwd: "", reason: "swap", account: $c, at: $at}]' "$D/handoff.json" > "$T/h" && mv "$T/h" "$D/handoff.json"
 mark; check "use bob, with no --resume" relay use bob
 check "the switch finishes" wait_log "swap: alice -> bob" 40
@@ -453,6 +454,15 @@ check "a rate limit with usage left doesn't switch" sh -c "! jq -e 'any(.resume[
 CLAUDE_CODE_ENTRYPOINT=cli MOD_SESSION=m-term MOD_IDENTITY=api-key MOD_USAGE="$FULL" bun "$REPO/tests/fakes/mod-host.ts" classic.StopFailure '{"session_id":"m-term","cwd":"/tmp","error":"rate_limit"}'
 check "a terminal claude's limit on an API key lists nothing" sh -c "! jq -e 'any(.resume[]; .sessionId == \"m-term\")' '$D/handoff.json'"
 check "and moves nothing" test "$(signed_in_as "$P/Cookies")" = "$B"
+
+section "the mod in Claude Code's own engine (claude plugin test)"
+# The engine applies Claude Code's own rules: how hooks may be registered, what each event
+# carries, what a hook must return. tests/host/mod.test.ts stands in for the host's services.
+mkdir -p "$T/modkit"; cp -R "$REPO/mod/." "$T/modkit/"; cp "$REPO/tests/host/mod.test.ts" "$T/modkit/hooks/"
+HOME="$REAL_HOME" "$REAL_CLAUDE" plugin test "$T/modkit" > "$T/modkit.out" 2>&1
+for t in "a turn marks its session busy, and its end clears it" "a limit lists the session and the ones mid-turn, then starts the switch" "a reopened session is told why, once"; do
+  check "engine: $t" grep -qF "(pass) $t" "$T/modkit.out"
+done
 
 section "switching while Claude is signed out"
 cp "$P/Cookies" "$T/bob.live"

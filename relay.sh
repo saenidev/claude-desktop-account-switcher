@@ -188,7 +188,7 @@ quit_default() {
   # mid-turn now (busy/, under 6 hours old) is cut off by this quit, whatever it was for: it's
   # listed to reopen on whichever account Claude comes back on, with the account it was on.
   local busy f; busy=$(for f in "$DIR"/busy/*.json; do [ -f "$f" ] && jq -c . "$f" 2>/dev/null; done \
-    | jq -sc --argjson now "$(date +%s)000" '[.[] | select(.sessionId and .busy != false and ($now - (.at // 0)) < 21600000)]')
+    | jq -sc --argjson now "$(date +%s)000" '[.[] | select(.sessionId and .v == 2 and .busy != false and ($now - (.at // 0)) < 21600000)]')
   handoff_write --argjson b "${busy:-[]}" --arg at "$(date -u +%FT%TZ)" '
     .closedAt = $at
     | ([.resume[].sessionId]) as $have

@@ -54,7 +54,10 @@ async function publishedArtifacts($: Host, transcript: string) {
 // `from`: on "closed" entries, the account the session was on when Claude closed.
 type Handoff = { resume: { sessionId: string; cwd: string; reason: string; at: string; account?: string; from?: string }[]; closedAt?: string }
 // A session mid-turn has a file in busy/; it's deleted when the turn ends, however it ends.
-type Busy = { sessionId: string; cwd: string; account: string; busy?: boolean; at: number }
+// `v`: 2 on markers this version writes. Older versions of the mod left a marker behind when a
+// turn ended without their end hook (one was seen still "busy" hours later), so only a v2
+// marker, deleted when the turn ends however it ends, says a session is mid-turn.
+type Busy = { sessionId: string; cwd: string; account: string; busy?: boolean; at: number; v?: number }
 
 async function paths($: Host) {
   const home = (await $.env.get('HOME')) ?? ''
@@ -103,7 +106,7 @@ async function isDesktop($: Host) {
 async function markBusy($: Host, sessionId: string, cwd: string) {
   const p = await paths($)
   const account = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
-  const entry: Busy = { sessionId, cwd, account, busy: true, at: await $.clock.now() }
+  const entry: Busy = { sessionId, cwd, account, busy: true, v: 2, at: await $.clock.now() }
   await $.fs.write(`${p.busy}/${sessionId}.json`, JSON.stringify(entry))
 }
 
@@ -128,7 +131,7 @@ async function relay($: Host, sessionId: string, cwd: string, reason: string, re
   for (const f of await $.fs.list(p.busy).catch(() => [])) {
     if (f.kind !== 'file' || !f.name.endsWith('.json')) continue
     const b = await readJson<Busy | null>($, `${p.busy}/${f.name}`, null)
-    if (b && b.busy !== false && b.account === account && now - b.at < BUSY_FRESH_MS && !resume.has(b.sessionId))
+    if (b && b.v === 2 && b.busy !== false && b.account === account && now - b.at < BUSY_FRESH_MS && !resume.has(b.sessionId))
       resume.set(b.sessionId, { sessionId: b.sessionId, cwd: b.cwd, reason: 'mid-turn when the account ran out', at: new Date(now).toISOString() })
   }
   const { armed } = await readJson($, p.config, { armed: false })
@@ -210,15 +213,6 @@ export const register: Register = on => {
   on('classic.UserPromptSubmit', async ($, e, next) => {
     if (await isDesktop($)) await markBusy($, e.session_id, e.cwd).catch(() => undefined)
     return next(e)
-  }).catch(($, e, next) => (next.called ? undefined : next(e)))
-
-  // The main loop's turn is over however it ended (an answer, Esc, an error), so the session
-  // isn't mid-turn any more: a limit switch mustn't reopen it with "carry on". A subagent's
-  // turn ending (agentId) says nothing about the session's.
-  on('turn.complete', async ($, e, next) => {
-    const r = await next(e)
-    if (e.agentId === undefined && (await isDesktop($))) await clearBusy($, await $.session.id()).catch(() => undefined)
-    return r
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   on('session.end', async ($, e, next) => {
@@ -433,10 +427,14 @@ function registerRow(on: Parameters<Register>[0]) {
     return { text: visible ? 'Account row hidden.' : 'Account row shown above the prompt.' }
   })
 
-  // Usage moves with every turn.
+  // One hook for turn.complete (the host takes only one per event without a matcher).
+  // The main loop's turn is over however it ended (an answer, Esc, an error), so the session
+  // isn't mid-turn any more: a limit switch mustn't reopen it with "carry on". A subagent's
+  // turn ending (agentId) says nothing about the session's. And usage moves with every turn.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     if (await isDesktop($)) {
+      if (e.agentId === undefined) await clearBusy($, await $.session.id()).catch(() => undefined)
       await saveSnapshot($).catch(() => undefined)
       // Every account's figures from Anthropic; relay.sh asks at most every 10 minutes. Detached.
       const p = await paths($)
