@@ -60,7 +60,7 @@ async function markBusy($: Host, sessionId: string, cwd: string, busy: boolean) 
 
 const isoZ = (t: string) => new Date(t).toISOString().replace(/\.\d+Z$/, 'Z')
 
-/** The hand-off and the relay: what both the limit and `/account-relay switch-now` run. */
+/** The hand-off and the relay, run when the limit hits. */
 async function relay($: Host, sessionId: string, cwd: string, reason: string, resetsAt: string | undefined) {
   const p = await paths($)
   const account = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
@@ -92,14 +92,6 @@ async function relay($: Host, sessionId: string, cwd: string, reason: string, re
 }
 
 export const register: Register = on => {
-  on('session.start', async ($, e, next) => {
-    await $.command.register({
-      name: 'account-relay',
-      description: 'Account relay: `status`, or `switch-now` to run the out-of-usage switch on demand',
-    })
-    return next(e)
-  })
-
   // A session reopened by the relay: say once that it should carry on.
   on('classic.SessionStart', async ($, e, next) => {
     const r = await next(e)
@@ -146,18 +138,4 @@ export const register: Register = on => {
     $.ui.toast(`Account relay: ${said}`, { timeoutMs: 10_000 })
     return r
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
-
-  on('command.run', { command: 'account-relay' }, async ($, e) => {
-    const p = await paths($)
-    if (e.args.trim() === 'switch-now') {
-      if (!(await isDesktop($))) return { text: 'Account relay only moves the desktop app; this is not a Code tab session.' }
-      const sessionId = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
-      return { text: `Account relay: ${await relay($, sessionId, await $.session.cwd(), 'switch-now (manual test)', undefined)}` }
-    }
-    const status = await $.process.run(['/bin/bash', p.relay, 'status'])
-    const { rateLimits } = await $.session.usage()
-    const windows = rateLimits.map(w => `${w.kind} ${w.percentUsed}%${w.resetsAt ? ` (resets ${w.resetsAt})` : ''}`).join('\n  ')
-    const { armed } = await readJson($, p.config, { armed: false })
-    return { text: `${armed ? 'ARMED' : 'disarmed'}\nthis session: ${(await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? '?'}\n  ${windows || 'no usage reading yet'}\n${status.stdout}` }
-  })
 }
