@@ -132,14 +132,26 @@ export const register: Register = on => {
   // The limit: a turn that died on rate_limit while a usage window is nearly full.
   on('classic.StopFailure', async ($, e, next) => {
     const r = await next(e)
-    if (e.error !== 'rate_limit' || !(await isDesktop($))) return r
-    // A nested `claude` started from a Code tab session inherits its environment but signs
-    // in with the terminal (Keychain) login, which this relay doesn't move. Only a limit on
-    // the token the app hands its sessions says the app's account is out.
+    if (e.error !== 'rate_limit') return r
+    // A terminal `claude`, or a nested one started from a Code tab session (it inherits the
+    // session's environment), signs in with the terminal (Keychain) login. A limit there moves
+    // only the terminal login (relay.sh cli-switch), never the app. Only a limit on the token
+    // the app hands its sessions says the app's account is out.
     const identity = await $.session.identity().catch(() => undefined)
     const kind = identity?.kind ?? ''
-    if (['claude.ai', 'console', 'api-key'].includes(kind)) {
-      await log($, `rate_limit in ${e.session_id} on its own ${kind} login, not the app's; not switching`)
+    if (kind === 'claude.ai' || !(await isDesktop($))) {
+      if (kind !== 'claude.ai') return r // an API key or a cloud provider: nothing to switch
+      const p = await paths($)
+      const { armed } = await readJson($, p.config, { armed: false })
+      const windows = (await $.session.usage().catch(() => ({ rateLimits: [] }))).rateLimits
+      const resetsAt = windows.filter(w => w.percentUsed >= NEAR_FULL && w.resetsAt).map(w => isoZ(w.resetsAt as string)).sort().at(-1)
+      if (!armed) {
+        await log($, `terminal: rate_limit in ${e.session_id} on the terminal login; switching is off`)
+        return r
+      }
+      const ran = await $.process.run(['/bin/bash', p.relay, 'cli-switch', ...(resetsAt ? [resetsAt] : [])]).catch(() => undefined)
+      await log($, `terminal: rate_limit in ${e.session_id}; cli-switch exit ${ran?.exitCode ?? 'failed'}`)
+      $.ui.toast(ran?.exitCode === 0 ? 'Terminal login moved to the other account; run the command again.' : 'Terminal login is out of usage, and no other account is ready.', { timeoutMs: 10_000 })
       return r
     }
     const { rateLimits } = await $.session.usage()

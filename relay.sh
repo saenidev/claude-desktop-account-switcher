@@ -21,7 +21,7 @@
 # relaunch, relaunch-later, sync, guard, install-agents.
 
 set -u
-export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 DIR="$HOME/.claude/account-relay"
 ACCOUNTS="$DIR/accounts.json"
@@ -208,6 +208,75 @@ EOF
   launchctl bootstrap "gui/$(id -u)" "$plist" && log "keepalive: daily check installed (04:30)"
 }
 
+# Terminal `claude` follows the app. Its login is the Keychain item "Claude Code-credentials"
+# (mirrored in ~/.claude/.credentials.json) and its account in ~/.claude.json's oauthAccount.
+# The login of an account not in use is parked in its own Keychain item (service
+# "account-relay-cli", account = accountUuid), never in a file; its oauthAccount record (no
+# secret) in park/<uuid>/oauthAccount.json. A swap first saves the live login to the outgoing
+# account's park, so the parked copy is always the newest (refresh tokens rotate; replaying a
+# stale one can revoke the family). Values go Keychain to Keychain through `security -i` on
+# stdin as hex: never printed, logged, or put on a command line.
+CLI_SVC="Claude Code-credentials"
+CLI_PARK_SVC="account-relay-cli"
+CLI_MIRROR="$HOME/.claude/.credentials.json"
+cli_account() { jq -r '.oauthAccount.accountUuid // empty' "$HOME/.claude.json" 2>/dev/null; }
+cli_parked() { security find-generic-password -s "$CLI_PARK_SVC" -a "$1" >/dev/null 2>&1; }
+keychain_put() {   # keychain_put <service> <account>, the secret on stdin
+  local v hex; v=$(cat)   # $(...) drops the newline `security -w` adds after the value
+  [ -n "$v" ] || return 1
+  hex=$(printf '%s' "$v" | xxd -p | tr -d '\n'); v=""
+  printf 'add-generic-password -U -s "%s" -a "%s" -X %s\n' "$1" "$2" "$hex" | security -i >/dev/null 2>&1
+}
+cli_park() {       # save the live terminal login as <uuid>'s parked one
+  local id="$1"
+  security find-generic-password -s "$CLI_SVC" -a "$USER" -w 2>/dev/null | keychain_put "$CLI_PARK_SVC" "$id" || return 1
+  mkdir -p "$PARK/$id"; jq '.oauthAccount' "$HOME/.claude.json" > "$PARK/$id/oauthAccount.json"
+}
+cli_restore() {    # make <uuid>'s parked login the live terminal login
+  local id="$1" tmp
+  security find-generic-password -s "$CLI_PARK_SVC" -a "$id" -w 2>/dev/null | keychain_put "$CLI_SVC" "$USER" || return 1
+  if [ -f "$CLI_MIRROR" ]; then
+    tmp="$CLI_MIRROR.tmp.$$"; ( umask 077; security find-generic-password -s "$CLI_PARK_SVC" -a "$id" -w > "$tmp" 2>/dev/null ) && mv "$tmp" "$CLI_MIRROR"
+  fi
+  [ -f "$PARK/$id/oauthAccount.json" ] && jq_write "$HOME/.claude.json" --slurpfile o "$PARK/$id/oauthAccount.json" '.oauthAccount = $o[0]'
+}
+# Move terminal claude to <uuid> if a parked login exists for it; otherwise leave it alone.
+swap_cli() {
+  local target="$1" cur; cur=$(cli_account)
+  [ "$cur" = "$target" ] && return 0
+  if ! cli_parked "$target"; then log "terminal: no parked terminal login for $(account_field "$target" name); terminal stays on $(account_field "$cur" name)"; return 0; fi
+  if [ -n "$cur" ] && ! cli_park "$cur"; then log "terminal: couldn't save $(account_field "$cur" name)'s terminal login; not swapping"; return 1; fi
+  cli_restore "$target" && log "terminal: $(account_field "$cur" name) -> $(account_field "$target" name)"
+}
+# Save the live terminal login as its account's parked copy (run once per account after `claude /login`).
+cmd_cli_save() {
+  local cur; cur=$(cli_account); [ -n "$(account_field "$cur" name)" ] || die "terminal is logged in as ${cur:-nobody}, not an account in accounts.json"
+  cli_park "$cur" && log "terminal: saved $(account_field "$cur" name)'s terminal login" && echo "saved $(account_field "$cur" name)'s terminal login"
+}
+# A terminal run hit the limit: cool that account down and move only the terminal login.
+cmd_cli_switch() {
+  local from; from=$(cli_account); [ -n "$from" ] || die "cli-switch: terminal isn't logged in"
+  local until="${1:-$(date -u -v+5H +%FT%TZ)}"
+  jq_write "$STATE" --arg a "$from" --arg u "$until" '.cooldowns[$a] = $u'
+  local target; target=$(pick_target "$from")
+  [ -n "$target" ] || { log "terminal: $(account_field "$from" name) is out and so is every other account"; notify "Terminal: every account is out of usage."; return 1; }
+  swap_cli "$target"
+}
+
+# Run a scripted claude, and if it fails on a usage limit, move the terminal login to the
+# next account and run it once more (after caam's `run`). Output passes through unchanged.
+#   relay.sh run -- -p "prompt" [claude args...]
+cmd_run() {
+  [ "${1:-}" = "--" ] && shift
+  local out rc; out=$(mktemp -t relay-run)
+  claude "$@" 2>&1 | tee "$out"; rc=${PIPESTATUS[0]}
+  if [ "$rc" -ne 0 ] && grep -qiE "hit your (weekly|5-hour) limit|usage limit reached|out of (extra )?usage" "$out"; then
+    log "run: claude hit a limit on $(account_field "$(cli_account)" name)'s terminal login; switching and retrying once"
+    if cmd_cli_switch; then claude "$@"; rc=$?; fi
+  fi
+  rm -f "$out"; return "$rc"
+}
+
 # Check the whole setup (after caam's doctor). Prints ok / !! per check; exits 1 if any failed.
 cmd_doctor() {
   local bad=0
@@ -237,6 +306,13 @@ cmd_doctor() {
       if [ -L "$d" ]; then canon=$(readlink "$d"); else ok "$kind: shared list $(basename "$(dirname "$d")" | cut -c1-8)/$(basename "$d" | cut -c1-8)"; fi
     done
     [ -n "$canon" ] && [ ! -d "$canon" ] && fail "$kind: link points at a missing folder $canon"
+  done
+  local tcur; tcur=$(cli_account)
+  [ -n "$(account_field "$tcur" name)" ] && ok "terminal claude is on $(account_field "$tcur" name)" || fail "terminal claude is on ${tcur:-nobody}, not an account in accounts.json"
+  for id in $(jq -r '.accounts[].accountUuid' "$ACCOUNTS"); do
+    [ "$id" = "$tcur" ] && continue
+    cli_parked "$id" && ok "$(account_field "$id" name) has a parked terminal login" \
+      || fail "$(account_field "$id" name) has no parked terminal login: relay.sh cli-save, claude /login as $(account_field "$id" name), relay.sh cli-save, then relay.sh cli-use $(account_field "$tcur" name)"
   done
   launchctl print "gui/$(id -u)/$LABEL.keepalive" >/dev/null 2>&1 && ok "daily keep-alive installed" || fail "daily keep-alive not installed (relay.sh install-keepalive)"
   [ -d "$LOCK" ] && fail "a switch lock is held ($LOCK); remove it if no switch is running" || ok "no switch running"
@@ -272,6 +348,7 @@ cmd_status() {
   local pid; pid=$(default_pids | head -1)
   if [ -n "$pid" ]; then echo "Claude: running (pid $pid)"; else echo "Claude: not running"; fi
   echo "auto-switch: $(jq -r 'if .armed then "on" else "off" end' "$DIR/config.json" 2>/dev/null || echo off)"
+  echo "terminal claude: on $(account_field "$(cli_account)" name)"
   echo "accounts:"
   local id; for id in $(jq -r '.accounts[].accountUuid' "$ACCOUNTS"); do
     local until; until=$(jq -r --arg a "$id" '.cooldowns[$a] // empty' "$STATE")
@@ -531,6 +608,7 @@ swap_to() {
   local n=0; while [ "$(folder_account "$DEFAULT_DIR")" != "$target" ] && [ $n -lt 45 ]; do sleep 1; n=$((n+1)); done
   if [ "$(folder_account "$DEFAULT_DIR")" = "$target" ]; then
     log "swap: $(account_field "$cur" name) -> $(account_field "$target" name)"
+    swap_cli "$target"   # terminal claude follows, when a parked terminal login exists
     return 0
   fi
   log "swap: $(account_field "$target" name)'s sign-in did not come up; going back to $(account_field "$cur" name)"
@@ -710,6 +788,10 @@ case "${1:-}" in
   keepalive) shift; cmd_keepalive "$@" ;;
   install-keepalive) cmd_install_keepalive ;;
   doctor) cmd_doctor ;;
+  cli-save) cmd_cli_save ;;
+  cli-switch) shift; cmd_cli_switch "$@" ;;
+  run) shift; cmd_run "$@" ;;
+  cli-use) shift; id=$(account_by_name "${1:-}"); [ -n "$id" ] || die "cli-use: no account named ${1:-}"; swap_cli "$id" && echo "terminal claude is on $(account_field "$(cli_account)" name)" ;;
   history) shift; cmd_history "$@" ;;
   *) echo "usage: relay.sh launch|switch|plan --from <accountUuid> [--resets-at <iso>] | status | relaunch[-later] <name> [--resume <id>] | resume" >&2; exit 2 ;;
 esac

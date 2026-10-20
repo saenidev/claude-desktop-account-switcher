@@ -16,7 +16,12 @@ macOS only. Built against Claude Desktop 3.1623 / Claude Code 2.1.30x.
   - The row also shows by itself when usage is above 95%, or when the parked account's sign-in has 3 days or less left.
 - **The other account's usage.** The row and `relay.sh status` show the parked account's last-known usage with its age ("weekly 100% · as of 3h ago"); a window past its reset time shows as reset. The mod saves each account's figures while it's the one in use, so the parked account's are as old as its last session (after caam's `limits --cached`).
 - **Keeping the parked sign-in alive.** A claude.ai sign-in was seen to last 28 days from signing in. Every day at 04:30 a launchd job (`relay.sh keepalive`, installed with `relay.sh install-keepalive`) opens Claude in the background on a throwaway profile folder holding only the parked sign-in, lets claude.ai load, quits it and parks the sign-in again; your own window is never touched. It counts as renewed only if the expiry date moved (after caam's `keepalive`). Whether claude.ai extends a sign-in this way isn't known yet: on a sign-in a few hours old it didn't. If it can't be renewed, you get a notification 3 days before it expires, and the row warns from 7 days out and shows itself from 3; sign it in again with `relay.sh signin-later <name>`. Only cookie expiry dates are read, never values.
-- **Limits on the terminal login are ignored.** A nested `claude` run from a Code tab session signs in with the terminal (Keychain) login, not the app's; a limit there doesn't switch the app (checked with the session's login kind).
+- **Terminal `claude` follows the app.** Its login is the Keychain item `Claude Code-credentials`. Each account not in use has its terminal login parked in its own Keychain item (`account-relay-cli`, one per account), never in a file. When the app switches, the terminal switches too, if a parked terminal login exists for the new account; the outgoing login is saved first, so the parked copy is always the newest (refresh tokens rotate, and putting back an old copy can revoke the login). Values go Keychain to Keychain on stdin; they're never printed, logged or put on a command line.
+- **A limit in a terminal session moves only the terminal.** A terminal `claude`, or a nested one run from a Code tab session, signs in with the terminal login. When it hits a limit (and auto-switch is on), the mod cools that account down and moves only the terminal login (`relay.sh cli-switch`); the app is left alone.
+- **Scripted runs retry:** `relay.sh run -- -p "…" [claude args]` runs `claude`, and on a usage limit moves the terminal login and runs it once more (after caam's `run`).
+- **Not tested yet:** whether a terminal `claude` that's already open picks up a swapped login without restarting. New `claude` processes do.
+- **Setting up the terminal logins once:** `relay.sh cli-save` (saves the current terminal login), `claude /login` as the other account, `relay.sh cli-save` again, then `relay.sh cli-use <name>` to go back. `relay.sh doctor` shows what's missing.
+- **Don't use `caam activate claude …` alongside this.** caam also writes the desktop app's token cache in `~/Library/Application Support/Claude/config.json`, which fights the relay.
 
 ### What carries over in a switch
 
@@ -88,6 +93,10 @@ Everything day to day is in the `/account` row. The relay commands, for when you
 | `relay.sh history [<n>]` | The last switches, sign-ins and keep-alive results. |
 | `relay.sh keepalive [<days>] [--force]` | Renew parked sign-ins with fewer than `<days>` left now (what the daily job runs). |
 | `relay.sh install-keepalive` | Install the daily 04:30 keep-alive job. |
+| `relay.sh cli-save` | Park the current terminal login as its account's saved copy. |
+| `relay.sh cli-use <name>` | Move terminal `claude` to `<name>`'s parked login. |
+| `relay.sh cli-switch [<resets-at>]` | Terminal hit a limit: cool its account down and move the terminal to the next one (what the mod runs). |
+| `relay.sh run -- <claude args>` | Run `claude`, retrying once on the other account after a usage limit. |
 
 The `-later` forms run under launchd and wait 10 seconds first, so they can be started from inside the Claude window they close.
 
