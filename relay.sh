@@ -84,6 +84,7 @@ pick_target() {
 # Claude is already running, even one on another profile folder.
 launch_app() {
   local dir="$1" app; app=$(app_for_dir "$1")
+  refresh_copy "$app"
   if [ "$dir" = "$DEFAULT_DIR" ]; then open -n -a "$app"; else open -n -a "$app" --args "--user-data-dir=$dir"; fi
 }
 
@@ -282,6 +283,90 @@ cmd_resume() {
   for id in $(jq -r '.resume[].sessionId' "$HANDOFF"); do send_link "$app" "claude://resume?session=$id" && log "resume: reopened session $id"; sleep 3; done
 }
 
+# ---- Keeping one window per profile folder -------------------------------------------
+#
+# The app has no single-instance lock, and Dock, Spotlight and Finder launches never
+# pass --user-data-dir, so they always open the default folder. So the account in the
+# default folder uses the real app, and every other account uses an untouched copy
+# (still Anthropic-signed: no Keychain prompts, nothing re-signed) kept where Spotlight
+# doesn't look. The guard catches whatever still slips through.
+
+ICON="$DIR/blue.icns"
+SETICON="$DIR/seticon.swift"
+
+app_version() { plutil -extract CFBundleShortVersionString raw "$1/Contents/Info.plist" 2>/dev/null; }
+
+# Bring an account's app copy up to the real app's version before it's launched.
+refresh_copy() {
+  local app="$1"
+  [ "$app" = "$APP" ] && return 0
+  [ -n "$(instances_of "$app")" ] && return 0
+  local want have; want=$(app_version "$APP"); have=$(app_version "$app")
+  [ "$want" = "$have" ] && return 0
+  local tmp="$app.new.$$"
+  ditto "$APP" "$tmp" || { log "refresh: copying $APP failed"; return 1; }
+  # The real app carries the blue Finder icon; copies keep the stock one.
+  swift "$SETICON" - "$tmp" >/dev/null 2>&1
+  [ -d "$app" ] && mv "$app" "$HOME/.Trash/$(basename "$app" .app) $have $(date +%Y%m%d-%H%M%S).app"
+  mv "$tmp" "$app"
+  log "refresh: $app ${have:-missing} -> $want"
+}
+
+# Put the blue Finder icon back on the real app (an update replaces the bundle and drops it).
+cmd_reicon() {
+  [ -f "$ICON" ] || die "reicon: no $ICON"
+  if [ -e "$APP/Icon"$'\r' ]; then return 0; fi
+  swift "$SETICON" "$ICON" "$APP" >/dev/null 2>&1 && log "reicon: blue icon put back on $APP ($(app_version "$APP"))" || log "reicon: could not set the icon on $APP"
+}
+
+# Profile folder of a main process, from its command line.
+folder_of() {
+  local args; args=$(ps -o args= -p "$1")
+  if [[ "$args" == *"--user-data-dir="* ]]; then printf '%s' "${args#*--user-data-dir=}"; else printf '%s' "$DEFAULT_DIR"; fi
+}
+started_at() { date -j -f "%a %b %d %T %Y" "$(ps -o lstart= -p "$1" | sed 's/  */ /g; s/^ //; s/ $//')" +%s 2>/dev/null; }
+
+# If two windows share a profile folder, quit the newer one. The older one has the
+# folder's sessions and sign-in in use; the newcomer has had no time to do anything.
+cmd_guard() {
+  local pid rows=""
+  for pid in $(all_instances); do rows+="$(started_at "$pid") $pid $(folder_of "$pid")"$'\n'; done
+  [ -n "$rows" ] || return 0
+  local dup; dup=$(printf '%s' "$rows" | sort -n | awk '{f=$0; sub(/^[0-9]+ [0-9]+ /,"",f); if (seen[f]++) print $2}')
+  for pid in $dup; do
+    local f; f=$(folder_of "$pid")
+    log "guard: a second window (pid $pid, $(app_of_pid "$pid")) opened on $f; quitting it"
+    notify "A second Claude window opened on $(basename "$f"), the same account as one already open. It was closed."
+    kill -TERM "$pid"; wait_gone "$pid" 20 || kill -KILL "$pid"
+  done
+}
+
+# Two standing launchd agents: the guard every 15 seconds, and reicon whenever the real
+# app's Info.plist changes (an update) and at login.
+cmd_install_agents() {
+  local uid; uid=$(id -u)
+  local agents="$HOME/Library/LaunchAgents"; mkdir -p "$agents"
+  write_agent() {
+    local label="$1" cmd="$2" trigger="$3" plist="$agents/$1.plist"
+    cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$DIR/relay.sh</string><string>$cmd</string></array>
+$trigger
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$DIR/launchd.out</string>
+  <key>StandardErrorPath</key><string>$DIR/launchd.out</string>
+</dict></plist>
+EOF
+    launchctl bootout "gui/$uid/$label" 2>/dev/null
+    launchctl bootstrap "gui/$uid" "$plist" && echo "loaded $label"
+  }
+  write_agent "$LABEL.guard" guard "  <key>StartInterval</key><integer>15</integer>"
+  write_agent "$LABEL.reicon" reicon "  <key>WatchPaths</key><array><string>$APP/Contents/Info.plist</string></array>"
+}
+
 case "${1:-}" in
   resume) cmd_resume ;;
   launch) shift; cmd_launch "$@" ;;
@@ -290,5 +375,8 @@ case "${1:-}" in
   status) cmd_status ;;
   relaunch) shift; cmd_relaunch "$@" ;;
   relaunch-later) shift; cmd_relaunch_later "$@" ;;
+  reicon) cmd_reicon ;;
+  guard)  cmd_guard ;;
+  install-agents) cmd_install_agents ;;
   *) echo "usage: relay.sh launch|switch|plan --from <accountUuid> [--resets-at <iso>] | status | relaunch[-later] <name> [--resume <id>] | resume" >&2; exit 2 ;;
 esac
