@@ -605,6 +605,7 @@ swap_to() {
   move_signin "$cur" "$target"
   apply_prefs_patch
   fix_scratch_paths
+  drop_old_link
   mirror_prefs "$cur" "$target"
   open -a "$APP"
   local n=0; while [ "$(folder_account "$DEFAULT_DIR")" != "$target" ] && [ $n -lt 45 ]; do sleep 1; n=$((n+1)); done
@@ -720,6 +721,14 @@ apply_prefs_patch() {
 # scratch-workspaces. Sessions started in an old per-account profile folder
 # (Claude-second) point outside it and show up as one project each. Point them back.
 # Only while Claude is closed: the running app rewrites session files.
+# ~/.claude/account-relay is the old name of $DIR, left as a link for sessions still running
+# the old mod. Once Claude has quit none are left, so the link goes.
+drop_old_link() {
+  local old="$HOME/.claude/account-relay"
+  [ -L "$old" ] && rm "$old" && log "removed the old link $old"
+  return 0
+}
+
 fix_scratch_paths() {
   local files f n=0
   files=$(grep -rlE 'Application Support/Claude-[^/"]+/scratch-workspaces/' "$DEFAULT_DIR/claude-code-sessions/" "$DEFAULT_DIR/local-agent-mode-sessions/" 2>/dev/null)
@@ -740,6 +749,7 @@ cmd_restart() {
   quit_default
   apply_prefs_patch
   fix_scratch_paths
+  drop_old_link
   open -a "$APP"
   if [ -n "$session" ]; then
     sleep 15
