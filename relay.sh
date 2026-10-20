@@ -139,6 +139,86 @@ signin_expires() {
   sqlite3 "file:$f?immutable=1" "select datetime(max(expires_utc)/1000000-11644473600,'unixepoch') from cookies where name='sessionKey'" 2>/dev/null
 }
 
+signin_expires_epoch() {
+  local f="$PARK/$1/Cookies"; [ -f "$f" ] || { echo 0; return; }
+  sqlite3 "file:$f?immutable=1" "select coalesce(max(expires_utc)/1000000-11644473600, 0) from cookies where name='sessionKey'" 2>/dev/null || echo 0
+}
+
+# Keep parked sign-ins from expiring (after caam's keepalive: use the login in its own home,
+# then re-read it; a clean exit alone isn't success). For each parked account with fewer than
+# <days> left (default 7, or any with --force): open Claude in the background on a throwaway
+# profile folder holding only that sign-in, let claude.ai load, quit that instance, park the
+# sign-in again. The Claude window you use is never touched.
+#   relay.sh keepalive [<days>] [--force]        (daily from a launchd agent: install-keepalive)
+KEEP="$DIR/keepalive-profile"
+cmd_keepalive() {
+  local days=7 force="" a
+  for a in "$@"; do case "$a" in --force) force=1 ;; *) days="$a" ;; esac; done
+  local id now; now=$(date -u +%s)
+  for id in $(jq -r '.accounts[].accountUuid' "$ACCOUNTS"); do
+    local name; name=$(account_field "$id" name)
+    [ "$(folder_account "$DEFAULT_DIR")" = "$id" ] && continue   # in use: the app keeps it fresh itself
+    if [ ! -f "$PARK/$id/Cookies" ]; then
+      log "keepalive: $name has no parked sign-in"; notify "$name is signed out. Run relay.sh signin-later $name."; continue
+    fi
+    local exp left; exp=$(signin_expires_epoch "$id"); left=$(( (exp - now) / 86400 ))
+    if [ -z "$force" ] && [ "$left" -gt "$days" ]; then log "keepalive: $name good for $left more days"; continue; fi
+    refresh_parked "$id"
+    local after; after=$(signin_expires_epoch "$id")
+    if [ "$after" -gt "$exp" ]; then
+      log "keepalive: $name renewed, now good until $(date -u -r "$after" '+%F %T') UTC"
+    else
+      log "keepalive: $name not renewed; expires $(date -u -r "$exp" '+%F %T') UTC"
+      [ "$left" -le 3 ] && notify "$name's sign-in expires in $left days and couldn't be renewed. Run relay.sh signin-later $name."
+    fi
+  done
+}
+
+refresh_parked() {
+  local id="$1" f
+  if ! mkdir "$LOCK" 2>/dev/null; then log "keepalive: a switch is running; skipped"; return 0; fi
+  mkdir -p "$KEEP"
+  for f in Cookies Cookies-journal; do [ -e "$PARK/$id/$f" ] && mv -f "$PARK/$id/$f" "$KEEP/$f"; done
+  open -g -n -a "$APP" --args "--user-data-dir=$KEEP"
+  local n=0 pid=""
+  while [ $n -lt 90 ]; do
+    pid=$(instance_pid "$KEEP")
+    [ -n "$pid" ] && [ "$(folder_account "$KEEP")" = "$id" ] && break
+    sleep 2; n=$((n+2))
+  done
+  if [ "$(folder_account "$KEEP")" = "$id" ]; then sleep 20; else log "keepalive: $(account_field "$id" name)'s sign-in did not load in the background instance"; fi
+  pid=$(instance_pid "$KEEP"); [ -n "$pid" ] && quit_pid "$pid"
+  for f in Cookies Cookies-journal; do [ -e "$KEEP/$f" ] && mv -f "$KEEP/$f" "$PARK/$id/$f"; done
+  rmdir "$LOCK" 2>/dev/null
+}
+
+cmd_install_keepalive() {
+  local plist="$HOME/Library/LaunchAgents/$LABEL.keepalive.plist"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL.keepalive</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$DIR/relay.sh</string><string>keepalive</string><string>27</string></array>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>30</integer></dict>
+</dict></plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LABEL.keepalive" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$plist" && log "keepalive: daily check installed (04:30)"
+}
+
+# An account's last usage reading, which the mod saves while that account is in use
+# (after caam's `limits --cached`). A window past its reset time counts as reset.
+usage_line() {
+  jq -r --arg a "$1" --argjson now "$(date -u +%s)" '
+    .[$a] // empty
+    | (.windows | map(select(.kind == "five_hour" or .kind == "seven_day")
+        | (if .kind == "five_hour" then "5-hour" else "weekly" end) as $k
+        | if (.resetsAt // "") != "" and ((.resetsAt | sub("\\.[0-9]+"; "") | fromdateiso8601) <= $now)
+          then "\($k) reset since" else "\($k) \(.percentUsed | round)%" end) | join(" · "))
+      + " · as of \((($now - (.at / 1000)) / 60) | floor)m ago"' "$DIR/usage.json" 2>/dev/null | grep . || echo "no reading yet"
+}
+
 # Where an account's sign-in is: in Claude now, parked and ready, or nowhere (needs signin).
 signin_state() {
   if [ "$(folder_account "$DEFAULT_DIR")" = "$1" ]; then echo "in Claude now"
@@ -154,6 +234,7 @@ cmd_status() {
   local id; for id in $(jq -r '.accounts[].accountUuid' "$ACCOUNTS"); do
     local until; until=$(jq -r --arg a "$id" '.cooldowns[$a] // empty' "$STATE")
     echo "  $(account_field "$id" name)  $(account_field "$id" email)  $(signin_state "$id")${until:+  (out of usage until $until)}"
+    echo "      usage: $(usage_line "$id")"
   done
   echo "pending resumes:"; jq -r '.resume[] | "  \(.sessionId)  (\(.reason))"' "$HANDOFF"
 }
@@ -584,5 +665,7 @@ case "${1:-}" in
   sync)   cmd_sync ;;
   guard)  cmd_guard ;;
   install-agents) cmd_install_agents ;;
+  keepalive) shift; cmd_keepalive "$@" ;;
+  install-keepalive) cmd_install_keepalive ;;
   *) echo "usage: relay.sh launch|switch|plan --from <accountUuid> [--resets-at <iso>] | status | relaunch[-later] <name> [--resume <id>] | resume" >&2; exit 2 ;;
 esac

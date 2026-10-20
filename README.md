@@ -14,7 +14,9 @@ macOS only. Built against Claude Desktop 3.1623 / Claude Code 2.1.30x.
   - **Switch to …** asks first, then does the same switch as the automatic one.
   - **Auto-switch** turns automatic switching on or off.
   - The row also shows by itself when usage is above 95%, or when the parked account's sign-in has 3 days or less left.
-- **Parked sign-ins expire.** A claude.ai sign-in was seen to last 28 days from signing in (whether using it extends that isn't tested yet). The row warns when the parked account has 7 days or less left (`relay.sh status` always shows the date); sign it in again with `relay.sh signin-later <name>`. Only the cookie's expiry date is read, never its value.
+- **The other account's usage.** The row and `relay.sh status` show the parked account's last-known usage with its age ("weekly 100% · as of 3h ago"); a window past its reset time shows as reset. The mod saves each account's figures while it's the one in use, so the parked account's are as old as its last session (after caam's `limits --cached`).
+- **Keeping the parked sign-in alive.** A claude.ai sign-in was seen to last 28 days from signing in. Every day at 04:30 a launchd job (`relay.sh keepalive`, installed with `relay.sh install-keepalive`) opens Claude in the background on a throwaway profile folder holding only the parked sign-in, lets claude.ai load, quits it and parks the sign-in again; your own window is never touched. It counts as renewed only if the expiry date moved (after caam's `keepalive`). Whether claude.ai extends a sign-in this way isn't known yet: on a sign-in a few hours old it didn't. If it can't be renewed, you get a notification 3 days before it expires, and the row warns from 7 days out and shows itself from 3; sign it in again with `relay.sh signin-later <name>`. Only cookie expiry dates are read, never values.
+- **Limits on the terminal login are ignored.** A nested `claude` run from a Code tab session signs in with the terminal (Keychain) login, not the app's; a limit there doesn't switch the app (checked with the session's login kind).
 
 ### What carries over in a switch
 

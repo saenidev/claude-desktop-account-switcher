@@ -133,6 +133,15 @@ export const register: Register = on => {
   on('classic.StopFailure', async ($, e, next) => {
     const r = await next(e)
     if (e.error !== 'rate_limit' || !(await isDesktop($))) return r
+    // A nested `claude` started from a Code tab session inherits its environment but signs
+    // in with the terminal (Keychain) login, which this relay doesn't move. Only a limit on
+    // the token the app hands its sessions says the app's account is out.
+    const identity = await $.session.identity().catch(() => undefined)
+    const kind = identity?.kind ?? ''
+    if (['claude.ai', 'console', 'api-key'].includes(kind)) {
+      await log($, `rate_limit in ${e.session_id} on its own ${kind} login, not the app's; not switching`)
+      return r
+    }
     const { rateLimits } = await $.session.usage()
     const full = rateLimits.filter(w => w.kind !== 'spend_limit' && w.percentUsed >= NEAR_FULL)
     const saysLimit = /usage limit|weekly limit|5-hour limit|limit reached|out of (extra )?usage/i.test(e.error_details ?? '')
@@ -141,7 +150,7 @@ export const register: Register = on => {
       return r
     }
     const resetsAt = full.map(w => w.resetsAt).filter((t): t is string => !!t).sort().at(-1)
-    const said = await relay($, e.session_id, e.cwd, `limit hit: ${full.map(w => `${w.kind} ${w.percentUsed}%`).join(', ') || 'limit message'}`, resetsAt)
+    const said = await relay($, e.session_id, e.cwd, `limit hit: ${full.map(w => `${w.kind} ${w.percentUsed}%`).join(', ') || 'limit message'}; login ${identity?.kind ?? 'unknown'}`, resetsAt)
     $.ui.toast(`Account relay: ${said}`, { timeoutMs: 10_000 })
     return r
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
@@ -168,6 +177,37 @@ const WINDOW: Record<string, string> = { five_hour: '5-hour', seven_day: 'weekly
 async function usage($: Host) {
   const { rateLimits } = await $.session.usage().catch(() => ({ rateLimits: [] }))
   return rateLimits.filter(w => w.kind in WINDOW)
+}
+
+// Each account's last usage reading, saved while it's the one in use (after caam's
+// `limits --cached`): the parked account's figures are as old as its last session, so
+// they're shown with their age, and a window past its reset time counts as reset.
+type Snapshot = { at: number; windows: { kind: string; percentUsed: number; resetsAt?: string }[] }
+
+async function saveSnapshot($: Host) {
+  const identity = await $.session.identity().catch(() => undefined)
+  if (['claude.ai', 'console', 'api-key'].includes(identity?.kind ?? '')) return // not the app's login
+  const account = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
+  const windows = await usage($)
+  if (account === '' || windows.length === 0) return
+  const p = await paths($)
+  const all = await readJson<Record<string, Snapshot>>($, `${p.dir}/usage.json`, {})
+  all[account] = { at: Date.now(), windows: windows.map(w => ({ kind: w.kind, percentUsed: w.percentUsed, resetsAt: w.resetsAt })) }
+  await $.fs.write(`${p.dir}/usage.json`, JSON.stringify(all, null, 2) + '\n')
+}
+
+function ago(ms: number) {
+  const m = Math.round(ms / 60000)
+  return m < 60 ? `${m}m ago` : m < 48 * 60 ? `${Math.round(m / 60)}h ago` : `${Math.round(m / 1440)}d ago`
+}
+
+// "weekly 100% (resets Oct 23, 1am) · as of 3h ago", or "weekly reset since" once past it.
+function lastKnown(s: Snapshot | undefined, now: number) {
+  if (s === undefined) return 'no usage reading yet'
+  const parts = s.windows
+    .filter(w => w.kind in WINDOW)
+    .map(w => (w.resetsAt && Date.parse(w.resetsAt) <= now ? `${WINDOW[w.kind]} reset since` : `${WINDOW[w.kind]} ${Math.round(w.percentUsed)}%`))
+  return `${parts.join(' · ')} · as of ${ago(now - s.at)}`
 }
 
 const DAY = 24 * 60 * 60 * 1000
@@ -204,6 +244,7 @@ function registerRow(on: Parameters<Register>[0]) {
   // Usage moves with every turn.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
+    if (await isDesktop($)) await saveSnapshot($).catch(() => undefined)
     await update($, redraw, n => n + 1)
     return r
   })
@@ -224,6 +265,7 @@ function registerRow(on: Parameters<Register>[0]) {
     if (!((await read($, shown)) ?? (near.length > 0 || expiringSoon))) return next(e)
     const cooldowns = (await readJson<{ cooldowns?: Record<string, string> }>($, `${p.dir}/state.json`, {})).cooldowns ?? {}
     const armed = (await readJson<{ armed?: boolean }>($, p.config, {})).armed === true
+    const snapshots = await readJson<Record<string, Snapshot>>($, `${p.dir}/usage.json`, {})
     const me = accounts.find(a => a.accountUuid === current)
     const outUntil = (a: Account) => {
       const t = cooldowns[a.accountUuid]
@@ -287,7 +329,7 @@ function registerRow(on: Parameters<Register>[0]) {
             return (
               <Box gap={1}>
                 <Button key={`to-${a.name}`} label={`Switch to ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name }))} />
-                {out ? <Text dimColor>out until {out}</Text> : null}
+                <Text dimColor>{out ? `out until ${out}` : lastKnown(snapshots[a.accountUuid], now)}</Text>
                 {exp - now < WARN_DAYS * DAY ? <Text>sign-in expires {when(new Date(exp).toISOString())}</Text> : null}
               </Box>
             )
