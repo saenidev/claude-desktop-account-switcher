@@ -9,6 +9,9 @@
 #   relay.sh switch --from <accountUuid> [--resets-at <iso>]   do the switch (what launchd runs)
 #   relay.sh plan   --from <accountUuid>                       print what a switch would do, change nothing
 #   relay.sh status                                            accounts, cooldowns, running instance
+#   relay.sh relaunch <name> [--resume <sessionId>]            restart that account in its own app now (what relaunch-later runs)
+#   relay.sh relaunch-later <name> [--resume <sessionId>]      the same under launchd, so it survives the app quitting
+#   relay.sh resume                                            reopen held sessions (exactly one Claude window open)
 
 set -u
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -29,6 +32,19 @@ notify() { osascript -e "display notification \"$1\" with title \"Claude account
 die() { log "ERROR $*"; notify "$*"; exit 1; }
 
 expand() { local p="$1"; printf '%s' "${p/#\~/$HOME}"; }
+
+# Each account can open with its own copy of the app (accounts.json "app"; default the real one),
+# for example a copy with a different Dock icon. Every such app's main binary counts as a Claude window.
+BINS=("$BIN")
+while read -r a; do [ -n "$a" ] && BINS+=("$(expand "$a")/Contents/MacOS/Claude"); done < <(jq -r '.accounts[].app // empty' "$ACCOUNTS" 2>/dev/null)
+is_main() {
+  [[ "$1" == *"--type="* ]] && return 1
+  local b; for b in "${BINS[@]}"; do [[ "$1" == "$b" || "$1" == "$b "* ]] && return 0; done; return 1
+}
+app_for_dir() {
+  local a; a=$(jq -r --arg d "$1" --arg h "$HOME" '.accounts[] | select((.userDataDir | sub("^~"; $h)) == $d) | .app // empty' "$ACCOUNTS")
+  expand "${a:-$APP}"
+}
 [ -f "$STATE" ] || echo '{"cooldowns":{},"switches":[]}' > "$STATE"
 [ -f "$HANDOFF" ] || echo '{"resume":[]}' > "$HANDOFF"
 
@@ -42,8 +58,7 @@ account_field() { jq -r --arg u "$1" --arg f "$2" '.accounts[] | select(.account
 instance_pid() {
   local want="$1" pid args
   while read -r pid args; do
-    [[ "$args" == "$BIN"* ]] || continue
-    [[ "$args" == *"--type="* ]] && continue
+    is_main "$args" || continue
     if [[ "$args" == *"--user-data-dir="* ]]; then
       local d="${args#*--user-data-dir=}"
       [ "$d" = "$want" ] && { echo "$pid"; return; }
@@ -68,13 +83,12 @@ pick_target() {
 # Always a new instance: `open -a` alone would just bring forward whichever
 # Claude is already running, even one on another profile folder.
 launch_app() {
-  local dir="$1"
-  if [ "$dir" = "$DEFAULT_DIR" ]; then open -n -a "$APP"; else open -n -a "$APP" --args "--user-data-dir=$dir"; fi
+  local dir="$1" app; app=$(app_for_dir "$1")
+  if [ "$dir" = "$DEFAULT_DIR" ]; then open -n -a "$app"; else open -n -a "$app" --args "--user-data-dir=$dir"; fi
 }
 
 # Every running Claude main process, whatever its folder.
-# Match on the program itself ($2), not anywhere in the line: awk's own arguments contain $BIN.
-all_instances() { ps -axo pid=,args= | awk -v bin="$BIN" '$2 == bin && !/--type=/ {print $1}'; }
+all_instances() { local pid args; while read -r pid args; do is_main "$args" && echo "$pid"; done < <(ps -axo pid=,args=); }
 
 wait_gone() { local pid="$1" n=0; while kill -0 "$pid" 2>/dev/null && [ $n -lt "$2" ]; do sleep 1; n=$((n+1)); done; ! kill -0 "$pid" 2>/dev/null; }
 wait_up() { local dir="$1" n=0; while [ -z "$(instance_pid "$dir")" ] && [ $n -lt "$2" ]; do sleep 1; n=$((n+1)); done; [ -n "$(instance_pid "$dir")" ]; }
@@ -94,7 +108,7 @@ parse_args() {
 }
 
 cmd_status() {
-  echo "accounts:"; jq -r '.accounts[] | "  \(.name)  \(.email)  \(.accountUuid)  \(.userDataDir)"' "$ACCOUNTS"
+  echo "accounts:"; jq -r '.accounts[] | "  \(.name)  \(.email)  \(.accountUuid)  \(.userDataDir)  app: \(.app // "/Applications/Claude.app")"' "$ACCOUNTS"
   echo "cooldowns:"; jq -r '.cooldowns | to_entries[] | "  \(.key) until \(.value)"' "$STATE"
   echo "running instances:"
   jq -r '.accounts[] | .userDataDir' "$ACCOUNTS" | while read -r d; do
@@ -115,21 +129,19 @@ cmd_plan() {
   echo "resume: $(jq -r '[.resume[].sessionId] | join(", ")' "$HANDOFF")"
 }
 
-cmd_launch() {
-  parse_args "$@"
-  [ -n "$FROM" ] || die "launch needs --from"
-  local plist="$DIR/$LABEL.plist" uid; uid=$(id -u)
-  # A one-shot job: no KeepAlive, so a failed run is never retried in a loop.
+# Run "relay.sh <args>" once under launchd, so it outlives the Claude app that started it.
+# A one-shot job: no KeepAlive, so a failed run is never retried in a loop.
+run_job() {
+  local plist="$DIR/$LABEL.plist" uid a args=""; uid=$(id -u)
+  for a in "$@"; do args+="    <string>$a</string>"$'\n'; done
   cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key><array>
-    <string>/bin/bash</string><string>$DIR/relay.sh</string><string>switch</string>
-    <string>--from</string><string>$FROM</string>
-    <string>--resets-at</string><string>${RESETS_AT:-}</string>
-  </array>
+    <string>/bin/bash</string><string>$DIR/relay.sh</string>
+$args  </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><false/>
   <key>StandardOutPath</key><string>$DIR/launchd.out</string>
@@ -137,7 +149,44 @@ cmd_launch() {
 </dict></plist>
 EOF
   launchctl bootout "gui/$uid/$LABEL" 2>/dev/null
-  launchctl bootstrap "gui/$uid" "$plist" && log "launch: switch away from $FROM queued under launchd"
+  launchctl bootstrap "gui/$uid" "$plist"
+}
+
+cmd_launch() {
+  parse_args "$@"
+  [ -n "$FROM" ] || die "launch needs --from"
+  run_job switch --from "$FROM" --resets-at "${RESETS_AT:-}" && log "launch: switch away from $FROM queued under launchd"
+}
+
+account_by_name() { jq -r --arg n "$1" '.accounts[] | select(.name == $n) | .accountUuid' "$ACCOUNTS"; }
+
+cmd_relaunch_later() {
+  [ -n "$(account_by_name "${1:-}")" ] || die "relaunch-later: no account named ${1:-}"
+  run_job relaunch "$@" && log "relaunch: $1 queued under launchd"
+}
+
+# Restart one account's window in the app accounts.json gives it, then reopen a session there.
+cmd_relaunch() {
+  local name="${1:-}" id; id=$(account_by_name "$name"); shift || true
+  [ -n "$id" ] || die "relaunch: no account named $name"
+  local session=""; [ "${1:-}" = "--resume" ] && session="${2:-}"
+  local dir pid; dir=$(expand "$(account_field "$id" userDataDir)"); pid=$(instance_pid "$dir")
+  sleep 3   # let the caller's turn finish writing before its app quits
+  if [ -n "$pid" ]; then
+    kill -TERM "$pid"; wait_gone "$pid" 30 || { kill -KILL "$pid"; wait_gone "$pid" 5; }
+    log "relaunch: $name (pid $pid) closed"
+  fi
+  launch_app "$dir"
+  wait_up "$dir" 60 || die "relaunch: $name did not start in $(app_for_dir "$dir")"
+  log "relaunch: $name open in $(app_for_dir "$dir")"
+  [ -n "$session" ] || return 0
+  sleep 12
+  if [ "$(all_instances | wc -l | tr -d ' ')" -gt 1 ]; then
+    jq_write "$HANDOFF" --arg s "$session" --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: $s, cwd: "", reason: "relaunch", at: $at}]'
+    log "relaunch: another Claude window is open; session $session held for relay.sh resume"
+  else
+    open "claude://resume?session=$session" && log "relaunch: reopened session $session"
+  fi
 }
 
 cmd_switch() {
@@ -218,5 +267,7 @@ case "${1:-}" in
   switch) shift; cmd_switch "$@" ;;
   plan)   shift; cmd_plan "$@" ;;
   status) cmd_status ;;
-  *) echo "usage: relay.sh launch|switch|plan --from <accountUuid> [--resets-at <iso>] | status" >&2; exit 2 ;;
+  relaunch) shift; cmd_relaunch "$@" ;;
+  relaunch-later) shift; cmd_relaunch_later "$@" ;;
+  *) echo "usage: relay.sh launch|switch|plan --from <accountUuid> [--resets-at <iso>] | status | relaunch[-later] <name> [--resume <id>] | resume" >&2; exit 2 ;;
 esac

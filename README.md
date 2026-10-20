@@ -46,11 +46,18 @@ These stay in `~/.claude/account-relay` and out of git: `config.json` (`{"armed"
 4. Each new profile folder starts with default app preferences, extensions and session lists. What to copy or link is in the audit section of `desktop-signin-map.md`.
 5. Arm it: `echo '{ "armed": true }' > ~/.claude/account-relay/config.json`
 
+## A different Dock icon per account
+
+An account can open with its own copy of the app: set `"app"` on it in `accounts.json` (default `/Applications/Claude.app`). The relay opens that account with its app, and counts every listed app as a Claude window.
+
+`dock-icon/build.sh [degrees]` builds `~/Applications/Claude Blue.app`: a copy with the icon's hue rotated (225° turns the orange blue), re-signed ad hoc. The copy doesn't auto-update, so rebuild it after each Claude update. Each rebuild changes its signature, so macOS asks once more for the "Claude Safe Storage" key. Opening the orange app by hand, with no `--user-data-dir`, still opens the default folder.
+
 ## Use
 
 - `relay.sh status`: accounts, cooldowns, running windows, pending reopens.
 - `relay.sh plan --from <accountUuid>`: what a switch would do, changing nothing.
 - `relay.sh resume`: reopen held sessions, with exactly one Claude window open.
+- `relay.sh relaunch-later <name> [--resume <sessionId>]`: restart that account's window in its own app (under launchd, so it can close the window it was run from), then reopen the session.
 - `/account-relay` in a Code tab session: status. `/account-relay switch-now` runs the switch on demand.
 - Log: `~/.claude/account-relay/relay.log`
 
