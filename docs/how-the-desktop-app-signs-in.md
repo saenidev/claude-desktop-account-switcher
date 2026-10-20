@@ -1,5 +1,7 @@
 # How Claude Desktop handles sign-in (Claude 2.42304.2, Claude Code 2.1.299)
 
+Research notes from 2026-10-20, kept for reference. The design they led to first (one profile folder per account, one app copy per account) was replaced the same day by switching in place; see the [README](../README.md) for how it works now and [history.md](history.md) for the earlier design. The facts below about where the sign-in lives, how sessions get their token, and the scratch-folder sweep still hold.
+
 Mapped 2026-10-20 from the app's own code (`app.asar` main-process bundle), the Claude Code program the app runs, the app's logs (`~/Library/Logs/Claude/main.log`), caam's Go source, and file/Keychain metadata. No secret values were read or printed; tokens were compared by SHA-256 fingerprint only.
 
 ## Where the sign-in lives

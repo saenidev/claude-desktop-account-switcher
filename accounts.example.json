@@ -4,14 +4,15 @@
       "name": "first",
       "email": "first@example.com",
       "accountUuid": "00000000-0000-0000-0000-000000000001",
-      "userDataDir": "~/Library/Application Support/Claude",
-      "app": "~/Applications/Claude Blue.app"
+      "orgUuid": "00000000-0000-0000-0000-0000000000a1",
+      "userDataDir": "~/Library/Application Support/Claude"
     },
     {
       "name": "second",
       "email": "second@example.com",
       "accountUuid": "00000000-0000-0000-0000-000000000002",
-      "userDataDir": "~/Library/Application Support/Claude-second"
+      "orgUuid": "00000000-0000-0000-0000-0000000000a2",
+      "userDataDir": "~/Library/Application Support/Claude"
     }
   ]
 }

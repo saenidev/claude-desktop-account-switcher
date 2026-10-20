@@ -1,17 +1,23 @@
 #!/bin/bash
-# account-relay: move Claude Desktop to another signed-in profile folder when an
-# account runs out, then reopen the sessions the switch cut off.
+# claude-desktop-account-switcher: switch Claude Desktop to another account in place
+# when one runs out (or by hand), then reopen the sessions the switch cut off.
 #
-# Never reads, copies or prints a token. Each account stays signed in to its own
-# --user-data-dir folder, and that folder's app refreshes its own login.
+# The app's account is its claude.ai sign-in, the Cookies file in its one profile
+# folder. Accounts not in use have theirs parked in $DIR/park/<accountUuid>/; a switch
+# closes Claude, moves the sign-ins, and opens it again. Never reads, copies or prints
+# a token. See README.md.
 #
-#   relay.sh launch --from <accountUuid> [--resets-at <iso>]   start a switch under launchd (returns at once)
-#   relay.sh switch --from <accountUuid> [--resets-at <iso>]   do the switch (what launchd runs)
+#   relay.sh launch --from <accountUuid> [--resets-at <iso>]   start an out-of-usage switch under launchd (returns at once)
+#   relay.sh switch --from <accountUuid> [--resets-at <iso>]   do it (what launchd runs)
 #   relay.sh plan   --from <accountUuid>                       print what a switch would do, change nothing
 #   relay.sh status                                            accounts, cooldowns, running instance
-#   relay.sh relaunch <name> [--resume <sessionId>]            restart that account in its own app now (what relaunch-later runs)
-#   relay.sh relaunch-later <name> [--resume <sessionId>]      the same under launchd, so it survives the app quitting
-#   relay.sh resume                                            reopen held sessions (exactly one Claude window open)
+#   relay.sh swap-later <name> [--resume <sessionId>]          switch to <name> by hand, under launchd (the /account button)
+#   relay.sh signin-later <name> [--resume <sessionId>]        open Claude signed out to sign <name> in, then come back
+#   relay.sh restart-later [--resume <sessionId>]              restart Claude on the same account, fixing settings and scratch paths
+#   relay.sh resume                                            reopen held sessions
+#
+# Left from the earlier one-app-per-account design (docs/history.md), unused now:
+# relaunch, relaunch-later, sync, guard, install-agents.
 
 set -u
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"

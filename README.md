@@ -1,88 +1,122 @@
-# account-relay
+# claude-desktop-account-switcher
 
-When the Claude account the desktop app is running on runs out of usage, move the app to another signed-in account and reopen the Code tab sessions the switch cut off.
+Use two Claude subscriptions in Claude Desktop as if they were one. When the account you're on runs out of usage, the app switches to the other account by itself and reopens the conversation you were in. Your sessions, projects, settings and config stay exactly the same; only the subscription changes. You can also switch by hand.
 
-How the desktop app handles sign-in, and why it's built this way, is in [desktop-signin-map.md](desktop-signin-map.md).
+macOS only. Built against Claude Desktop 3.1623 / Claude Code 2.1.30x.
+
+## Using it
+
+- **Automatic.** With auto-switch on, when a turn fails because a 5-hour or weekly limit is used up, Claude closes, comes back on the other account (about 15 to 30 seconds), and reopens the conversation that was cut off. That conversation gets one message telling it to carry on, so the work continues on its own. It only switches to an account that still has usage; if both are out, you get a notification and nothing changes.
+- **`/account`** in any Code tab session shows or hides a row above the prompt:
+
+  > **saenidev** · 5-hour 2% · weekly 2% · [Switch to second] out until Oct 23, 1am · [Auto-switch: on] · [Hide]
+
+  - **Switch to …** asks first, then does the same switch as the automatic one.
+  - **Auto-switch** turns automatic switching on or off.
+  - The row also shows by itself when usage is above 95%.
+
+### What carries over in a switch
+
+- **Everything on your Mac:** the session list, every conversation's full history, project folders, worktrees, app preferences, `~/.claude` settings, hooks, mods and MCP servers. Both accounts use one shared session list.
+- **Conversations continue across accounts.** Checked on 2026-10-20: a session written on one account on Oct 18 (11 replies with thinking, 17 tool calls) was continued on the other account and answered normally.
+
+### What doesn't
+
+- **Usage and billing** move to the new account. The first message after a switch re-reads the whole conversation without the prompt cache (caches aren't shared between accounts), so it costs more than usual.
+- **Things tied to a claude.ai account follow the account:** claude.ai connectors, Remote Control, cloud sessions, artifacts and shared links.
+- **Claude restarts.** Any window or pane state that isn't saved is reset; open sessions are reopened.
 
 ## How it works
 
-- **One app, one profile folder, switched in place.** The app's account is its claude.ai sign-in (the `Cookies` file in `~/Library/Application Support/Claude`). Each account was signed in once, the normal way; the relay keeps the accounts that aren't in use parked in `~/.claude/account-relay/park/<account>/` and moves the sign-ins in and out while Claude is closed. Sessions, settings and config are one shared set, so only the subscription changes. No token is ever read or copied.
+- **The app's account is its claude.ai sign-in**, the `Cookies` file in its one profile folder (`~/Library/Application Support/Claude`). The account not in use has its sign-in parked in `~/.claude/account-relay/park/<accountUuid>/`. A switch closes Claude, moves the two sign-ins, and opens Claude again; the app then makes its own Code tab token for that account. No token is ever read, copied or printed. The research behind this is in [docs/how-the-desktop-app-signs-in.md](docs/how-the-desktop-app-signs-in.md).
+- **One session list.** The app keeps sessions under `claude-code-sessions/<account>/<org>/` (and `local-agent-mode-sessions/…` for Cowork). Every account/org pair is a link to one shared folder, so both accounts see the same sessions. Session files hold no account fields.
+- **Per-account settings follow you.** A few app preferences are stored per account (keys holding the account or org id in `claude_desktop_config.json`). While Claude is closed for a switch, the relay copies the outgoing account's onto the incoming one.
+- **Scratch paths are kept inside the app's folder.** The app files a session under Scratch only if its folder is inside its own `scratch-workspaces`, and on launch it deletes scratch folders no session names by exact path. While Claude is closed, the relay points any session still using an old profile folder's path back inside it.
 - **The mod** (`mod/`, installed as `account-relay@account-relay-local`) runs in every Code tab session in the desktop app:
   - It records which sessions are mid-turn.
-  - When a turn fails with `rate_limit` while a 5-hour or 7-day window is at 95% or more, and switching is on, it writes a hand-off and starts the relay.
+  - When a turn fails with `rate_limit` while a usage window is at 95% or more (or the error says a limit was reached) and auto-switch is on, it writes a hand-off listing the sessions to reopen and starts the relay.
   - In a session the relay reopened, it sends one message saying why (a usage limit, a switch by hand, a restart, a sign-in) and to carry on.
-  - `/account` shows or hides a row above the prompt: the account, its usage, a button to switch to the other account (asks first), and an auto-switch on/off toggle. The row also shows by itself while usage is above 95%.
-- **The relay** (`relay.sh`, started as a one-shot launchd job, so it survives the app quitting):
-  1. Takes a lock, so only one switch runs at a time.
-  2. Puts the spent account on cooldown until its reset time.
+  - It draws the `/account` row.
+- **The relay** (`relay.sh`) runs as a one-shot launchd job, so it survives Claude quitting:
+  1. Takes a lock, so only one switch runs at a time; a second trigger within 5 minutes is ignored.
+  2. Puts the spent account on cooldown until its reset time (from the usage window).
   3. Picks the next account that isn't cooling down and has a parked sign-in.
-  4. Quits Claude, moves the sign-ins, copies per-account settings across, and opens Claude again.
-  5. Reopens each handed-off session with `claude://resume?session=<id>`.
-  6. If the new sign-in doesn't come up, puts the previous one back.
-- **By hand:** `relay.sh swap <name>` (what the row's button runs), `relay.sh signin <name>` (sign an account in again without losing the current one), `relay.sh restart`.
+  4. Quits Claude, moves the sign-ins, copies per-account settings across, fixes scratch paths, and opens Claude.
+  5. Waits up to 45 seconds for the new account to come up; if it doesn't, puts the previous sign-in back.
+  6. Reopens each handed-off session with `claude://resume?session=<id>`.
 
-## Layout
+## Files
 
-| In this repo | Live location |
+| In this repo | What it is |
 | --- | --- |
-| `relay.sh` | `~/.claude/account-relay/relay.sh` (a link to this file) |
-| `mod/` | `~/.claude/account-relay/mod` (a link to this folder), the source of the `account-relay-local` marketplace |
-| `accounts.example.json` | `~/.claude/account-relay/accounts.json` (real account ids, not in git) |
+| `relay.sh` | The switcher. Linked from `~/.claude/account-relay/relay.sh`. |
+| `mod/` | The Claude Code mod (hooks + the `/account` row). Linked from `~/.claude/account-relay/mod`, which is the `account-relay-local` plugin marketplace. |
+| `accounts.example.json` | Template for `~/.claude/account-relay/accounts.json`. |
+| `tools/migrate-to-inplace.sh` | The one-time move from the old design (shared session list, parked sign-in, blue copy retired). |
+| `docs/` | Research notes on the app's sign-in, and the history of the earlier design. |
+| `dock-icon/`, `tests/matrix.sh` | From the earlier one-app-per-account design; unused now. |
 
-These stay in `~/.claude/account-relay` and out of git: `config.json` (`{"armed": true|false}`), `state.json` (cooldowns, last switches), `handoff.json`, `busy/`, `relay.log`, `backups/`.
+Live state, never in git, in `~/.claude/account-relay/`:
+
+| File | What it holds |
+| --- | --- |
+| `accounts.json` | Each account's `name`, `email`, `accountUuid`, `orgUuid`. |
+| `config.json` | `{ "armed": true }` turns automatic switching on (the row's toggle writes it). |
+| `state.json` | Cooldowns (`accountUuid` → reset time) and the last switches. |
+| `park/<accountUuid>/` | The parked sign-in (`Cookies`, `Cookies-journal`) of each account not in use. |
+| `handoff.json` | Sessions waiting to be reopened. |
+| `busy/` | Which sessions are mid-turn. |
+| `relay.log` | Everything the relay and the mod did, in local time. |
+| `backups/` | Copies taken before each change: session lists, preferences, session files whose paths were rewritten. |
+
+## Commands
+
+Everything day to day is in the `/account` row. The relay commands, for when you need them:
+
+| Command | What it does |
+| --- | --- |
+| `relay.sh status` | Accounts, cooldowns, running windows, sessions waiting to be reopened. |
+| `relay.sh plan --from <accountUuid>` | What an out-of-usage switch would do, changing nothing. |
+| `relay.sh swap-later <name> [--resume <sessionId>]` | Switch to `<name>` by hand (what the row's button runs). |
+| `relay.sh signin-later <name> [--resume <sessionId>]` | Sign `<name>` in again (after a sign-out): parks the current sign-in, opens Claude signed out for you to sign in, then parks the new sign-in and brings the current account back. Gives up after 10 minutes. |
+| `relay.sh restart-later [--resume <sessionId>]` | Restart Claude on the same account, applying `prefs-patch.json` if present and fixing scratch paths. |
+| `relay.sh resume` | Reopen sessions still waiting in the hand-off. |
+
+The `-later` forms run under launchd and wait 10 seconds first, so they can be started from inside the Claude window they close.
 
 ## Setup on a new machine
 
-1. For each extra account, open a profile folder and sign in. Only one Claude app may be running while you sign in, or the login is handed to the wrong one:
-   ```bash
-   open -n -a /Applications/Claude.app --args "--user-data-dir=$HOME/Library/Application Support/Claude-second"
-   ```
-2. Copy `accounts.example.json` to `~/.claude/account-relay/accounts.json` and fill in each account's id. Each folder's `config.json` has it under `lastKnownAccountUuid`.
-3. Link the relay and the mod, then install the mod:
+1. Sign in to the first account in Claude Desktop the normal way.
+2. Copy `accounts.example.json` to `~/.claude/account-relay/accounts.json` and fill in both accounts. The ids of the signed-in account are in `~/Library/Application Support/Claude/config.json` (`lastKnownAccountUuid`); the org id is the folder name under `claude-code-sessions/<accountUuid>/`.
+3. Link the relay and the mod, and install the mod:
    ```bash
    ln -s "$PWD/relay.sh" ~/.claude/account-relay/relay.sh
    ln -s "$PWD/mod" ~/.claude/account-relay/mod
    claude plugin marketplace add ~/.claude/account-relay/mod
    claude plugin install account-relay@account-relay-local --scope user
    ```
-4. Each new profile folder starts with default app preferences, extensions and session lists. What to copy or link is in the audit section of `desktop-signin-map.md`.
-5. Arm it: `echo '{ "armed": true }' > ~/.claude/account-relay/config.json`
+4. Sign the second account in: `~/.claude/account-relay/relay.sh signin-later <second-name>`. Claude closes and opens signed out; sign in to the second account; the relay parks it and brings the first back.
+5. Share one session list: with Claude closed, move each account/org folder's contents under `claude-code-sessions/` and `local-agent-mode-sessions/` into one folder and link the others to it (`tools/migrate-to-inplace.sh` shows how; back up first).
+6. Turn on auto-switch with the row's toggle, or `echo '{ "armed": true }' > ~/.claude/account-relay/config.json`.
 
-## Each account in its own app, one window per folder
+## Rules that keep it safe
 
-Here: **orange** (`/Applications/Claude.app`, the original) is second. **Blue** (`~/Applications/Claude Blue.app`) is saenidev.
+- **One Claude window at a time.** The app has no single-instance lock; two windows on one folder share a sign-in (signing out in one signs out both) and fight over files. Open Claude from the Dock as usual; don't start a second copy.
+- **Change app files only while Claude is closed.** The running app rewrites session files and preferences. That's why every change goes through a relay command that quits Claude first.
+- **Signing out in the app ends that account's sign-in**, parked copy included. Use `signin-later` to sign it back in.
+- **Don't run test switches** onto an account without meaning to: it restarts Claude on that account.
 
-What the app does, from its own code and from tests:
+## Troubleshooting
 
-- It has no single-instance lock. Two windows can open the same profile folder and share its sign-in, so signing out in one signs out both.
-- Only the `--user-data-dir` switch picks a folder (release builds delete `CLAUDE_USER_DATA_DIR`). Dock, Spotlight, Finder and `claude://` links never pass it, so any app opened by hand opens the default folder.
-- Every window claims `claude://` at startup. Copies keep the same bundle id, so they don't fight over it. macOS sends links to the orange app and starts it if it isn't running.
-- The "Claude Safe Storage" Keychain key trusts Anthropic's team ID, plus one fingerprint per re-signed copy.
+- **A switch didn't happen.** Check auto-switch is on (row or `config.json`), the other account isn't on cooldown (`relay.sh status`), and has a parked sign-in (`park/<accountUuid>/Cookies`). Then read `relay.log`.
+- **A session says its folder is missing.** For a scratch session, recreate the folder at the exact path in the session's `cwd`; the conversation is in `~/.claude/projects/` and is unaffected. For a worktree, `git worktree add <path> -b claude/<name> main` brings the folder back (unpushed branch tips can't be recovered).
+- **Scratch sessions show up as projects.** Their paths point outside the app's folder; `relay.sh restart-later` fixes them.
+- **Signed out of an account.** `relay.sh signin-later <name>`.
+- **Undo a change.** Look in `~/.claude/account-relay/backups/`; each change backs up what it touched first.
 
-How it's handled:
+## Uninstall
 
-- **Blue is an untouched copy** of the orange app with a Finder custom icon (`dock-icon/seticon.swift`). It's never re-signed, so there are no Keychain prompts and it updates itself. `"app"` and `"icon"` in `accounts.json` name it.
-- **`relay.sh sync`** puts a copy on the orange app's version, when it isn't running, and puts its icon back. macOS lets only Anthropic-signed processes change a launched Anthropic-signed bundle. So the mod runs sync at every session start; the launchd `sync` agent can only refresh a copy that isn't protected yet.
-- **`relay.sh guard`** runs every 5 seconds from a launchd agent:
-  - A window running the wrong app for its folder is closed, and the folder is reopened in its own app. Opening orange by hand ends up in blue.
-  - Of two windows on one folder, the newer one is closed.
-- **The relay sends links to one app** with `open -a <app> <link>`.
-- **Old copies are unregistered** from LaunchServices before they go to the Trash. A trashed copy otherwise still claims `claude://`.
-- **Sign-in links from the browser go to the orange app.** If you sign saenidev in, the guard then moves the window to blue; the sign-in is stored in the folder either way.
-
-Install the agents with `relay.sh install-agents`. `tests/matrix.sh start --resume <sessionId>` runs every entry point (blue or orange opened by hand, a bare link, the relay) in every starting state (nothing open, saenidev only, second only, both). It closes all windows while it runs. The last run's results are in [tests/matrix-results-2026-10-20.md](tests/matrix-results-2026-10-20.md).
-
-## Use
-
-- `relay.sh status`: accounts, cooldowns, running windows, pending reopens.
-- `relay.sh plan --from <accountUuid>`: what a switch would do, changing nothing.
-- `relay.sh resume`: reopen held sessions, with exactly one Claude window open.
-- `relay.sh relaunch-later <name> [--resume <sessionId>]`: restart that account's window in its own app (under launchd, so it can close the window it was run from), then reopen the session.
-- `/account-relay` in a Code tab session: status. `/account-relay switch-now` runs the switch on demand.
-- Log: `~/.claude/account-relay/relay.log`
-
-## Undo
-
-1. `claude plugin uninstall account-relay@account-relay-local`
-2. `claude plugin marketplace remove account-relay-local`
-3. Remove each extra profile folder's links back to `Claude/` (`claude-code-sessions/<id>`, `local-agent-mode-sessions/<id>`).
+1. Turn auto-switch off.
+2. `claude plugin uninstall account-relay@account-relay-local` and `claude plugin marketplace remove account-relay-local`.
+3. The parked sign-in stays in `~/.claude/account-relay/park/`; delete it to sign that account out for good.
+4. The shared session list keeps working with one account. To split it again, restore `backups/20261020-before-shared-list/` with Claude closed.

@@ -1,4 +1,7 @@
 #!/bin/bash
+# From the retired one-app-per-account design (docs/history.md): it expects a blue app copy and
+# two profile folders, so it does not apply to switching in place.
+#
 # End-to-end matrix: every way a Claude window gets opened, in every starting state, checked
 # from outside (process table, open files, LaunchServices) against one rule: no profile folder
 # ever has more than one window, and each account opens in its own app.
