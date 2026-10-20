@@ -52,6 +52,8 @@ An account can open with its own copy of the app: set `"app"` on it in `accounts
 
 `dock-icon/build.sh [degrees]` builds `~/Applications/Claude Blue.app`: a copy with the icon's hue rotated (225° turns the orange blue), re-signed ad hoc. The copy doesn't auto-update, so rebuild it after each Claude update. Each rebuild changes its signature, so macOS asks once more for the "Claude Safe Storage" key. Opening the orange app by hand, with no `--user-data-dir`, still opens the default folder.
 
+macOS sends `claude://` links to the orange app, and starts it if it isn't running, even when the window you meant runs the copy. That once opened a second window on the same folder. So the relay sends each link to one app with `open -a <app> <link>`. Sign-in links from the browser still go to the orange app: to sign a folder in, open it with the orange app, with no other Claude window running.
+
 ## Use
 
 - `relay.sh status`: accounts, cooldowns, running windows, pending reopens.

@@ -90,6 +90,24 @@ launch_app() {
 # Every running Claude main process, whatever its folder.
 all_instances() { local pid args; while read -r pid args; do is_main "$args" && echo "$pid"; done < <(ps -axo pid=,args=); }
 
+# Main processes running one particular app bundle.
+instances_of() {
+  local bin="$1/Contents/MacOS/Claude" pid args
+  while read -r pid args; do
+    [[ "$args" == *"--type="* ]] && continue
+    [[ "$args" == "$bin" || "$args" == "$bin "* ]] && echo "$pid"
+  done < <(ps -axo pid=,args=)
+}
+
+# The app bundle a main process runs.
+app_of_pid() { local args; args=$(ps -o args= -p "$1"); printf '%s' "${args%%/Contents/MacOS/Claude*}"; }
+
+# Send a claude:// link to one app. A bare `open <link>` goes to whichever app macOS
+# registered for claude:// (the orange one), and starts it if it isn't running, even
+# when the window you meant runs a copy. Among instances of the same app, macOS still
+# picks one, so callers check that only one instance of that app is open.
+send_link() { open -a "$1" "$2"; }
+
 wait_gone() { local pid="$1" n=0; while kill -0 "$pid" 2>/dev/null && [ $n -lt "$2" ]; do sleep 1; n=$((n+1)); done; ! kill -0 "$pid" 2>/dev/null; }
 wait_up() { local dir="$1" n=0; while [ -z "$(instance_pid "$dir")" ] && [ $n -lt "$2" ]; do sleep 1; n=$((n+1)); done; [ -n "$(instance_pid "$dir")" ]; }
 
@@ -181,11 +199,11 @@ cmd_relaunch() {
   log "relaunch: $name open in $(app_for_dir "$dir")"
   [ -n "$session" ] || return 0
   sleep 12
-  if [ "$(all_instances | wc -l | tr -d ' ')" -gt 1 ]; then
+  if [ "$(instances_of "$(app_for_dir "$dir")" | wc -l | tr -d ' ')" -gt 1 ]; then
     jq_write "$HANDOFF" --arg s "$session" --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: $s, cwd: "", reason: "relaunch", at: $at}]'
     log "relaunch: another Claude window is open; session $session held for relay.sh resume"
   else
-    open "claude://resume?session=$session" && log "relaunch: reopened session $session"
+    send_link "$(app_for_dir "$dir")" "claude://resume?session=$session" && log "relaunch: reopened session $session"
   fi
 }
 
@@ -240,16 +258,17 @@ cmd_switch() {
 
   # Give the app time to load its web login before handing it links.
   sleep 12
-  # claude:// links go to whichever instance macOS picks, so only send them
-  # when the target is the one Claude running.
-  if [ "$(all_instances | wc -l | tr -d ' ')" -gt 1 ]; then
-    log "switch: another Claude instance is running; not sending resume links (they could land in the wrong one)"
+  # Links go to the target's app, but macOS picks among several instances of
+  # that app, so only send them when the target is its app's one instance.
+  local to_app; to_app=$(app_for_dir "$to_dir")
+  if [ "$(instances_of "$to_app" | wc -l | tr -d ' ')" -gt 1 ]; then
+    log "switch: another window of $to_app is running; not sending resume links (they could land in the wrong one)"
     notify "Switched to $(account_field "$target" name), but another Claude window is open, so sessions were not reopened. Close it and run: relay.sh resume"
     log "switch: done (resumes held)"; return
   fi
   local ids; ids=$(jq -r '.resume[].sessionId' "$HANDOFF")
   for id in $ids; do
-    open "claude://resume?session=$id" && log "switch: reopened session $id"
+    send_link "$to_app" "claude://resume?session=$id" && log "switch: reopened session $id"
     sleep 3
   done
   notify "Switched to $(account_field "$target" name). Reopened $(echo "$ids" | grep -c . | tr -d ' ') session(s)."
@@ -257,8 +276,10 @@ cmd_switch() {
 }
 
 cmd_resume() {
-  [ "$(all_instances | wc -l | tr -d ' ')" -eq 1 ] || { echo "run this with exactly one Claude window open" >&2; exit 1; }
-  for id in $(jq -r '.resume[].sessionId' "$HANDOFF"); do open "claude://resume?session=$id" && log "resume: reopened session $id"; sleep 3; done
+  local pids; pids=$(all_instances)
+  [ "$(echo "$pids" | grep -c .)" -eq 1 ] || { echo "run this with exactly one Claude window open" >&2; exit 1; }
+  local app; app=$(app_of_pid "$pids")
+  for id in $(jq -r '.resume[].sessionId' "$HANDOFF"); do send_link "$app" "claude://resume?session=$id" && log "resume: reopened session $id"; sleep 3; done
 }
 
 case "${1:-}" in
