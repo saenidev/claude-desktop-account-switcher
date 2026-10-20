@@ -84,6 +84,10 @@ Everything day to day is in the `/account` row. The relay commands, for when you
 | `relay.sh signin-later <name> [--resume <sessionId>]` | Sign `<name>` in again (after a sign-out): parks the current sign-in, opens Claude signed out for you to sign in, then parks the new sign-in and brings the current account back. Gives up after 10 minutes. |
 | `relay.sh restart-later [--resume <sessionId>]` | Restart Claude on the same account, applying `prefs-patch.json` if present and fixing scratch paths. |
 | `relay.sh resume` | Reopen sessions still waiting in the hand-off. |
+| `relay.sh doctor` | Check the whole setup: links, mod installed, accounts, parked sign-ins and days left, one Claude window, shared session list, keep-alive job, no stuck lock. |
+| `relay.sh history [<n>]` | The last switches, sign-ins and keep-alive results. |
+| `relay.sh keepalive [<days>] [--force]` | Renew parked sign-ins with fewer than `<days>` left now (what the daily job runs). |
+| `relay.sh install-keepalive` | Install the daily 04:30 keep-alive job. |
 
 The `-later` forms run under launchd and wait 10 seconds first, so they can be started from inside the Claude window they close.
 

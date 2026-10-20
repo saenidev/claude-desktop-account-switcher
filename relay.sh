@@ -14,6 +14,7 @@
 #   relay.sh swap-later <name> [--resume <sessionId>]          switch to <name> by hand, under launchd (the /account button)
 #   relay.sh signin-later <name> [--resume <sessionId>]        open Claude signed out to sign <name> in, then come back
 #   relay.sh restart-later [--resume <sessionId>]              restart Claude on the same account, fixing settings and scratch paths
+#   relay.sh doctor | history [<n>] | keepalive [<days>] [--force] | install-keepalive
 #   relay.sh resume                                            reopen held sessions
 #
 # Left from the earlier one-app-per-account design (docs/history.md), unused now:
@@ -205,6 +206,47 @@ cmd_install_keepalive() {
 EOF
   launchctl bootout "gui/$(id -u)/$LABEL.keepalive" 2>/dev/null
   launchctl bootstrap "gui/$(id -u)" "$plist" && log "keepalive: daily check installed (04:30)"
+}
+
+# Check the whole setup (after caam's doctor). Prints ok / !! per check; exits 1 if any failed.
+cmd_doctor() {
+  local bad=0
+  ok()   { echo "ok  $*"; }
+  fail() { echo "!!  $*"; bad=1; }
+  [ -L "$DIR/relay.sh" ] && [ -e "$DIR/relay.sh" ] && ok "relay.sh -> $(readlink "$DIR/relay.sh")" || fail "$DIR/relay.sh is not a working link"
+  [ -L "$DIR/mod" ] && [ -e "$DIR/mod/hooks/hooks.json" ] && ok "mod -> $(readlink "$DIR/mod")" || fail "$DIR/mod is not a working link"
+  jq -e '.enabledPlugins["account-relay@account-relay-local"] == true' "$HOME/.claude/settings.json" >/dev/null 2>&1 && ok "mod installed and enabled" || fail "mod not enabled (claude plugin install account-relay@account-relay-local)"
+  local n; n=$(jq '[.accounts[] | select(.accountUuid and .orgUuid and .name)] | length' "$ACCOUNTS" 2>/dev/null || echo 0)
+  [ "$n" -ge 2 ] && ok "$n accounts in accounts.json" || fail "accounts.json needs 2+ accounts with name, accountUuid, orgUuid"
+  local cur; cur=$(folder_account "$DEFAULT_DIR")
+  [ -n "$(account_field "$cur" name)" ] && ok "Claude is signed in as $(account_field "$cur" name)" || fail "Claude is signed in as ${cur:-nobody}, which isn't in accounts.json"
+  local id now; now=$(date -u +%s)
+  for id in $(jq -r '.accounts[].accountUuid' "$ACCOUNTS"); do
+    [ "$id" = "$cur" ] && continue
+    local exp; exp=$(signin_expires_epoch "$id")
+    if [ "$exp" -gt "$now" ]; then ok "$(account_field "$id" name) parked, $(( (exp - now) / 86400 )) days left"
+    else fail "$(account_field "$id" name) has no live parked sign-in (relay.sh signin-later $(account_field "$id" name))"; fi
+  done
+  local pids; pids=$(default_pids | wc -l | tr -d ' ')
+  [ "$pids" -le 1 ] && ok "$pids Claude window(s) on the profile folder" || fail "$pids Claude windows on one profile folder: quit all but one"
+  local kind canon="" d
+  for kind in claude-code-sessions local-agent-mode-sessions; do
+    for d in "$DEFAULT_DIR/$kind"/*/*; do
+      [ -d "$d" ] || continue; case "$d" in *.merged-*) continue ;; esac
+      case "$(basename "$(dirname "$d")")" in ????????-????-????-????-????????????) ;; *) continue ;; esac   # account folders only
+      if [ -L "$d" ]; then canon=$(readlink "$d"); else ok "$kind: shared list $(basename "$(dirname "$d")" | cut -c1-8)/$(basename "$d" | cut -c1-8)"; fi
+    done
+    [ -n "$canon" ] && [ ! -d "$canon" ] && fail "$kind: link points at a missing folder $canon"
+  done
+  launchctl print "gui/$(id -u)/$LABEL.keepalive" >/dev/null 2>&1 && ok "daily keep-alive installed" || fail "daily keep-alive not installed (relay.sh install-keepalive)"
+  [ -d "$LOCK" ] && fail "a switch lock is held ($LOCK); remove it if no switch is running" || ok "no switch running"
+  echo "auto-switch: $(jq -r 'if .armed then "on" else "off" end' "$DIR/config.json" 2>/dev/null || echo off)"
+  return $bad
+}
+
+# Recent switches and sign-in events, newest last (after caam's history).
+cmd_history() {
+  grep -E 'swap: [a-z]+ -> |switch: .* is out|signin: |keepalive: .*(renewed|not renewed)|launched relay away|not switching' "$LOG" | tail -n "${1:-20}"
 }
 
 # An account's last usage reading, which the mod saves while that account is in use
@@ -667,5 +709,7 @@ case "${1:-}" in
   install-agents) cmd_install_agents ;;
   keepalive) shift; cmd_keepalive "$@" ;;
   install-keepalive) cmd_install_keepalive ;;
+  doctor) cmd_doctor ;;
+  history) shift; cmd_history "$@" ;;
   *) echo "usage: relay.sh launch|switch|plan --from <accountUuid> [--resets-at <iso>] | status | relaunch[-later] <name> [--resume <id>] | resume" >&2; exit 2 ;;
 esac
