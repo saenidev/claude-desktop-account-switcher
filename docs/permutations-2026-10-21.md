@@ -112,8 +112,20 @@ Two parts of the logic have too many states to list by hand, so `tests/sweep.sh`
   Also fixed, found reading the code and not reached by any test: two backups of the same kind made in the same second shared a folder, and the second overwrote the first one's files. Each now gets its own folder.
 - **Which account a limit switch picks.** Claude is on alice, and bob and carol are each put in every state that counts. The parked sign-in is live, run out or missing. A cooldown is running, has passed, or there is none. The last usage reading is fine (99%), has a 5-hour window used up, has a weekly window used up and since reset, or has the model's own weekly limit used up. And the limit that was hit is a general one or that model's. `relay.sh plan` must name the first of them that can be picked, or nobody.
 
-## What the stand-in can't show
+## The mod in a real Claude Code session
 
-Which events the real host fires, and in what order, in a live session. The live relay log shows the real host firing the two that matter, with the fields the mod reads: a limit (`StopFailure`, `rate_limit`, a weekly window at 100%, three times) and a reopen (`SessionStart` with `source: resume`, five times).
+`tests/host/live.sh` runs the mod in a real `claude -p` session: the real host, the real model, started as the app starts a session (`CLAUDE_CODE_ENTRYPOINT=claude-desktop` and an account id), in a throwaway home folder, so neither the installed mod nor the real data folder is touched. It costs a few cents of usage a run, so it is run by hand, not by `tests/e2e.sh`. What it shows, 9 checks, all passing:
 
-The one 12-minute run of the suite has no timings (they were added after it), so why it was slow can't be known now. The timed runs since took five to six minutes. The latest took 317 seconds, and no section in it took more than about 30. Every section's wait is bounded (each `wait_for` gives up after its time-out and counts a failure), so a slow run that still passes means the stand-ins were slow to respond, not that something hung. During these runs, four other e2e suites from other projects' sessions were running on the same Mac, one of them for 35 minutes. That kind of load is the likeliest cause, but for the 12-minute run it isn't shown.
+- a turn marks its session busy: the marker (v2, the app's account) is there when the model looks from inside the turn;
+- the turn's end clears it before the session ends: a look taken between two turns of one session finds nothing;
+- a session resumed with a hand-off entry for it uses the entry up, logs the reopen, and gets the carry-on message once, which the session then answers as a turn of its own.
+
+Run on the mod as it was at a2ce8e5 (the one that didn't load), 5 of the 9 fail. The real host can't be made to hit a usage limit on demand, so the limit itself (`StopFailure` with `rate_limit`) is shown only by the live relay log below and by the engine's own test.
+
+## What the stand-ins can't show
+
+Every event the real host fires, in every order, in a live desktop session. The live relay log shows the real host firing the two that matter, with the fields the mod reads: a limit (`StopFailure`, `rate_limit`, a weekly window at 100%, three times) and a reopen (`SessionStart` with `source: resume`, five times).
+
+## The slow run
+
+The run I called a 12-minute run was shorter: the session's own record has it launched at 20:48:28 UTC and done at 20:57:21, 8 minutes 53 seconds, against 5 minutes 24 seconds for the run before it. Its one failure was a check that fails at once, with no wait behind it. It had no section timings (they were added right after), so which part was slow can't be known now. In that half hour other sessions on the Mac were running test suites (pytest in three other projects, one with four subagents of its own, and sf-map workflows driving Chromium and `npm test`), which is evidence of load, not proof that it was the cause. The timed runs since took five to six minutes; the latest took 317 seconds, no section more than about 30. Every wait in the suite is bounded (each `wait_for` gives up after its time-out and counts a failure), so a run that is slow but passes means the stand-ins were slow to answer, not that something hung.
