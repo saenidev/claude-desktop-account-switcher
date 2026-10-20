@@ -1,1 +1,1 @@
-{ "name": "account-relay", "version": "0.1.0", "description": "When a Claude account runs out, hand Code tab sessions to the next signed-in profile folder and reopen them there" }
+{ "name": "account-relay", "version": "0.2.0", "description": "When a Claude account runs out, move the desktop app to the next account and reopen Code tab sessions there; /account shows a row to switch by hand", "types": "./types/index.d.ts" }

@@ -1,14 +1,21 @@
+import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
+
+import type { Step } from '../types'
 
 // When the account a Claude Desktop session runs on is out of usage, record the
 // sessions the switch will cut off and start ~/.claude/account-relay/relay.sh,
-// which moves the app to the next signed-in profile folder and reopens them.
+// which moves the app to the other account and reopens them.
 // A session reopened that way gets one message telling it to carry on.
+//
+// /account shows a row above the prompt to switch by hand and to turn automatic
+// switching on or off; the row also shows by itself while usage is above 95%.
 //
 // Nothing here reads a token: the account comes from the app's own
 // CLAUDE_CODE_ACCOUNT_UUID, the usage from the session's rate-limit windows.
 
 type Host = EngineInterface
+type Account = { name: string; accountUuid: string }
 
 const NEAR_FULL = 95
 const BUSY_FRESH_MS = 6 * 60 * 60 * 1000
@@ -138,4 +145,140 @@ export const register: Register = on => {
     $.ui.toast(`Account relay: ${said}`, { timeoutMs: 10_000 })
     return r
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
+
+  registerRow(on)
+}
+
+// The account row above the prompt.
+
+const step = atom({ plugin: 'account-relay', key: 'step' } as const, { kind: 'idle' } as Step)
+// Bumped when something the row shows may have changed, so it draws again.
+const redraw = atom({ plugin: 'account-relay', key: 'redraw' } as const, 0)
+const shown = atom({ plugin: 'account-relay', key: 'shown' } as const, null as boolean | null)
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+function when(iso: string) {
+  const d = new Date(iso)
+  const h = d.getHours()
+  return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${h % 12 || 12}${h < 12 ? 'am' : 'pm'}`
+}
+
+const WINDOW: Record<string, string> = { five_hour: '5-hour', seven_day: 'weekly' }
+
+async function usage($: Host) {
+  const { rateLimits } = await $.session.usage().catch(() => ({ rateLimits: [] }))
+  return rateLimits.filter(w => w.kind in WINDOW)
+}
+
+function registerRow(on: Parameters<Register>[0]) {
+  on('session.start', async ($, e, next) => {
+    const r = await next(e)
+    if (!(await isDesktop($))) return r
+    await $.command.register({ name: 'account', description: 'Show or hide the account row: switch Claude accounts, turn auto-switch on or off' })
+    return r
+  })
+
+  on('command.run', { command: 'account' }, async $ => {
+    const near = (await usage($)).some(w => w.percentUsed > NEAR_FULL)
+    const visible = (await read($, shown)) ?? near
+    await update($, shown, () => !visible)
+    await update($, step, (): Step => ({ kind: 'idle' }))
+    return { text: visible ? 'Account row hidden.' : 'Account row shown above the prompt.' }
+  })
+
+  // Usage moves with every turn.
+  on('turn.complete', async ($, e, next) => {
+    const r = await next(e)
+    await update($, redraw, n => n + 1)
+    return r
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey || !(await isDesktop($))) return next(e)
+    await read($, redraw)
+    const windows = await usage($)
+    const near = windows.filter(w => w.percentUsed > NEAR_FULL)
+    if (!((await read($, shown)) ?? near.length > 0)) return next(e)
+
+    const p = await paths($)
+    const accounts = (await readJson<{ accounts: Account[] }>($, `${p.dir}/accounts.json`, { accounts: [] })).accounts
+    if (accounts.length < 2) return next(e)
+    const cooldowns = (await readJson<{ cooldowns?: Record<string, string> }>($, `${p.dir}/state.json`, {})).cooldowns ?? {}
+    const armed = (await readJson<{ armed?: boolean }>($, p.config, {})).armed === true
+    const current = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
+    const me = accounts.find(a => a.accountUuid === current)
+    const now = Date.now()
+    const outUntil = (a: Account) => {
+      const t = cooldowns[a.accountUuid]
+      return t !== undefined && Date.parse(t) > now ? when(t) : undefined
+    }
+    const s = await read($, step)
+    const { Box, Button, Text } = $.ui.resolve(e)
+
+    if (s.kind === 'switching') {
+      return (
+        <Box>
+          <Text dimColor>Switching to {s.to}. Claude closes in a few seconds and reopens this session.</Text>
+        </Box>
+      )
+    }
+
+    if (s.kind === 'confirm') {
+      const target = accounts.find(a => a.name === s.to)
+      const out = target ? outUntil(target) : undefined
+      return (
+        <Box gap={1}>
+          <Text>
+            Switch to {s.to}?{out ? ` It's out of usage until ${out}.` : ''} Claude closes and reopens this session.
+          </Text>
+          <Button
+            key="yes"
+            variant="primary"
+            label={`Switch to ${s.to}`}
+            onPress={async () => {
+              await update($, step, (): Step => ({ kind: 'switching', to: s.to }))
+              const sessionId = await $.session.id()
+              const ran = await $.process.run(['/bin/bash', p.relay, 'swap-later', s.to, '--resume', sessionId]).catch(() => undefined)
+              if (ran === undefined || ran.exitCode !== 0) {
+                $.ui.toast(`Couldn't start the switch to ${s.to}. See ~/.claude/account-relay/relay.log.`)
+                await update($, step, (): Step => ({ kind: 'idle' }))
+              }
+            }}
+          />
+          <Button key="cancel" label="Cancel" onPress={() => update($, step, (): Step => ({ kind: 'idle' }))} />
+        </Box>
+      )
+    }
+
+    const used = windows.map(w => `${WINDOW[w.kind]} ${Math.round(w.percentUsed)}%`).join(' · ')
+    return (
+      <Box gap={1}>
+        <Text weight="semibold">{me?.name ?? 'Unknown account'}</Text>
+        {used ? <Text dimColor={near.length === 0}>{used}</Text> : null}
+        {accounts
+          .filter(a => a.accountUuid !== current)
+          .map(a => {
+            const out = outUntil(a)
+            return (
+              <Box gap={1}>
+                <Button key={`to-${a.name}`} label={`Switch to ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name }))} />
+                {out ? <Text dimColor>out until {out}</Text> : null}
+              </Box>
+            )
+          })}
+        <Button
+          key="auto"
+          dimColor
+          label={armed ? 'Auto-switch: on' : 'Auto-switch: off'}
+          onPress={async () => {
+            const config = await readJson<Record<string, unknown>>($, p.config, {})
+            await $.fs.write(p.config, JSON.stringify({ ...config, armed: !armed }, null, 2) + '\n')
+            $.ui.toast(armed ? 'Automatic switching is off.' : 'Automatic switching is on.')
+            await update($, redraw, n => n + 1)
+          }}
+        />
+        <Button key="hide" role="dismiss" dimColor label="Hide" onPress={() => update($, shown, () => false)} />
+      </Box>
+    )
+  })
 }
