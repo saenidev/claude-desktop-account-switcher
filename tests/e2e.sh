@@ -23,7 +23,7 @@ cp "$REPO/tests/fakes/app-start" "$APPDIR/Contents/Resources/start"; chmod +x "$
 plutil -create xml1 "$APPDIR/Contents/Info.plist"; plutil -insert CFBundleShortVersionString -string 3.1623.0 "$APPDIR/Contents/Info.plist"
 echo "$OA" > "$H/orgs/$A"; echo "$OB" > "$H/orgs/$B"; echo "$OC" > "$H/orgs/$C"
 
-REAL_CLAUDE=$(command -v claude || echo claude); REAL_HOME="$HOME"   # for claude plugin test, which the stand-ins would shadow
+REAL_CLAUDE=$(command -v claude || echo claude); REAL_HOME="$HOME"; REAL_PATH="$PATH"   # for the real claude, which the stand-ins would shadow
 export HOME="$H" ACCOUNT_SWITCHER_APP="$APPDIR" ACCOUNT_SWITCHER_FAST=1
 export PATH="$H/.local/bin:$PATH"
 relay() { "$REPO/relay.sh" "$@"; }
@@ -464,6 +464,30 @@ HOME="$REAL_HOME" "$REAL_CLAUDE" plugin test "$T/modkit" > "$T/modkit.out" 2>&1
 for t in "a turn marks its session busy, and its end clears it" "a limit lists the session and the ones mid-turn, then starts the switch" "a reopened session is told why, once"; do
   check "engine: $t" grep -qF "(pass) $t" "$T/modkit.out"
 done
+
+section "a real Claude Code session hits a usage limit (against a stand-in API)"
+# The real claude, with the mod, started as the app starts a session on bob: with a token the
+# app hands it (a dummy here: the API is tests/fakes/api.ts, which refuses every request as a
+# used-up 5-hour window, so no real account is used). Its turn ends on the limit; the mod and
+# the relay take it from there.
+bun "$REPO/tests/fakes/api.ts" "$T/api.log" > "$T/api.port" & API=$!
+wait_for "[ -s '$T/api.port' ]" 10
+mkdir -p "$T/live"; mark
+(cd "$T/live" && env -u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u ANTHROPIC_API_KEY PATH="$REAL_PATH" HOME="$H" \
+  CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-stand-in ANTHROPIC_BASE_URL="http://127.0.0.1:$(cat "$T/api.port")" CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+  CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_ACCOUNT_UUID="$B" \
+  "$REAL_CLAUDE" -p "hi" --plugin-dir "$T/modkit" --settings '{"enabledPlugins":{"desktop-account-switcher@desktop-account-switcher-local":false}}' --output-format json > "$T/live.json" 2>&1)
+kill "$API" 2>/dev/null; wait "$API" 2>/dev/null
+LSID=$(jq -r '.session_id // empty' "$T/live.json" 2>/dev/null)
+check "the session's request was refused as a usage limit" grep -q "POST /v1/messages" "$T/api.log"
+check "the mod read the 5-hour window at 100% from the session" wait_log "launched relay away from $B (limit hit: 5-hour 100%" 10
+check "and listed the session to reopen" jq -e --arg s "$LSID" 'any(.resume[]; .sessionId == $s)' "$D/handoff.json"
+check "the relay switches Claude away from bob" wait_log "swap: bob -> alice" 40
+check "and bob cools down" jq -e --arg b "$B" '.cooldowns[$b] != null' "$D/state.json"
+check "the session is reopened" wait_for "grep -q 'session=$LSID' '$H/links.log'" 40
+wait_log "switch: done" 20
+jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+mark; relay use bob >/dev/null; wait_log "swap: alice -> bob" 40
 
 section "switching while Claude is signed out"
 cp "$P/Cookies" "$T/bob.live"

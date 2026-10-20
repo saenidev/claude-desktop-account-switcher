@@ -120,7 +120,9 @@ Two parts of the logic have too many states to list by hand, so `tests/sweep.sh`
 - the turn's end clears it before the session ends: a look taken between two turns of one session finds nothing;
 - a session resumed with a hand-off entry for it uses the entry up, logs the reopen, and gets the carry-on message once, which the session then answers as a turn of its own.
 
-Run on the mod as it was at a2ce8e5 (the one that didn't load), 5 of the 9 fail. The real host can't be made to hit a usage limit on demand, so the limit itself (`StopFailure` with `rate_limit`) is shown only by the live relay log below and by the engine's own test.
+Run on the mod as it was at a2ce8e5 (the one that didn't load), 5 of the 9 fail.
+
+The limit itself runs on the real host too, in `tests/e2e.sh` ("a real Claude Code session hits a usage limit"). The real `claude` runs with the mod, started as the app starts a session on bob, with a dummy token. It talks to `tests/fakes/api.ts`, a stand-in for Anthropic's API, which refuses every request the way the real API refuses one on a used-up 5-hour window: a 429 with the unified rate-limit headers. No real account is used, so the suite runs it every time. The chain runs end to end: the real host ends the turn with `StopFailure` and `rate_limit`, and the mod reads the 5-hour window at 100% from the session's own usage. It lists the session and launches the relay, which switches the stand-in Claude from bob to alice, records bob's cooldown, and reopens the session.
 
 ## What the stand-ins can't show
 
