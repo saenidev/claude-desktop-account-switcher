@@ -607,6 +607,7 @@ swap_to() {
   fix_scratch_paths
   drop_old_link
   mirror_prefs "$cur" "$target"
+  mirror_rc "$cur" "$target"
   open -a "$APP"
   local n=0; while [ "$(folder_account "$DEFAULT_DIR")" != "$target" ] && [ $n -lt 45 ]; do sleep 1; n=$((n+1)); done
   if [ "$(folder_account "$DEFAULT_DIR")" = "$target" ]; then
@@ -708,6 +709,20 @@ mirror_prefs() {
       . + (to_entries | map(select(.key | contains($f)))
            | map({key: (.key | gsub($f; $t) | gsub($fo; $to)), value}) | from_entries)
     else . end)' "$PREFS" > "$tmp" && jq empty "$tmp" && mv "$tmp" "$PREFS" && log "prefs: $(account_field "$from" name)'s per-account settings copied to $(account_field "$to" name)"
+}
+
+# Remote Control's on/off is kept per account (identities["org:account"].serve in
+# remote-control-state.json); an account with none starts with it off. Carry the on/off over,
+# never the environments, which belong to each account.
+mirror_rc() {
+  local f="$DEFAULT_DIR/remote-control-state.json" fk tk serve
+  [ -f "$f" ] || return 0
+  fk="$(account_field "$1" orgUuid):$1"; tk="$(account_field "$2" orgUuid):$2"
+  serve=$(jq -r --arg k "$fk" '.identities[$k].serve // empty' "$f")
+  [ -n "$serve" ] || return 0
+  [ "$(jq -r --arg k "$tk" '.identities[$k].serve // empty' "$f")" = "$serve" ] && return 0
+  cp -p "$f" "$DIR/backups/remote-control-state.before-mirror.json"
+  jq --arg k "$tk" --arg s "$serve" '.identities[$k] = ((.identities[$k] // {folders: {}, pendingDelete: [], pendingUnarchive: []}) + {serve: $s})' "$f" > "$f.tmp.$$" && jq empty "$f.tmp.$$" && mv "$f.tmp.$$" "$f" && log "remote control: $serve on $(account_field "$2" name), as on $(account_field "$1" name)"
 }
 
 # A one-off settings fix ($DIR/prefs-patch.json), merged in the next time Claude is closed.
