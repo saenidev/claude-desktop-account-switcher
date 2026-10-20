@@ -57,7 +57,7 @@ Every top-level entry of `Claude/` was compared with `Claude-second/`.
 | In-app browser sign-ins (`Partitions`) | **Copied** | Same Mac, same safeStorage key |
 | Login (`Cookies`, `oauth:tokenCacheV2`) | Separate | That's what makes it a different account |
 | Worktree list (`git-worktrees.json`) | Separate, on purpose | Two windows managing the same worktrees could fight. Effect: archiving a second session made in a worktree before today leaves its worktree on disk instead of removing it |
-| Scratch "No folder" workspaces | Not copied | The 23 second scratch sessions point at absolute paths in `Claude/scratch-workspaces/`, which still exist |
+| Scratch "No folder" workspaces | **Linked** (`Claude-second/scratch-workspaces` → `Claude/scratch-workspaces`) | The 23 second scratch sessions point at `Claude/scratch-workspaces/`; without the link the second window listed each as its own project instead of "No folder" |
 | Cowork VM (`vm_bundles`, 10 GB; `claude-code-vm`) | Not copied | The app downloads it again the first time Cowork runs in that window |
 | Web page state (`Local Storage`, `IndexedDB`, `Session Storage`) | Not copied | Holds claude.ai page state tied to the signed-in account. Some UI state (possibly sidebar filters) may live here and need setting once in that window |
 | Caches, GPU caches, crash reports, usage-history charts | Not copied | Rebuilt by the app |
