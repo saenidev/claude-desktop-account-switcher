@@ -12,7 +12,7 @@
 #   relay.sh plan   --from <accountUuid>                       print what a switch would do, change nothing
 #   relay.sh status                                            accounts, cooldowns, running instance
 #   relay.sh swap-later <name> [--resume <sessionId>]          switch to <name> by hand, under launchd (the /account button)
-#   relay.sh signin-later <name> [--resume <sessionId>]        open Claude signed out to sign <name> in, then come back
+#   relay.sh signin-later <name> [--resume <sessionId>]        open Claude signed out to sign <name> in (a new name adds the account), then come back
 #   relay.sh restart-later [--resume <sessionId>]              restart Claude on the same account, fixing settings and scratch paths
 #   relay.sh doctor | history [<n>] | keepalive [<days>] [--force] | install-keepalive
 #   relay.sh resume                                            reopen held sessions
@@ -156,7 +156,7 @@ cmd_keepalive() {
   local days=7 force="" a
   for a in "$@"; do case "$a" in --force) force=1 ;; *) days="$a" ;; esac; done
   local id now; now=$(date -u +%s)
-  for id in $(jq -r '.accounts[].accountUuid' "$ACCOUNTS"); do
+  for id in $(jq -r '.accounts[].accountUuid // empty' "$ACCOUNTS"); do
     local name; name=$(account_field "$id" name)
     [ "$(folder_account "$DEFAULT_DIR")" = "$id" ] && continue   # in use: the app keeps it fresh itself
     if [ ! -f "$PARK/$id/Cookies" ]; then
@@ -290,7 +290,7 @@ cmd_doctor() {
   local cur; cur=$(folder_account "$DEFAULT_DIR")
   [ -n "$(account_field "$cur" name)" ] && ok "Claude is signed in as $(account_field "$cur" name)" || fail "Claude is signed in as ${cur:-nobody}, which isn't in accounts.json"
   local id now; now=$(date -u +%s)
-  for id in $(jq -r '.accounts[].accountUuid' "$ACCOUNTS"); do
+  for id in $(jq -r '.accounts[].accountUuid // empty' "$ACCOUNTS"); do
     [ "$id" = "$cur" ] && continue
     local exp; exp=$(signin_expires_epoch "$id")
     if [ "$exp" -gt "$now" ]; then ok "$(account_field "$id" name) parked, $(( (exp - now) / 86400 )) days left"
@@ -298,18 +298,24 @@ cmd_doctor() {
   done
   local pids; pids=$(default_pids | wc -l | tr -d ' ')
   [ "$pids" -le 1 ] && ok "$pids Claude window(s) on the profile folder" || fail "$pids Claude windows on one profile folder: quit all but one"
-  local kind canon="" d
+  local kind canon d l pair
   for kind in claude-code-sessions local-agent-mode-sessions; do
+    canon=""; for l in "$DEFAULT_DIR/$kind"/*/*; do [ -L "$l" ] && { canon=$(readlink "$l"); break; }; done
     for d in "$DEFAULT_DIR/$kind"/*/*; do
-      [ -d "$d" ] || continue; case "$d" in *.merged-*) continue ;; esac
+      [ -d "$d" ] && [ ! -L "$d" ] || continue; case "$d" in *.merged-*) continue ;; esac
       case "$(basename "$(dirname "$d")")" in ????????-????-????-????-????????????) ;; *) continue ;; esac   # account folders only
-      if [ -L "$d" ]; then canon=$(readlink "$d"); else ok "$kind: shared list $(basename "$(dirname "$d")" | cut -c1-8)/$(basename "$d" | cut -c1-8)"; fi
+      pair="$(basename "$(dirname "$d")" | cut -c1-8)/$(basename "$d" | cut -c1-8)"
+      if [ -z "$canon" ] || [ "$d" = "$canon" ]; then ok "$kind: shared list $pair"
+      else fail "$kind: $pair is a session list of its own, not linked to the shared one (relay.sh restart-later links it)"; fi
     done
     [ -n "$canon" ] && [ ! -d "$canon" ] && fail "$kind: link points at a missing folder $canon"
+    for id in $(jq -r '.accounts[] | select((.orgUuid // "") != "") | .accountUuid // empty' "$ACCOUNTS"); do
+      [ -n "$canon" ] && [ ! -e "$DEFAULT_DIR/$kind/$id/$(account_field "$id" orgUuid)" ] && fail "$kind: $(account_field "$id" name) has no link to the shared list (relay.sh restart-later adds it)"
+    done
   done
   local tcur; tcur=$(cli_account)
   [ -n "$(account_field "$tcur" name)" ] && ok "terminal claude is on $(account_field "$tcur" name)" || fail "terminal claude is on ${tcur:-nobody}, not an account in accounts.json"
-  for id in $(jq -r '.accounts[].accountUuid' "$ACCOUNTS"); do
+  for id in $(jq -r '.accounts[].accountUuid // empty' "$ACCOUNTS"); do
     [ "$id" = "$tcur" ] && continue
     cli_parked "$id" && ok "$(account_field "$id" name) has a parked terminal login" \
       || fail "$(account_field "$id" name) has no parked terminal login: relay.sh cli-save, claude /login as $(account_field "$id" name), relay.sh cli-save, then relay.sh cli-use $(account_field "$tcur" name)"
@@ -350,7 +356,7 @@ cmd_status() {
   echo "auto-switch: $(jq -r 'if .armed then "on" else "off" end' "$DIR/config.json" 2>/dev/null || echo off)"
   echo "terminal claude: on $(account_field "$(cli_account)" name)"
   echo "accounts:"
-  local id; for id in $(jq -r '.accounts[].accountUuid' "$ACCOUNTS"); do
+  local id; for id in $(jq -r '.accounts[].accountUuid // empty' "$ACCOUNTS"); do
     local until; until=$(jq -r --arg a "$id" '.cooldowns[$a] // empty' "$STATE")
     echo "  $(account_field "$id" name)  $(account_field "$id" email)  $(signin_state "$id")${until:+  (out of usage until $until)}"
     echo "      usage: $(usage_line "$id")"
@@ -396,7 +402,7 @@ cmd_launch() {
   run_job switch --from "$FROM" --resets-at "${RESETS_AT:-}" && log "launch: switch away from $FROM queued under launchd"
 }
 
-account_by_name() { jq -r --arg n "$1" '.accounts[] | select(.name == $n) | .accountUuid' "$ACCOUNTS"; }
+account_by_name() { jq -r --arg n "$1" '.accounts[] | select(.name == $n) | .accountUuid // empty' "$ACCOUNTS"; }
 
 cmd_relaunch_later() {
   [ -n "$(account_by_name "${1:-}")" ] || die "relaunch-later: no account named ${1:-}"
@@ -606,6 +612,8 @@ swap_to() {
   apply_prefs_patch
   fix_scratch_paths
   drop_old_link
+  fill_orgs
+  link_sessions
   mirror_prefs "$cur" "$target"
   mirror_rc "$cur" "$target"
   open -a "$APP"
@@ -744,6 +752,75 @@ drop_old_link() {
   return 0
 }
 
+# A new account from signin: its name and the accountUuid the app reports. Fills an entry
+# you added with only a name, or adds one.
+add_account() {
+  local name="$1" id="$2" other; other=$(account_field "$id" name)
+  if [ -n "$other" ]; then log "signin: that sign-in is $other, already in accounts.json; parked it as $other"; notify "That was $other, not a new account. Parked it as $other."; return 0; fi
+  jq_write "$ACCOUNTS" --arg n "$name" --arg u "$id" '
+    if any(.accounts[]; .name == $n) then .accounts |= map(if .name == $n then . + {accountUuid: $u} else . end)
+    else .accounts += [{name: $n, accountUuid: $u, userDataDir: "~/Library/Application Support/Claude"}] end'
+  log "signin: added $name ($id) to accounts.json"
+}
+
+# The org of account $1, from the session folders the app makes for it
+# (claude-code-sessions/<account>/<org>/): the only one, or else the only one no other
+# account in accounts.json has. Empty when that doesn't settle it.
+new_org() {
+  local id="$1" d b orgs="" others
+  for d in "$DEFAULT_DIR"/claude-code-sessions/"$id"/* "$DEFAULT_DIR"/local-agent-mode-sessions/"$id"/*; do
+    b=$(basename "$d"); [[ "$b" =~ ^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$ ]] && orgs+="$b"$'\n'
+  done
+  orgs=$(printf '%s' "$orgs" | sort -u)
+  [ "$(printf '%s' "$orgs" | grep -c .)" -eq 1 ] && { echo "$orgs"; return; }
+  others=$(jq -r --arg u "$id" '.accounts[] | select(.accountUuid != $u) | .orgUuid // empty' "$ACCOUNTS")
+  orgs=$(printf '%s\n' "$orgs" | grep . | grep -vxF -f <(printf '%s\n' "$others" | grep . || echo none))
+  [ "$(printf '%s' "$orgs" | grep -c .)" -eq 1 ] && echo "$orgs"
+}
+
+# Fill in orgUuid for accounts that don't have it yet (a new one, before the app had made
+# its session folder).
+fill_orgs() {
+  local id org
+  for id in $(jq -r '.accounts[] | select((.orgUuid // "") == "") | .accountUuid // empty' "$ACCOUNTS"); do
+    org=$(new_org "$id")
+    if [ -n "$org" ]; then
+      jq_write "$ACCOUNTS" --arg u "$id" --arg o "$org" '.accounts |= map(if .accountUuid == $u then . + {orgUuid: $o} else . end)'
+      log "accounts: $(account_field "$id" name)'s org is $org"
+    else log "accounts: $(account_field "$id" name)'s org isn't known yet; it's filled in on a later switch or restart"; fi
+  done
+}
+
+# One session list for every account: each account/org folder under claude-code-sessions/ and
+# local-agent-mode-sessions/ links to one shared folder. A real folder of an account in
+# accounts.json (the app makes one when a new account first loads) has its sessions moved into
+# the shared folder, is kept as <org>.merged-<stamp>, and becomes a link. An account whose org
+# is known gets its link even before the app makes the folder. Only while Claude is closed:
+# the running app rewrites session files.
+link_sessions() {
+  local stamp kind root canon d l id org f moved; stamp=$(date +%Y%m%d-%H%M%S)
+  for kind in claude-code-sessions local-agent-mode-sessions; do
+    root="$DEFAULT_DIR/$kind"; canon=""
+    for l in "$root"/*/*; do [ -L "$l" ] && { canon=$(readlink "$l"); break; }; done
+    if [ -z "$canon" ] || [ ! -d "$canon" ]; then log "sessions: $kind has no shared list to link to"; continue; fi
+    for id in $(jq -r '.accounts[].accountUuid // empty' "$ACCOUNTS"); do
+      for d in "$root/$id"/*; do
+        [ -d "$d" ] && [ ! -L "$d" ] && [ "$d" != "$canon" ] || continue
+        case "$d" in *.merged-*) continue ;; esac
+        mkdir -p "$DIR/backups/$stamp-shared-list/$kind/$id"
+        ditto "$d" "$DIR/backups/$stamp-shared-list/$kind/$id/$(basename "$d")"
+        moved=0; for f in "$d"/* "$d"/.[!.]*; do [ -e "$f" ] && mv -n "$f" "$canon/" && moved=$((moved+1)); done
+        mv "$d" "$d.merged-$stamp" && ln -s "$canon" "$d"
+        log "sessions: $kind/$(account_field "$id" name)/$(basename "$d") linked to the shared list ($moved item(s) moved in)"
+      done
+      org=$(account_field "$id" orgUuid)
+      if [ -n "$org" ] && [ ! -e "$root/$id/$org" ]; then
+        mkdir -p "$root/$id" && ln -s "$canon" "$root/$id/$org" && log "sessions: $kind/$(account_field "$id" name)/$org linked to the shared list"
+      fi
+    done
+  done
+}
+
 fix_scratch_paths() {
   local files f n=0
   files=$(grep -rlE 'Application Support/Claude-[^/"]+/scratch-workspaces/' "$DEFAULT_DIR/claude-code-sessions/" "$DEFAULT_DIR/local-agent-mode-sessions/" 2>/dev/null)
@@ -765,6 +842,8 @@ cmd_restart() {
   apply_prefs_patch
   fix_scratch_paths
   drop_old_link
+  fill_orgs
+  link_sessions
   open -a "$APP"
   if [ -n "$session" ]; then
     sleep 15
@@ -776,21 +855,38 @@ cmd_restart() {
 #   relay.sh signin <name> [--resume <sessionId>]   (run under launchd by signin-later)
 # Parks the current sign-in, opens Claude signed out for you to sign in to <name>, then
 # parks <name> and brings the previous account back. Gives up after 10 minutes.
+# A <name> not in accounts.json (or there without an accountUuid) is a new account: whatever
+# account other than the current one you sign in to is added under that name, with the ids
+# the app reports, and its session folders are linked to the shared list.
 cmd_signin() {
-  local id; id=$(account_by_name "${1:-}"); [ -n "$id" ] || die "signin: no account named ${1:-}"
+  local name="${1:-}"; [ -n "$name" ] || die "signin: which account? relay.sh signin-later <name>"
+  local id; id=$(account_by_name "$name")
   local session=""; [ "${2:-}" = "--resume" ] && session="${3:-}"
   local cur; cur=$(folder_account "$DEFAULT_DIR")
   sleep 10
   [ -n "$session" ] && hand_off "$session" signin
   quit_default
-  move_signin "$cur" "$id"   # nothing parked for $id, so Claude opens signed out
+  move_signin "$cur" "${id:-new}"   # nothing parked for it, so Claude opens signed out
   open -a "$APP"
-  notify "Sign in to ${1} in Claude. Your other account comes back afterwards."
-  log "signin: waiting for ${1} to be signed in"
-  local n=0; while [ "$(folder_account "$DEFAULT_DIR")" != "$id" ] && [ $n -lt 600 ]; do sleep 2; n=$((n+2)); done
-  if [ "$(folder_account "$DEFAULT_DIR")" = "$id" ]; then log "signin: ${1} signed in"; sleep 8; else log "signin: no sign-in to ${1} within 10 minutes"; fi
+  notify "Sign in to ${name} in Claude. Your other account comes back afterwards."
+  log "signin: waiting for ${name} to be signed in$([ -z "$id" ] && echo " (a new account)")"
+  # While signed out the app still reports the last account, so a new one shows as a change.
+  local now n=0
+  signed_in() { now=$(folder_account "$DEFAULT_DIR"); if [ -n "$id" ]; then [ "$now" = "$id" ]; else [ -n "$now" ] && [ "$now" != "$cur" ]; fi; }
+  while ! signed_in && [ $n -lt 600 ]; do sleep 2; n=$((n+2)); done
+  local new=""
+  if signed_in; then
+    new="$now"; log "signin: ${name} signed in"
+    # The app makes the account's session folder, which names its org, once the Code tab loads.
+    n=0; while [ $n -lt 8 ] || { [ -z "$(new_org "$new")" ] && [ $n -lt 30 ]; }; do sleep 2; n=$((n+2)); done
+  else log "signin: no sign-in to ${name} within 10 minutes"; fi
   quit_default
-  if [ "$(folder_account "$DEFAULT_DIR")" = "$id" ]; then move_signin "$id" "$cur"; else
+  if [ -n "$new" ]; then
+    [ -z "$id" ] && add_account "$name" "$new"
+    fill_orgs
+    link_sessions
+    move_signin "$new" "$cur"
+  else
     local f; for f in Cookies Cookies-journal; do [ -e "$PARK/$cur/$f" ] && mv -f "$PARK/$cur/$f" "$DEFAULT_DIR/$f"; done
   fi
   open -a "$APP"
