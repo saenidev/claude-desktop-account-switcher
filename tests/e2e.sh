@@ -459,11 +459,15 @@ check "and moves nothing" test "$(signed_in_as "$P/Cookies")" = "$B"
 section "the mod in Claude Code's own engine (claude plugin test)"
 # The engine applies Claude Code's own rules: how hooks may be registered, what each event
 # carries, what a hook must return. tests/host/mod.test.ts stands in for the host's services.
-mkdir -p "$T/modkit"; cp -R "$REPO/mod/." "$T/modkit/"; cp "$REPO/tests/host/mod.test.ts" "$T/modkit/hooks/"
+# tests/host/sequences.test.ts runs every order of up to 4 of a session's events.
+mkdir -p "$T/modkit"; cp -R "$REPO/mod/." "$T/modkit/"; cp "$REPO/tests/host/mod.test.ts" "$REPO/tests/host/sequences.test.ts" "$T/modkit/hooks/"
 HOME="$REAL_HOME" "$REAL_CLAUDE" plugin test "$T/modkit" > "$T/modkit.out" 2>&1
 for t in "a turn marks its session busy, and its end clears it" "a limit lists the session and the ones mid-turn, then starts the switch" "a reopened session is told why, once"; do
   check "engine: $t" grep -qF "(pass) $t" "$T/modkit.out"
 done
+check "engine: all 2800 orders of up to 4 events hold to the model" test "$(grep -c '^(pass) events ' "$T/modkit.out")" = 2800
+check "engine: nothing failed" sh -c "! grep -q '^(fail)' '$T/modkit.out'"
+mv "$T/modkit/hooks/sequences.test.ts" "$T/sequences.test.ts"   # the session below needs only the mod
 
 section "a real Claude Code session hits a usage limit (against a stand-in API)"
 # The real claude, with the mod, started as the app starts a session on bob: with a token the
@@ -480,10 +484,12 @@ mkdir -p "$T/live"; mark
 kill "$API" 2>/dev/null; wait "$API" 2>/dev/null
 LSID=$(jq -r '.session_id // empty' "$T/live.json" 2>/dev/null)
 check "the session's request was refused as a usage limit" grep -q "POST /v1/messages" "$T/api.log"
-check "the mod read the 5-hour window at 100% from the session" wait_log "launched relay away from $B (limit hit: 5-hour 100%" 10
 check "and listed the session to reopen" jq -e --arg s "$LSID" 'any(.resume[]; .sessionId == $s)' "$D/handoff.json"
 check "the relay switches Claude away from bob" wait_log "swap: bob -> alice" 40
-check "and bob cools down" jq -e --arg b "$B" '.cooldowns[$b] != null' "$D/state.json"
+# The stand-in API puts the 5-hour reset 3 hours out: a cooldown until then is the window the
+# mod read from the session. (The mod's own log line can be lost here: claude -p exits as the
+# turn ends.)
+check "bob cools down until the 5-hour reset the session reported" jq -e --arg b "$B" --argjson now "$(date -u +%s)" '(.cooldowns[$b] | fromdateiso8601) - ($now + 3*3600) | fabs < 300' "$D/state.json"
 check "the session is reopened" wait_for "grep -q 'session=$LSID' '$H/links.log'" 40
 wait_log "switch: done" 20
 jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"

@@ -112,6 +112,15 @@ Two parts of the logic have too many states to list by hand, so `tests/sweep.sh`
   Also fixed, found reading the code and not reached by any test: two backups of the same kind made in the same second shared a folder, and the second overwrote the first one's files. Each now gets its own folder.
 - **Which account a limit switch picks.** Claude is on alice, and bob and carol are each put in every state that counts. The parked sign-in is live, run out or missing. A cooldown is running, has passed, or there is none. The last usage reading is fine (99%), has a 5-hour window used up, has a weekly window used up and since reset, or has the model's own weekly limit used up. And the limit that was hit is a general one or that model's. `relay.sh plan` must name the first of them that can be picked, or nobody.
 
+## Every order of a session's events
+
+`tests/host/sequences.test.ts` runs in Claude Code's own engine with the suite. It covers every sequence of up to 4 of the events one session can get: a prompt, the turn's end, the session's end, a start on a reopen, at startup or after a compact, and a usage limit. That is 7 + 49 + 343 + 2401 = 2800 sequences. After every event it checks the files and what the session was told against a model stated once:
+- the busy marker is there exactly while a prompt was the last thing to happen;
+- the reopen entry is used up by the first start, with the carry-on message once, and never by a compact;
+- a limit lists this session and the other one mid-turn on its account (never an older mod's marker or another account's), each once, and starts the switch.
+
+All 2800 pass. Its first run failed 210 sequences, every one a limit followed by a reopen. The fixture had Claude closing at the clock's first instant, so a limit at that same instant counted as written before the close, under the one-second grace that `relay.sh` needs because it stamps the close to the second. With the close moved 5 seconds before the first event, all pass. With one bug put in by hand (a reopened session not clearing its own busy marker), 388 fail.
+
 ## The mod in a real Claude Code session
 
 `tests/host/live.sh` runs the mod in a real `claude -p` session: the real host, the real model, started as the app starts a session (`CLAUDE_CODE_ENTRYPOINT=claude-desktop` and an account id), in a throwaway home folder, so neither the installed mod nor the real data folder is touched. It costs a few cents of usage a run, so it is run by hand, not by `tests/e2e.sh`. What it shows, 9 checks, all passing:
@@ -122,7 +131,7 @@ Two parts of the logic have too many states to list by hand, so `tests/sweep.sh`
 
 Run on the mod as it was at a2ce8e5 (the one that didn't load), 5 of the 9 fail.
 
-The limit itself runs on the real host too, in `tests/e2e.sh` ("a real Claude Code session hits a usage limit"). The real `claude` runs with the mod, started as the app starts a session on bob, with a dummy token. It talks to `tests/fakes/api.ts`, a stand-in for Anthropic's API, which refuses every request the way the real API refuses one on a used-up 5-hour window: a 429 with the unified rate-limit headers. No real account is used, so the suite runs it every time. The chain runs end to end: the real host ends the turn with `StopFailure` and `rate_limit`, and the mod reads the 5-hour window at 100% from the session's own usage. It lists the session and launches the relay, which switches the stand-in Claude from bob to alice, records bob's cooldown, and reopens the session.
+The limit itself runs on the real host too, in `tests/e2e.sh` ("a real Claude Code session hits a usage limit"). The real `claude` runs with the mod, started as the app starts a session on bob, with a dummy token. It talks to `tests/fakes/api.ts`, a stand-in for Anthropic's API, which refuses every request the way the real API refuses one on a used-up 5-hour window: a 429 with the unified rate-limit headers. No real account is used, so the suite runs it every time. The chain runs end to end: the real host ends the turn with `StopFailure` and `rate_limit`, and the mod reads the 5-hour window at 100% from the session's own usage. It lists the session and launches the relay, which switches the stand-in Claude from bob to alice and reopens the session. Bob's cooldown runs to the reset the stand-in API gave (3 hours), not the relay's 5-hour default, so the window really came from the session. In one run the mod's own log line for the launch was missing, though the launch happened. The mod writes that line after the launch returns, and `claude -p` exits as its turn ends. A session in the app stays alive, so the suite doesn't check that line.
 
 ## What the stand-ins can't show
 
