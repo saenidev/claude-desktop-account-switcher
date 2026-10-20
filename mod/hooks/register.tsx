@@ -30,6 +30,19 @@ const REOPENED: Record<string, { text: string; toast: string }> = {
   swap: { text: `The desktop app was switched to another account by hand and reopened this session. ${CARRY_ON}`, toast: 'Switched account; carrying on.' },
 }
 
+// Artifacts belong to the claude.ai account that published them, so after a switch the ones
+// this session published are another account's: not found here unless they were shared with
+// this account, with edit access. Each publish shows in the transcript as "Published <file> at <url>".
+const ARTIFACT_MAX = 10
+const ARTIFACTS = (urls: string[]) =>
+  `Artifacts this session published before the switch belong to the account it was on then (${urls.join(', ')}). This account can read or update one only if it was shared with it, with edit access. Before publishing to one again, read it; if the read fails, tell the user, since publishing again makes a new link.`
+
+async function publishedArtifacts($: Host, transcript: string) {
+  const ran = await $.process.run(['/usr/bin/grep', '-oE', 'Published [^"]* at https://claude\\.ai/code/artifact/[0-9a-f-]{36}', '--', transcript]).catch(() => undefined)
+  const urls = (ran?.stdout ?? '').split('\n').map(l => l.replace(/^.* at /, '')).filter(Boolean)
+  return [...new Set(urls)].slice(-ARTIFACT_MAX)
+}
+
 // `account`: the account Claude is on when the session reopens (relay.sh fills it in; the
 // mod's own entries get it once the switch has picked an account). Absent on older entries.
 type Handoff = { resume: { sessionId: string; cwd: string; reason: string; at: string; account?: string }[]; closedAt?: string }
@@ -148,9 +161,13 @@ export const register: Register = on => {
     if (stale.length > 0) await log($, `dropped ${stale.length} stale hand-off entr${stale.length === 1 ? 'y' : 'ies'} (${stale.map(x => x.sessionId).join(', ')})`)
     if (mine === undefined) return r
     const msg = REOPENED[mine.reason] ?? { text: CONTINUE, toast: 'Reopened on another Claude account; carrying on.' }
-    await log($, `reopened ${e.session_id} (${e.source}, ${mine.reason}); sending the carry-on message`)
+    // A restart or sign-in comes back on the same account; a switch doesn't.
+    const switched = mine.reason === 'swap' || REOPENED[mine.reason] === undefined
+    const artifacts = switched ? await publishedArtifacts($, e.transcript_path) : []
+    const text = artifacts.length > 0 ? `${msg.text}\n\n${ARTIFACTS(artifacts)}` : msg.text
+    await log($, `reopened ${e.session_id} (${e.source}, ${mine.reason}); sending the carry-on message${artifacts.length > 0 ? ` (with ${artifacts.length} artifact link(s) from the previous account)` : ''}`)
     $.ui.toast(msg.toast, { timeoutMs: 8000 })
-    $.clock.after(2500, () => void $.prompt.submit({ text: msg.text }))
+    $.clock.after(2500, () => void $.prompt.submit({ text }))
     return r
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 

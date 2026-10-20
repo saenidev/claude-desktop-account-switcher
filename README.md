@@ -63,6 +63,7 @@ Finally, if you use `claude` in a terminal, give each account a parked terminal 
 
 - **Usage and billing** move to the new account. The first message after a switch re-reads the whole conversation without the prompt cache (caches aren't shared between accounts), so it costs more than usual.
 - **Things tied to a claude.ai account follow the account:** claude.ai connectors, cloud sessions, artifacts and shared links. Remote Control's on/off carries over; its environments don't.
+- **Artifacts stay with the account that published them.** After a switch, the other account gets "not found" for them, and publishing again makes a new link. To keep one usable from every account, share it on claude.ai with each other account's email, with edit access, and accept the invitation in that account. A session reopened on another account is told which artifacts it published before, so it checks before publishing again.
 - **Claude restarts.** Any window or pane state that isn't saved is reset; open sessions are reopened.
 
 ## Commands
