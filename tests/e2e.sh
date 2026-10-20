@@ -93,7 +93,7 @@ check "doctor wants a second account" sh -c "'$REPO/relay.sh' doctor | grep -q '
 section "add a second account"
 echo '{"note":"alice'"'"'s session"}' > "$P/claude-code-sessions/$A/$OA/local_alice.json"
 mark; check "add bob is queued" relay add bob
-check "Claude closes and opens signed out" wait_for "running && [ ! -f '$P/Cookies' ]" 20
+check "Claude closes and opens signed out" wait_for "running && [ -z \"\$(signed_in_as '$P/Cookies')\" ]" 20
 sign_in "$B"
 mkdir -p "$P/claude-code-sessions/$B/$OB"; echo '{"note":"made while signing in"}' > "$P/claude-code-sessions/$B/$OB/local_bob.json"
 check "the relay notices the sign-in and brings alice back" wait_log "signin: back on alice" 60
@@ -205,7 +205,7 @@ plutil -replace CFBundleShortVersionString -string 3.1623.0 "$APPDIR/Contents/In
 
 section "a third account, with the shared list already there"
 mark; check "add carol is queued" relay add carol
-check "Claude opens signed out" wait_for "running && [ ! -f '$P/Cookies' ]" 20
+check "Claude opens signed out" wait_for "running && [ -z \"\$(signed_in_as '$P/Cookies')\" ]" 20
 sign_in "$C"
 check "carol is added" wait_log "signin: back on alice" 60
 check "carol has her ids" test "$(uuid_of carol):$(org_of carol)" = "$C:$OC"
@@ -289,7 +289,8 @@ check "bob's sign-in is parked as bob's" test -f "$D/park/$B/Cookies" -a ! -e "$
 mv "$T/bob.cookies" "$D/park/$B/Cookies"
 wait_for "[ -z \"\$(job_pid)\" ]" 10
 # Killed outright, between parking alice's sign-in and the app loading bob's: Claude is closed
-# with bob's Cookies while the app still reports alice.
+# with bob's Cookies while the app still reports alice. Here swap.inflight notes no moves, as
+# a relay before they were noted left it. (tests/sweep.sh cuts a switch off at every move.)
 pkill -f "^$APPDIR/Contents/MacOS/Claude"; wait_for "! running" 10
 mv "$P/Cookies" "$D/park/$A/Cookies"; mv "$D/park/$B/Cookies" "$P/Cookies"; echo "$A $B" > "$D/swap.inflight"
 check "doctor says a switch was cut off" sh -c "'$REPO/relay.sh' doctor | grep -q 'a switch was cut off'"
@@ -316,7 +317,7 @@ mv "$T/bob.cookies" "$D/park/$B/Cookies"
 section "signing in to a known account under a new name (one with quotes, & and <>)"
 DAVE="d'ave & <co> \"x\""
 mark; check "add $DAVE is queued" relay add "$DAVE"
-check "Claude opens signed out" wait_for "running && [ ! -f '$P/Cookies' ]" 20
+check "Claude opens signed out" wait_for "running && [ -z \"\$(signed_in_as '$P/Cookies')\" ]" 20
 check "the job got the name whole" grep -qF "signin: waiting for $DAVE to be signed in" "$D/relay.log"
 check "the notification shows the name as it is" grep -qxF "Sign in to $DAVE in Claude. Your other account comes back afterwards." "$H/notifications.log"
 sign_in "$B"
@@ -354,14 +355,14 @@ jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
 
 section "a sign-in cut off while it waits for you"
 mark; check "add erin is queued" relay add erin
-check "Claude opens signed out" wait_for "running && [ ! -f '$P/Cookies' ]" 20
+check "Claude opens signed out" wait_for "running && [ -z \"\$(signed_in_as '$P/Cookies')\" ]" 20
 check "stopping the job (launchd's SIGTERM)" kill -TERM "$(job_pid)"
 check "puts bob's sign-in back at once" wait_log "signin: cut off; put bob's sign-in back" 30
 check "Claude is on bob" test "$(signed_in_as "$P/Cookies")" = "$B"
 check "Claude is running" wait_for running 10
 wait_for "[ -z \"\$(job_pid)\" ]" 10
 mark; check "add erin is queued again" relay add erin
-check "Claude opens signed out" wait_for "running && [ ! -f '$P/Cookies' ]" 20
+check "Claude opens signed out" wait_for "running && [ -z \"\$(signed_in_as '$P/Cookies')\" ]" 20
 check "killing the job outright (nothing can run)" kill -KILL "$(job_pid)"
 wait_for "[ -z \"\$(job_pid)\" ]" 10
 check "doctor says the sign-in is still parked" sh -c "'$REPO/relay.sh' doctor | grep -q 'still parked'"

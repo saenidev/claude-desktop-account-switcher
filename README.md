@@ -115,4 +115,4 @@ Day to day, everything is in the `/account` row. `~/.claude/desktop-account-swit
 
 ## Developing
 
-`tests/e2e.sh` runs every flow end to end against a stand-in Claude app in a throwaway home folder, and the mod's hooks in a stand-in Claude Code host (needs `bun`; about six minutes; `E2E_FAILFAST=1` stops at the first failure). See [docs/how-it-works.md](docs/how-it-works.md#testing).
+`tests/e2e.sh` runs every flow end to end against a stand-in Claude app in a throwaway home folder, and the mod's hooks in a stand-in Claude Code host (needs `bun`; about five to six minutes; `E2E_FAILFAST=1` stops at the first failure). `tests/sweep.sh` runs two parts in every state they can be in: a switch cut off at each of its moves, and the account a limit switch picks (about 25 minutes). See [docs/how-it-works.md](docs/how-it-works.md#testing).

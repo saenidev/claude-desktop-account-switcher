@@ -1,0 +1,32 @@
+#!/bin/bash
+# Stand-in for mv(1), for tests/sweep.sh: the real mv, except that while $HOME/cut holds
+# "<n> <how>" the relay's launchd job is cut off at the n-th move of a sign-in file (Cookies or
+# Cookies-journal, wherever it goes). <how> is "kill-before" or "kill-after" (SIGKILL, as when
+# the Mac shuts down: no undo runs), or "term-before" or "term-after" (SIGTERM, as launchd
+# stops a job), before or after that move is made. The cut happens once; $HOME/cut is removed.
+# With $HOME/report holding "<n> <uuid>", the app reports <uuid> (lastKnownAccountUuid in its
+# config.json) just before the n-th move: an app that signs in late, just as it's quit.
+cut="$HOME/cut"; report="$HOME/report"; count="$HOME/cut.count"
+src="${*: -2:1}" dst="${*: -1}"
+if { [ -f "$cut" ] || [ -f "$report" ]; } && [[ "${src##*/}" == *Cookies* || "${dst##*/}" == *Cookies* ]]; then
+  c=$(( $(cat "$count" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$count"
+  if [ -f "$report" ]; then
+    read -r rn ru < "$report"
+    if [ "$c" = "$rn" ]; then
+      rm -f "$report"; cfg="$HOME/Library/Application Support/Claude/config.json"
+      jq --arg u "$ru" '.lastKnownAccountUuid = $u' "$cfg" > "$cfg.tmp" && /bin/mv "$cfg.tmp" "$cfg"
+    fi
+  fi
+  if [ -f "$cut" ]; then
+    read -r n how < "$cut"
+    if [ "$c" = "$n" ]; then
+      rm -f "$cut"
+      job=$(cat "$HOME/launchd.pids/local.desktop-account-switcher" 2>/dev/null)
+      sig=KILL; [[ "$how" == term-* ]] && sig=TERM
+      [[ "$how" == *-after ]] && /bin/mv "$@"
+      [ -n "$job" ] && kill -"$sig" "$job"
+      exit 0
+    fi
+  fi
+fi
+exec /bin/mv "$@"

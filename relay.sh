@@ -442,7 +442,7 @@ put_back_keepalive() {
     for f in Cookies Cookies-journal; do [ -e "$KEEP/$f" ] && mv -f "$KEEP/$f" "$PARK/$id/$f"; done
     log "recover: put $(account_field "$id" name)'s sign-in back from the keep-alive profile (a keep-alive was cut off)"
   else
-    b="$DIR/backups/$(date +%Y%m%d-%H%M%S)-keepalive-leftover"; mkdir -p "$b"
+    b=$(backup_dir keepalive-leftover)
     for f in Cookies Cookies-journal; do [ -e "$KEEP/$f" ] && mv -f "$KEEP/$f" "$b/$f"; done
     log "recover: the keep-alive profile held a sign-in for ${id:-an unknown account} that couldn't go back to park/; it's in $b"
   fi
@@ -477,27 +477,43 @@ recover_signin() {
   return 0
 }
 
-# A switch writes swap.inflight ("<from> <to>") just before it moves the sign-ins, and removes
-# it once the new account is up or the old one is back. Found later, the switch was cut off
-# half-way (the Mac shut down, the job was killed): Claude's Cookies may be <to>'s while the
-# app still reports <from>, and moving them now would park <to>'s sign-in as <from>'s. If the
-# app came up on <to>, the switch had worked; otherwise put <from>'s sign-in back.
+# A switch writes swap.inflight ("<from> <to>") just before it moves the sign-ins, adds each
+# move ("<source><tab><destination>") just before making it, and "back" before it moves them
+# back; it removes the file once the new account is up or the old one is back. Found later,
+# the switch was cut off half-way (the Mac shut down, the job was killed): Claude's Cookies may
+# be <to>'s while the app still reports <from>, and moving them now would park <to>'s sign-in
+# as <from>'s. If the app came up on <to> (and the switch wasn't going back), it had worked;
+# otherwise its moves are undone, last first, which puts every file back where it was.
 SWAPPING="$DIR/swap.inflight"
 swap_names() { local f t; read -r f t < "$SWAPPING"; echo "$(account_field "$f" name) to $(account_field "$t" name)"; }
 # With "open" (the switch's own undo, as it's killed), Claude is opened again even if the
 # switch had closed it.
 finish_swap() {
-  local from to was="${1:-}"; read -r from to < "$SWAPPING"
-  if [ -n "$to" ] && [ "$(folder_account "$DEFAULT_DIR")" = "$to" ]; then
+  local from to was="${1:-}" src dst b="" n=0; read -r from to < "$SWAPPING"
+  if [ -n "$to" ] && ! grep -qx back "$SWAPPING" && [ "$(folder_account "$DEFAULT_DIR")" = "$to" ]; then
     log "recover: the cut-off switch to $(account_field "$to" name) had worked"
     rm -f "$SWAPPING"; swap_cli "$to"; return 0
   fi
   [ -n "$(default_pids)" ] && { quit_default; was=1; }
-  # How far the move got (park the current sign-in, then bring the new one in): Claude holds
-  # <to>'s sign-in only once nothing is left parked for <to>; <from>'s is still in Claude
-  # until it has been parked.
-  [ -n "$to" ] && [ ! -e "$PARK/$to/Cookies" ] && [ -e "$DEFAULT_DIR/Cookies" ] && move_pair "$DEFAULT_DIR" "$PARK/$to"
-  [ -n "$from" ] && [ -e "$PARK/$from/Cookies" ] && [ ! -e "$DEFAULT_DIR/Cookies" ] && move_pair "$PARK/$from" "$DEFAULT_DIR"
+  # No moves noted: none made, or the file is from a relay that didn't note them. Then how far
+  # the move got is read from where the files are (park the current sign-in, then bring the
+  # new one in): Claude holds <to>'s only once nothing is left parked for <to>; <from>'s is
+  # still in Claude until it has been parked. With none made, this moves nothing.
+  if [ "$(wc -l < "$SWAPPING")" -le 1 ]; then
+    [ -n "$to" ] && [ ! -e "$PARK/$to/Cookies" ] && [ -e "$DEFAULT_DIR/Cookies" ] && move_pair "$DEFAULT_DIR" "$PARK/$to"
+    [ -n "$from" ] && [ -e "$PARK/$from/Cookies" ] && [ ! -e "$DEFAULT_DIR/Cookies" ] && move_pair "$PARK/$from" "$DEFAULT_DIR"
+  fi
+  # Something at both ends of a move: Claude, opened in the meantime, made the one in its own
+  # folder (it writes nowhere else). If that's the destination, the move hadn't been made.
+  while IFS=$'\t' read -r src dst; do
+    if [ -e "$src" ] && [ -e "$dst" ]; then
+      [ -n "$b" ] || b=$(backup_dir cut-off-switch); n=$((n+1))
+      if [[ "$dst" == "$DEFAULT_DIR/"* ]]; then mv -f "$dst" "$b/$n-${dst##*/}"; continue; fi
+      mv -f "$src" "$b/$n-${src##*/}"
+    fi
+    if [ -e "$dst" ]; then mv -f "$dst" "$src"; fi
+  done < <(sed 1d "$SWAPPING" | grep -vx back | tail -r)
+  [ $n -gt 0 ] && log "recover: Claude was opened during the cut-off switch; what it made is kept in ${b#$DIR/}"
   rm -f "$SWAPPING"
   log "recover: a switch from $(account_field "$from" name) to $(account_field "$to" name) was cut off; put $(account_field "$from" name)'s sign-in back"
   [ -n "$was" ] && open_app
@@ -879,13 +895,17 @@ move_pair() {
   [ -e "$from/Cookies" ] || [ -e "$from/Cookies-journal" ] || return 0
   mkdir -p "$to"
   if [ -e "$to/Cookies" ] || [ -e "$to/Cookies-journal" ]; then
-    b="$DIR/backups/$(date +%Y%m%d-%H%M%S)-${3:-replaced-signin}"; mkdir -p "$b"
-    for f in Cookies Cookies-journal; do [ -e "$to/$f" ] && mv -f "$to/$f" "$b/$f"; done
+    b=$(backup_dir "${3:-replaced-signin}")
+    for f in Cookies Cookies-journal; do [ -e "$to/$f" ] && move_noted "$to/$f" "$b/$f"; done
     log "signin: ${to#$DIR/} already held a sign-in; it's kept in ${b#$DIR/}"
   fi
-  for f in Cookies Cookies-journal; do [ -e "$from/$f" ] && mv -f "$from/$f" "$to/$f"; done
+  for f in Cookies Cookies-journal; do [ -e "$from/$f" ] && move_noted "$from/$f" "$to/$f"; done
   return 0
 }
+# A switch (NOTE_MOVES set) adds each move to swap.inflight before making it.
+move_noted() { [ -z "${NOTE_MOVES:-}" ] || printf '%s\t%s\n' "$1" "$2" >> "$SWAPPING"; mv -f "$1" "$2"; }
+# A new folder in backups/ (two in the same second each get their own).
+backup_dir() { local b="$DIR/backups/$(date +%Y%m%d-%H%M%S)-$1"; [ -e "$b" ] && b="$b-$$-$RANDOM"; mkdir -p "$b"; echo "$b"; }
 
 # Move the sign-in files: park the folder's current ones under $1, bring $2's in.
 move_signin() { move_pair "$DEFAULT_DIR" "$PARK/$1"; move_pair "$PARK/$2" "$DEFAULT_DIR"; }
@@ -912,7 +932,7 @@ swap_to() {
   # From here until the new account is up or the old one is back, a cut-off run is put right
   # (finish_swap): as it's killed, or by the next command.
   echo "$cur $target" > "$SWAPPING"; UNDO="finish_swap open"
-  move_signin "$cur" "$target"
+  NOTE_MOVES=1 move_signin "$cur" "$target"
   while_closed
   mirror_prefs "$cur" "$target"
   mirror_rc "$cur" "$target"
@@ -928,7 +948,8 @@ swap_to() {
   fi
   log "swap: $(account_field "$target" name)'s sign-in did not come up; going back to $(account_field "$cur" name)"
   quit_default
-  move_signin "$target" "$cur"
+  echo back >> "$SWAPPING"
+  NOTE_MOVES=1 move_signin "$target" "$cur"
   rm -f "$SWAPPING"; UNDO=""
   open_app
   return 3
@@ -1307,7 +1328,7 @@ signin_undo() {
   now=$(folder_account "$DEFAULT_DIR")
   if [ -e "$DEFAULT_DIR/Cookies" ] && [ "$now" != "$cur" ]; then
     if [ -n "$(account_field "$now" name)" ] && [ ! -e "$PARK/$now/Cookies" ]; then move_pair "$DEFAULT_DIR" "$PARK/$now"
-    else move_pair "$DEFAULT_DIR" "$DIR/backups/$(date +%Y%m%d-%H%M%S)-cut-off-signin"; fi
+    else move_pair "$DEFAULT_DIR" "$(backup_dir cut-off-signin)"; fi
   fi
   # Anything else left in the profile (a signed-out Cookies) goes to backups/ as it comes back.
   [ -e "$PARK/$cur/Cookies" ] && move_pair "$PARK/$cur" "$DEFAULT_DIR" signed-out-cookies
@@ -1327,7 +1348,7 @@ cmd_remove() {
   lock_or_die remove
   recover_signin
   [ "$id" = "$(folder_account "$DEFAULT_DIR")" ] && die "remove: Claude is on $name now; switch to another account first (relay.sh use <name>)"
-  local b; b="$DIR/backups/$(date +%Y%m%d-%H%M%S)-removed-$name"; mkdir -p "$b"
+  local b; b=$(backup_dir "removed-$name")
   jq --arg u "$id" '.accounts[] | select(.accountUuid == $u)' "$ACCOUNTS" > "$b/account.json"
   [ -d "$PARK/$id" ] && mv "$PARK/$id" "$b/park"
   cli_parked "$id" && security delete-generic-password -s "$CLI_PARK_SVC" -a "$id" >/dev/null 2>&1

@@ -5,6 +5,12 @@
 # in the sessionKey cookie's value, which the real app encrypts; the switcher never reads it.
 # The account's org comes from $HOME/orgs/<accountUuid>.
 profile="$1"; mkdir -p "$profile"
+# With no Cookies it makes an empty cookie database, and empties a journal left there, as the
+# real app does (its journal is truncated, not deleted, after each write).
+if [ ! -e "$profile/Cookies" ]; then
+  sqlite3 "$profile/Cookies" "create table cookies(host_key text, name text, value text, expires_utc integer);"
+  : > "$profile/Cookies-journal"
+fi
 id=$(sqlite3 "file:$profile/Cookies?mode=ro&immutable=1" "select value from cookies where name='sessionKey'" 2>/dev/null)
 [ -n "$id" ] || exit 0
 [ -f "$profile/config.json" ] || echo '{}' > "$profile/config.json"
