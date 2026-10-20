@@ -30,6 +30,8 @@ Then add your other account, from a Code tab session:
 
 or from a terminal, `~/.claude/desktop-account-switcher/relay.sh add <name>`. Claude closes and opens signed out. Sign in to the other account and wait for the Code tab to load. Within half a minute Claude closes again and comes back on your first account. The new account is recorded with the ids the app reports, its sign-in is parked, and both accounts now share one session list (backed up first). Repeat for more accounts. The order they were added is the order they're tried.
 
+`add` is only for a name that isn't set up yet; it never re-points an account you already have. To sign an account you already added in again (its sign-in ran out, or you signed out of it), use the row's Sign in button or `relay.sh signin <name>`. If you sign in to an account that's already set up while adding, it's kept under its own name and nothing new is added.
+
 Finally, if you use `claude` in a terminal, give each account a parked terminal login so it follows the app (below), and check everything with `relay.sh doctor`.
 
 ## Using it
@@ -50,7 +52,7 @@ Finally, if you use `claude` in a terminal, give each account a parked terminal 
 - **Terminal `claude` follows the app.** Its login is the Keychain item `Claude Code-credentials`. Each account not in use has its terminal login parked in its own Keychain item (`desktop-account-switcher-cli`, one per account), never in a file. When the app switches, the terminal switches too, if a parked terminal login exists for the new account; the outgoing login is saved first, so the parked copy is always the newest (refresh tokens rotate, and putting back an old copy can revoke the login). To set it up once: `relay.sh cli-save` (saves the current terminal login), `claude /login` as the other account, `relay.sh cli-save` again, then `relay.sh cli-use <name>` to go back.
 - **A limit in a terminal session moves only the terminal.** A terminal `claude`, or one run from a Code tab session's shell, signs in with the terminal login. When it hits a limit (and auto-switch is on), the mod cools that account down and moves only the terminal login; the app is left alone. New `claude` processes pick up the swapped login; whether one that's already open does isn't tested yet.
 - **Scripted runs retry:** `relay.sh run -- -p "…" [claude args]` runs `claude`, and on a usage limit moves the terminal login and runs it once more.
-- **Don't use another account switcher alongside this** (such as `caam activate claude …`): two tools writing the app's sign-in files fight each other.
+- **Don't use another account switcher alongside this**: two tools writing the app's sign-in files fight each other.
 
 ### What carries over in a switch
 
@@ -70,8 +72,8 @@ Day to day, everything is in the `/account` row. `~/.claude/desktop-account-swit
 | Command | What it does |
 | --- | --- |
 | `setup <name>` | First run on a Mac, from the cloned repo. Safe to run again. |
-| `add <name>` | Sign in another account and add it. |
-| `signin <name>` | Sign an account in again after its sign-in ran out. Gives up after 10 minutes. |
+| `add <name>` | Sign in another account and add it as `<name>`, a name not set up yet. |
+| `signin <name>` | Sign an account you already added in again after its sign-in ran out. Gives up after 10 minutes. |
 | `use <name>` | Switch Claude to `<name>` now. |
 | `remove <name>` | Take an account out. Its parked sign-in is kept in `backups/` until you delete it. |
 | `status` | Accounts, usage, cooldowns, sessions waiting to be reopened. |
@@ -82,7 +84,7 @@ Day to day, everything is in the `/account` row. `~/.claude/desktop-account-swit
 | `cli-save`, `cli-use <name>` | Park the current terminal login; move terminal `claude` to an account's parked login. |
 | `run -- <claude args>` | Run `claude`, retrying once on the next account after a usage limit. |
 
-`add`, `signin`, `use` and `restart` close Claude, so they run as a launchd job and return at once; they work from inside Claude too. `signin`, `use` and `restart` take `--resume <sessionId>` to reopen a session afterwards. How it all works is in [docs/how-it-works.md](docs/how-it-works.md).
+`add`, `signin`, `use` and `restart` close Claude, so they run as a launchd job and return at once; they work from inside Claude too. They take `--resume <sessionId>` to reopen a session afterwards. One runs at a time: while a switch, sign-in or restart (or the keep-alive) is running, another is turned away with "a switch or sign-in is running; try again when it's done". How it all works is in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Rules that keep it safe
 
@@ -98,6 +100,7 @@ Day to day, everything is in the `/account` row. `~/.claude/desktop-account-swit
 - **A session says its folder is missing.** For a scratch session, recreate the folder at the exact path in the session's `cwd`; the conversation is in `~/.claude/projects/` and is unaffected. For a worktree, `git worktree add <path> -b claude/<name> main` brings the folder back (unpushed branch tips can't be recovered).
 - **An account sees an empty session list, or scratch sessions show up as projects.** `relay.sh restart` links the list and fixes the paths.
 - **Signed out of an account.** The row's Sign in button, or `relay.sh signin <name>`.
+- **Claude is signed out after a sign-in or keep-alive was cut off** (the Mac shut down, or the job was killed). The next `use`, `restart`, sign-in or switch puts the parked sign-in back first, and `relay.sh doctor` says if one is out of place; `relay.sh restart` fixes it straight away.
 - **Undo a change.** Look in `~/.claude/desktop-account-switcher/backups/`; each change backs up what it touched first.
 
 ## Uninstall
@@ -105,8 +108,9 @@ Day to day, everything is in the `/account` row. `~/.claude/desktop-account-swit
 1. Turn auto-switch off.
 2. `claude plugin uninstall desktop-account-switcher@desktop-account-switcher-local` and `claude plugin marketplace remove desktop-account-switcher-local`.
 3. `launchctl bootout gui/$(id -u)/local.desktop-account-switcher.keepalive` and delete `~/Library/LaunchAgents/local.desktop-account-switcher.keepalive.plist`.
-4. Parked sign-ins stay in `~/.claude/desktop-account-switcher/park/`; delete them to sign those accounts out for good.
-5. The shared session list keeps working with one account. To split it again, restore the `*-shared-list` folders in `backups/` with Claude closed.
+4. The shared session list keeps working with one account. To split it again, restore the `*-shared-list` folders in `backups/` with Claude closed (do this before the next step).
+5. Delete each account's parked terminal login from the Keychain: `security delete-generic-password -s desktop-account-switcher-cli -a <accountUuid>` for every `accountUuid` in `accounts.json` (an account that has none just says it isn't there).
+6. Remove `~/.claude/desktop-account-switcher`. That deletes the parked sign-ins in `park/` too, which signs those accounts out of Claude for good, and the backups.
 
 ## Developing
 
