@@ -1,7 +1,7 @@
 .DS_Store
 *.log
 mod/.claude-plugin/types/
-# Live state and account ids stay in ~/.claude/account-relay, never here
+# Live state and account ids stay in ~/.claude/desktop-account-switcher, never here
 accounts.json
 state.json
 handoff.json

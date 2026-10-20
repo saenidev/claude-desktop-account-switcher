@@ -23,7 +23,7 @@
 set -u
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-DIR="$HOME/.claude/account-relay"
+DIR="$HOME/.claude/desktop-account-switcher"
 ACCOUNTS="$DIR/accounts.json"
 STATE="$DIR/state.json"
 HANDOFF="$DIR/handoff.json"
@@ -31,7 +31,7 @@ LOG="$DIR/relay.log"
 LOCK="$DIR/switch.lock"
 APP="/Applications/Claude.app"
 BIN="$APP/Contents/MacOS/Claude"
-LABEL="com.jun.account-relay"
+LABEL="com.jun.desktop-account-switcher"
 DEFAULT_DIR="$HOME/Library/Application Support/Claude"
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
@@ -211,13 +211,13 @@ EOF
 # Terminal `claude` follows the app. Its login is the Keychain item "Claude Code-credentials"
 # (mirrored in ~/.claude/.credentials.json) and its account in ~/.claude.json's oauthAccount.
 # The login of an account not in use is parked in its own Keychain item (service
-# "account-relay-cli", account = accountUuid), never in a file; its oauthAccount record (no
+# "desktop-account-switcher-cli", account = accountUuid), never in a file; its oauthAccount record (no
 # secret) in park/<uuid>/oauthAccount.json. A swap first saves the live login to the outgoing
 # account's park, so the parked copy is always the newest (refresh tokens rotate; replaying a
 # stale one can revoke the family). Values go Keychain to Keychain through `security -i` on
 # stdin as hex: never printed, logged, or put on a command line.
 CLI_SVC="Claude Code-credentials"
-CLI_PARK_SVC="account-relay-cli"
+CLI_PARK_SVC="desktop-account-switcher-cli"
 CLI_MIRROR="$HOME/.claude/.credentials.json"
 cli_account() { jq -r '.oauthAccount.accountUuid // empty' "$HOME/.claude.json" 2>/dev/null; }
 cli_parked() { security find-generic-password -s "$CLI_PARK_SVC" -a "$1" >/dev/null 2>&1; }

@@ -4,7 +4,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Step } from '../types'
 
 // When the account a Claude Desktop session runs on is out of usage, record the
-// sessions the switch will cut off and start ~/.claude/account-relay/relay.sh,
+// sessions the switch will cut off and start ~/.claude/desktop-account-switcher/relay.sh,
 // which moves the app to the other account and reopens them.
 // A session reopened that way gets one message telling it to carry on.
 //
@@ -34,7 +34,7 @@ type Busy = { sessionId: string; cwd: string; account: string; busy: boolean; at
 
 async function paths($: Host) {
   const home = (await $.env.get('HOME')) ?? ''
-  const dir = `${home}/.claude/account-relay`
+  const dir = `${home}/.claude/desktop-account-switcher`
   return { dir, handoff: `${dir}/handoff.json`, config: `${dir}/config.json`, busy: `${dir}/busy`, relay: `${dir}/relay.sh`, log: `${dir}/relay.log` }
 }
 
@@ -335,7 +335,7 @@ function registerRow(on: Parameters<Register>[0]) {
               const sessionId = await $.session.id()
               const ran = await $.process.run(['/bin/bash', p.relay, 'swap-later', s.to, '--resume', sessionId]).catch(() => undefined)
               if (ran === undefined || ran.exitCode !== 0) {
-                $.ui.toast(`Couldn't start the switch to ${s.to}. See ~/.claude/account-relay/relay.log.`)
+                $.ui.toast(`Couldn't start the switch to ${s.to}. See ~/.claude/desktop-account-switcher/relay.log.`)
                 await update($, step, (): Step => ({ kind: 'idle' }))
               }
             }}
