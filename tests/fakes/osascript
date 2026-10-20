@@ -1,3 +1,6 @@
 #!/bin/bash
 # Stand-in for osascript: notifications go to $HOME/notifications.log instead of the screen.
-echo "$*" >> "$HOME/notifications.log"
+# The script (-e lines) is skipped; what's logged is its argv, the notification's text, as
+# osascript would hand it to `on run argv`.
+while [ $# -gt 0 ]; do case "$1" in -e) shift 2 ;; *) break ;; esac; done
+printf '%s\n' "$*" >> "$HOME/notifications.log"

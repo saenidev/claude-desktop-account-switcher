@@ -2,7 +2,7 @@
 # End-to-end tests: run relay.sh the way a person does, in a throwaway home folder, against a
 # stand-in Claude app and stand-ins for open, launchctl, the Keychain, notifications and the
 # claude CLI (tests/fakes). Nothing touches the real Claude, Keychain or launchd.
-#   tests/e2e.sh                      (about a minute)
+#   tests/e2e.sh                      (about a minute and a half)
 #   E2E_FAILFAST=1 tests/e2e.sh       stop at the first failure, with the log
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -30,8 +30,8 @@ relay() { "$REPO/relay.sh" "$@"; }
 # A claude.ai sign-in for account $2 in Cookies file $1 (good for 20 days).
 cookies() {
   rm -f "$1"
-  sqlite3 "$1" "create table cookies(name text, value text, expires_utc integer);
-    insert into cookies values('sessionKey', '$2', ($(date -u +%s) + 20*86400 + 11644473600) * 1000000);"
+  sqlite3 "$1" "create table cookies(host_key text, name text, value text, expires_utc integer);
+    insert into cookies values('.claude.ai', 'sessionKey', '$2', ($(date -u +%s) + 20*86400 + 11644473600) * 1000000);"
 }
 signed_in_as() { sqlite3 "file:$1?mode=ro&immutable=1" "select value from cookies where name='sessionKey'" 2>/dev/null; }
 app_pids() { pgrep -f "^$APPDIR/Contents/MacOS/Claude" ; }
@@ -56,7 +56,11 @@ check() {   # check "<what>" <command...>
       echo "app processes:"; ps -axo pid=,args= | grep -F "$APPDIR" | grep -v grep; echo "profile:"; ls "$P"; exit 1; }
   fi
 }
-section() { echo; echo "$*"; }
+# The pid of the relay's launchd job while it runs (the stand-in launchctl keeps it).
+job_pid() { cat "$H/launchd.pids/local.desktop-account-switcher" 2>/dev/null; }
+# Each section starts once the last one's job has finished: a job still running would turn
+# the next command away (as it should).
+section() { wait_for "[ -z \"\$(job_pid)\" ]" 30; echo; echo "$*"; }
 
 # ---- A Mac with Claude signed in to one account ----
 cookies "$P/Cookies" "$A"; open -a "$APPDIR"
@@ -99,6 +103,8 @@ check "alice's session is still there" test -f "$P/claude-code-sessions/$A/$OA/l
 check "Cowork's list is linked too" test -L "$P/local-agent-mode-sessions/$B/$OB"
 check "bob's folder was backed up first" sh -c "ls '$D'/backups/*-shared-list/claude-code-sessions/$B/$OB/local_bob.json"
 check "doctor is happy" relay doctor
+check "add with a name already set up is refused" sh -c "! '$REPO/relay.sh' add bob 2>'$T/err' && grep -q 'bob is already set up; to sign it in again use relay.sh signin bob' '$T/err'"
+check "signin with a name not set up is refused" sh -c "! '$REPO/relay.sh' signin zed 2>'$T/err' && grep -q 'relay.sh add zed' '$T/err'"
 
 section "terminal claude follows the app"
 mkdir -p "$H/keychain/Claude Code-credentials"
@@ -108,10 +114,20 @@ printf 'token-for-bob' > "$H/keychain/Claude Code-credentials/$USER"; jq -n --ar
 check "cli-save parks bob's terminal login" relay cli-save
 check "cli-use alice moves the terminal back" relay cli-use alice
 check "the terminal login is alice's" test "$(cat "$H/keychain/Claude Code-credentials/$USER")" = token-for-alice
+jq --arg u "$B" '.oauthAccount.accountUuid = $u' "$H/.claude.json" > "$T/j" && mv "$T/j" "$H/.claude.json"
+check "a live login that is alice's parked one isn't saved as bob's" sh -c "! '$REPO/relay.sh' cli-save 2>/dev/null"
+check "bob's parked terminal login is untouched" test "$(cat "$H/keychain/desktop-account-switcher-cli/$B")" = token-for-bob
+check "it's logged" grep -q "same as alice's parked one" "$D/relay.log"
+jq --arg u "$A" '.oauthAccount.accountUuid = $u' "$H/.claude.json" > "$T/j" && mv "$T/j" "$H/.claude.json"
 
 section "switch by hand, reopening the session"
+# A private per-account setting: it's copied to the new account, and the file stays private.
+jq -n --arg a "$A" '{("sidebar-" + $a): {width: 300}}' > "$P/claude_desktop_config.json"; chmod 600 "$P/claude_desktop_config.json"
 mark; check "use bob is queued" relay use bob --resume session-1
+check "the hand-off says which account the session comes back on" wait_for "jq -e --arg b '$B' '.resume[] | select(.sessionId == \"session-1\") | .account == \$b' '$D/handoff.json' >/dev/null" 10
 check "the switch finishes" wait_log "swap: alice -> bob" 40
+check "alice's per-account setting is copied to bob" jq -e --arg b "$B" '.["sidebar-" + $b].width == 300' "$P/claude_desktop_config.json"
+check "claude_desktop_config.json is still 0600" test "$(stat -f %Lp "$P/claude_desktop_config.json")" = 600
 check "Claude is signed in as bob" test "$(signed_in_as "$P/Cookies")" = "$B"
 check "the app reports bob" test "$(jq -r .lastKnownAccountUuid "$P/config.json")" = "$B"
 check "alice is parked" test "$(signed_in_as "$D/park/$A/Cookies")" = "$A"
@@ -128,11 +144,12 @@ check "it switches to the next account" wait_log "swap: bob -> alice" 40
 check "Claude is signed in as alice" test "$(signed_in_as "$P/Cookies")" = "$A"
 check "bob cools down until his reset" jq -e --arg b "$B" '.cooldowns[$b] > (now | todate)' "$D/state.json"
 check "the cut-off session is reopened" wait_for "grep -q 'session=session-2' '$H/links.log'" 20
+check "the mod's entry is stamped with the account switched to" jq -e --arg a "$A" '.resume[] | select(.sessionId == "session-2") | .account == $a' "$D/handoff.json"
 wait_log "switch: done" 20
 
 section "every account out"
 jq --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: "session-3", cwd: "", reason: "limit hit", at: $at}]' "$D/handoff.json" > "$T/h" && mv "$T/h" "$D/handoff.json"
-check "a switch with nowhere to go fails" sh -c "XPC_SERVICE_NAME=local.desktop-account-switcher '$REPO/relay.sh' switch --from $A 2>/dev/null; [ \$? -ne 0 ]"
+check "a switch with nowhere to go fails" sh -c "'$REPO/relay.sh' switch --from $A 2>/dev/null; [ \$? -ne 0 ]"
 check "Claude stays on alice" test "$(signed_in_as "$P/Cookies")" = "$A"
 check "you're told" grep -q "every other account is too" "$H/notifications.log"
 check "the limit's hand-off is dropped" sh -c "! jq -e '.resume[] | select(.sessionId == \"session-3\")' '$D/handoff.json'"
@@ -144,6 +161,14 @@ jq --arg b "$B" --arg r "$(date -u -v+2d +%FT%TZ)" --argjson at "$(date +%s)000"
 check "plan finds nobody to switch to" sh -c "'$REPO/relay.sh' plan --from $A | grep -q 'nobody'"
 jq --arg b "$B" '.[$b].windows[0].resetsAt = "2020-01-01T00:00:00Z"' "$D/usage.json" > "$T/u" && mv "$T/u" "$D/usage.json"
 check "once that window has reset, bob is picked" sh -c "'$REPO/relay.sh' plan --from $A | grep -q '^to: *bob'"
+jq --arg b "$B" --arg r "$(date -u -v+2d +%FT%T)+00:00" '.[$b].windows[0].resetsAt = $r' "$D/usage.json" > "$T/u" && mv "$T/u" "$D/usage.json"
+check "a reset time written with +00:00 counts too" sh -c "'$REPO/relay.sh' plan --from $A | grep -q 'nobody'"
+cp "$D/usage.json" "$T/u.saved"; echo '{"broken' > "$D/usage.json"
+mark; check "with usage.json unreadable, bob is still picked" sh -c "'$REPO/relay.sh' plan --from $A | grep -q '^to: *bob'"
+check "and that's logged" wait_log "couldn't read the usage figures" 5
+mv "$T/u.saved" "$D/usage.json"
+jq --arg b "$B" 'del(.[$b])' "$D/usage.json" > "$T/u" && mv "$T/u" "$D/usage.json"
+check "an option given last with no value doesn't crash" sh -c "! '$REPO/relay.sh' plan --from 2>&1 | grep -q 'unbound variable'"
 jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
 
 section "the app's files moved (an app update)"
@@ -155,6 +180,23 @@ check "bob stays parked" test "$(signed_in_as "$D/park/$B/Cookies")" = "$B"
 check "doctor says what's wrong" sh -c "'$REPO/relay.sh' doctor | grep -q 'lastKnownAccountUuid'"
 mv "$T/c.saved" "$P/config.json"
 
+section "an update that moves the app's files installs while Claude is closed for a switch"
+# A stand-in ShipIt: still installing as the relay quits Claude, then the app is a new version
+# that keeps no lastKnownAccountUuid in config.json.
+mkdir -p "$T/Squirrel.framework/Resources"
+printf '%s\n' "sleep 4" \
+  "plutil -replace CFBundleShortVersionString -string 3.9999.0 '$APPDIR/Contents/Info.plist'" \
+  "jq 'del(.lastKnownAccountUuid)' '$P/config.json' > '$T/c' && mv '$T/c' '$P/config.json'" > "$T/Squirrel.framework/Resources/ShipIt"
+/bin/bash "$T/Squirrel.framework/Resources/ShipIt" &
+mark; check "use bob is queued" relay use bob
+check "the relay waits for the update" wait_log "update: Claude 3.1623.0 -> 3.9999.0 installed while closed" 30
+check "and then doesn't switch" wait_log "doesn't keep its files where this expects" 10
+check "the switch fails" wait_log "ERROR switch to bob failed" 20
+check "Claude keeps alice's sign-in" test "$(signed_in_as "$P/Cookies")" = "$A"
+check "bob stays parked" test "$(signed_in_as "$D/park/$B/Cookies")" = "$B"
+check "Claude is open again" wait_for running 10
+plutil -replace CFBundleShortVersionString -string 3.1623.0 "$APPDIR/Contents/Info.plist"
+
 section "a third account, with the shared list already there"
 mark; check "add carol is queued" relay add carol
 check "Claude opens signed out" wait_for "running && [ ! -f '$P/Cookies' ]" 20
@@ -163,13 +205,21 @@ check "carol is added" wait_log "signin: back on alice" 60
 check "carol has her ids" test "$(uuid_of carol):$(org_of carol)" = "$C:$OC"
 check "carol's list links to the same shared one" test "$(readlink "$P/claude-code-sessions/$C/$OC")" = "$P/claude-code-sessions/$A/$OA"
 check "doctor is happy with three" relay doctor
+# Terminal claude is on alice; bob is cooling down and carol has no parked terminal login.
+jq --arg b "$B" --arg u "$(date -u -v+3H +%FT%TZ)" '.cooldowns[$b] = $u' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+check "a terminal limit doesn't move to an account with no parked terminal login" sh -c "! '$REPO/relay.sh' cli-switch 2>/dev/null"
+check "terminal claude stays on alice" test "$(cat "$H/keychain/Claude Code-credentials/$USER")" = token-for-alice
+jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
 
-section "signing in to a known account under a new name"
-mark; check "add dave is queued" relay add dave
+section "signing in to a known account under a new name (one with quotes, & and <>)"
+DAVE="d'ave & <co> \"x\""
+mark; check "add $DAVE is queued" relay add "$DAVE"
 check "Claude opens signed out" wait_for "running && [ ! -f '$P/Cookies' ]" 20
+check "the job got the name whole" grep -qF "signin: waiting for $DAVE to be signed in" "$D/relay.log"
+check "the notification shows the name as it is" grep -qxF "Sign in to $DAVE in Claude. Your other account comes back afterwards." "$H/notifications.log"
 sign_in "$B"
 check "it's kept as bob" wait_log "that sign-in is bob" 60
-check "nobody named dave is added" wait_for "[ -z \"\$(uuid_of dave)\" ] && tail -n +$((MARK + 1)) '$D/relay.log' | grep -q 'signin: back on alice'" 30
+check "nobody named dave is added" wait_for "[ -z \"\$(uuid_of \"\$DAVE\")\" ] && tail -n +$((MARK + 1)) '$D/relay.log' | grep -q 'signin: back on alice'" 30
 check "bob's new sign-in is parked" test "$(signed_in_as "$D/park/$B/Cookies")" = "$B"
 
 section "remove an account"
@@ -178,6 +228,56 @@ check "remove carol" relay remove carol
 check "carol is gone from accounts.json" test -z "$(uuid_of carol)"
 check "her sign-in is kept in backups" sh -c "ls '$D'/backups/*-removed-carol/park/Cookies"
 check "no parked sign-in is left for her" test ! -e "$D/park/$C"
+
+section "a switch whose new sign-in doesn't come up goes back"
+cp "$D/park/$B/Cookies" "$T/bob.cookies"
+sqlite3 "$T/dud" "create table cookies(host_key text, name text, value text, expires_utc integer);" && mv "$T/dud" "$D/park/$B/Cookies"
+mark; check "use bob is queued" relay use bob
+check "bob's sign-in doesn't come up, so it goes back" wait_log "did not come up; going back to alice" 40
+check "the switch fails" wait_log "ERROR switch to bob failed" 20
+check "Claude is on alice again" test "$(signed_in_as "$P/Cookies")" = "$A"
+check "Claude is running" running
+mv "$T/bob.cookies" "$D/park/$B/Cookies"
+
+section "a second command never kills one that's running"
+mark; check "use bob is queued" relay use bob
+check "a restart while it runs is refused" sh -c "! '$REPO/relay.sh' restart 2>'$T/err' && grep -q 'a switch or sign-in is running' '$T/err'"
+check "the mod's launch while it runs is fine" relay launch --from "$B"
+check "and only logs that a switch is under way" wait_log "launch: a switch is already under way" 5
+check "the first switch finishes" wait_log "swap: alice -> bob" 40
+check "Claude is on bob" test "$(signed_in_as "$P/Cookies")" = "$B"
+check "nothing else ran" sh -c "! tail -n +$((MARK + 1)) '$D/relay.log' | grep -qE 'restart : queued|switch: .* is out'"
+
+section "a sign-in cut off while it waits for you"
+mark; check "add erin is queued" relay add erin
+check "Claude opens signed out" wait_for "running && [ ! -f '$P/Cookies' ]" 20
+check "stopping the job (launchd's SIGTERM)" kill -TERM "$(job_pid)"
+check "puts bob's sign-in back at once" wait_log "signin: cut off; put bob's sign-in back" 30
+check "Claude is on bob" test "$(signed_in_as "$P/Cookies")" = "$B"
+check "Claude is running" wait_for running 10
+wait_for "[ -z \"\$(job_pid)\" ]" 10
+mark; check "add erin is queued again" relay add erin
+check "Claude opens signed out" wait_for "running && [ ! -f '$P/Cookies' ]" 20
+check "killing the job outright (nothing can run)" kill -KILL "$(job_pid)"
+wait_for "[ -z \"\$(job_pid)\" ]" 10
+check "doctor says the sign-in is still parked" sh -c "'$REPO/relay.sh' doctor | grep -q 'still parked'"
+mark; check "a restart is queued" relay restart
+check "it puts bob's sign-in back first" wait_log "recover: put bob's sign-in back into Claude" 30
+check "and takes over the lock the killed job left" grep -q "lock: taking over a lock" "$D/relay.log"
+check "Claude is on bob" test "$(signed_in_as "$P/Cookies")" = "$B"
+check "Claude is running after the restart" wait_for "running && [ -z \"\$(job_pid)\" ]" 30
+check "erin wasn't added" test -z "$(uuid_of erin)"
+check "doctor is happy" relay doctor
+
+section "the keep-alive skips while something holds the lock"
+mkdir "$D/switch.lock"; echo $$ > "$D/switch.lock/pid"; echo use > "$D/switch.lock/what"
+notes=$(wc -l < "$H/notifications.log")
+mark; check "keepalive runs" relay keepalive --force
+check "it skips alice" wait_log "keepalive: a switch or sign-in is running; skipped alice" 5
+check "without calling it not renewed" sh -c "! tail -n +$((MARK + 1)) '$D/relay.log' | grep -q 'not renewed'"
+check "or notifying" test "$(wc -l < "$H/notifications.log")" = "$notes"
+check "use is refused while the lock is held" sh -c "! '$REPO/relay.sh' use alice 2>/dev/null"
+rm -rf "$D/switch.lock"
 
 section "moving from the old launchd label"
 cp "$H/Library/LaunchAgents/local.desktop-account-switcher.keepalive.plist" "$H/Library/LaunchAgents/com.jun.desktop-account-switcher.keepalive.plist"

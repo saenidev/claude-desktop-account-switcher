@@ -2,19 +2,35 @@
 # Stand-in for launchctl: remembers loaded labels in $HOME/launchd.loaded, and runs a job
 # marked RunAtLoad at once in the background, the way launchd would: with only the plist's
 # EnvironmentVariables added (and HOME/PATH, which launchd also sets). Output goes to $HOME/jobs.out.
+# Like launchd, `print` says "state = running" while a job's process runs (its pid is kept in
+# $HOME/launchd.pids/<label>), and `bootout` of a running job kills it (SIGTERM).
 loaded="$HOME/launchd.loaded"; touch "$loaded"
+pids="$HOME/launchd.pids"; mkdir -p "$pids"
 label_of() { echo "${1#gui/*/}"; }
+# The job's pid, if it's running. An empty pid file is a job being started.
+job_pid() { local p; [ -f "$pids/$1" ] || return 1; p=$(cat "$pids/$1"); [ -z "$p" ] && return 0; kill -0 "$p" 2>/dev/null && echo "$p"; }
 case "$1" in
   bootstrap)
     plist="$3"; label=$(plutil -extract Label raw "$plist")
-    grep -qxF "$label" "$loaded" || echo "$label" >> "$loaded"
+    if grep -qxF "$label" "$loaded"; then echo "Bootstrap failed: 5: Input/output error (service already loaded)" >&2; exit 5; fi
+    echo "$label" >> "$loaded"
     if [ "$(plutil -extract RunAtLoad raw "$plist" 2>/dev/null)" = true ]; then
       args=(); i=0
       while v=$(plutil -extract "ProgramArguments.$i" raw "$plist" 2>/dev/null); do args+=("$v"); i=$((i+1)); done
       envs=(); for k in $(plutil -extract EnvironmentVariables json -o - "$plist" 2>/dev/null | jq -r 'keys[]'); do envs+=("$k=$(plutil -extract "EnvironmentVariables.$k" raw "$plist")"); done
-      ( env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin:/usr/sbin:/sbin XPC_SERVICE_NAME="$label" ${envs[@]+"${envs[@]}"} "${args[@]}"; grep -vxF "$label" "$loaded" > "$loaded.tmp"; mv "$loaded.tmp" "$loaded" ) >> "$HOME/jobs.out" 2>&1 &
+      : > "$pids/$label"   # running from now on, before the background job has its pid
+      ( env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin:/usr/sbin:/sbin XPC_SERVICE_NAME="$label" ${envs[@]+"${envs[@]}"} "${args[@]}" &
+        echo $! > "$pids/$label"; wait $!
+        rm -f "$pids/$label" ) >> "$HOME/jobs.out" 2>&1 &
     fi ;;
-  bootout) label=$(label_of "$2"); grep -qxF "$label" "$loaded" || exit 3; grep -vxF "$label" "$loaded" > "$loaded.tmp"; mv "$loaded.tmp" "$loaded" ;;
-  print) grep -qxF "$(label_of "$2")" "$loaded" ;;
+  bootout)
+    label=$(label_of "$2"); grep -qxF "$label" "$loaded" || exit 3
+    p=$(job_pid "$label") && [ -n "$p" ] && kill -TERM "$p" 2>/dev/null
+    grep -vxF "$label" "$loaded" > "$loaded.tmp"; mv "$loaded.tmp" "$loaded" ;;
+  print)
+    label=$(label_of "$2"); grep -qxF "$label" "$loaded" || exit 113
+    echo "gui/$(id -u)/$label = {"
+    if job_pid "$label" >/dev/null; then echo "	state = running"; else echo "	state = not running"; fi
+    echo "}" ;;
   *) exit 1 ;;
 esac
