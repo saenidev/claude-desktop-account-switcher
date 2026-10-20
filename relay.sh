@@ -313,7 +313,7 @@ refresh_copy() {
   [ "$want" = "$have" ] && return 0
   local tmp="$app.new.$$"
   ditto "$APP" "$tmp" || { log "refresh: copying $APP failed"; return 1; }
-  set_icon "$tmp"
+  set_icon "$tmp" "$app"
   [ -d "$app" ] && mv "$app" "$HOME/.Trash/$(basename "$app" .app) $have $(date +%Y%m%d-%H%M%S).app"
   mv "$tmp" "$app"
   log "refresh: $app ${have:-missing} -> $want"
@@ -324,7 +324,7 @@ set_icon() {
   local app="$1" icon; icon=$(icon_for_app "${2:-$1}")
   [ -n "$icon" ] && [ -f "$icon" ] || return 0
   [ -e "$app/Icon"$'\r' ] && return 0
-  swift "$SETICON" "$icon" "$app" >/dev/null 2>&1 || log "icon: could not set $icon on $app"
+  swift "$SETICON" "$icon" "$app" >/dev/null 2>&1
 }
 
 # What the sync agent runs: every copy on the real app's version, with its icon.
@@ -333,7 +333,10 @@ cmd_sync() {
   while read -r app; do
     [ -n "$app" ] || continue
     refresh_copy "$app"
-    [ -d "$app" ] && [ ! -e "$app/Icon"$'\r' ] && { set_icon "$app"; log "sync: icon put back on $app ($(app_version "$app"))"; }
+    # From a launchd agent this fails (macOS blocks it); the mod runs sync from inside Claude.
+    if [ -d "$app" ] && [ ! -e "$app/Icon"$'\r' ] && set_icon "$app" && [ -e "$app/Icon"$'\r' ]; then
+      log "sync: icon put back on $app ($(app_version "$app"))"
+    fi
   done < <(copies)
 }
 

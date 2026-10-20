@@ -98,6 +98,10 @@ export const register: Register = on => {
     const r = await next(e)
     if (!(await isDesktop($))) return r
     const p = await paths($)
+    // Keep app copies on the real app's version with their icons. macOS lets only apps from
+    // the same developer change a launched Anthropic-signed bundle, so this runs from here
+    // (inside Claude) rather than from a launchd agent. Detached: it never delays the session.
+    await $.process.run(['/bin/sh', '-c', 'nohup /bin/bash "$1" sync >/dev/null 2>&1 &', 'sh', p.relay]).catch(() => undefined)
     const handoff = await readJson<Handoff>($, p.handoff, { resume: [] })
     const mine = handoff.resume.find(x => x.sessionId === e.session_id)
     if (mine === undefined) return r
