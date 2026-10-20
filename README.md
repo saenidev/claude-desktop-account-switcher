@@ -6,18 +6,20 @@ How the desktop app handles sign-in, and why it's built this way, is in [desktop
 
 ## How it works
 
-- **One profile folder per account.** Each account is signed in once, the normal way, in its own `--user-data-dir` folder (`~/Library/Application Support/Claude`, `…/Claude-<name>`). No token is ever read, copied or stored: each folder's app keeps and refreshes its own login.
+- **One app, one profile folder, switched in place.** The app's account is its claude.ai sign-in (the `Cookies` file in `~/Library/Application Support/Claude`). Each account was signed in once, the normal way; the relay keeps the accounts that aren't in use parked in `~/.claude/account-relay/park/<account>/` and moves the sign-ins in and out while Claude is closed. Sessions, settings and config are one shared set, so only the subscription changes. No token is ever read or copied.
 - **The mod** (`mod/`, installed as `account-relay@account-relay-local`) runs in every Code tab session in the desktop app:
   - It records which sessions are mid-turn.
-  - When a turn fails with `rate_limit` while a 5-hour or 7-day window is at 95% or more, it writes a hand-off and starts the relay.
-  - In a session the relay reopened, it sends one "carry on" message.
+  - When a turn fails with `rate_limit` while a 5-hour or 7-day window is at 95% or more, and switching is on, it writes a hand-off and starts the relay.
+  - In a session the relay reopened, it sends one message saying why (a usage limit, a switch by hand, a restart, a sign-in) and to carry on.
+  - `/account` shows or hides a row above the prompt: the account, its usage, a button to switch to the other account (asks first), and an auto-switch on/off toggle. The row also shows by itself while usage is above 95%.
 - **The relay** (`relay.sh`, started as a one-shot launchd job, so it survives the app quitting):
   1. Takes a lock, so only one switch runs at a time.
   2. Puts the spent account on cooldown until its reset time.
-  3. Picks the next account that isn't cooling down, and checks that its folder is signed in as that account.
-  4. Quits the app and opens the target folder, unless the target is already open.
+  3. Picks the next account that isn't cooling down and has a parked sign-in.
+  4. Quits Claude, moves the sign-ins, copies per-account settings across, and opens Claude again.
   5. Reopens each handed-off session with `claude://resume?session=<id>`.
-  6. If the target won't start, goes back to the previous folder.
+  6. If the new sign-in doesn't come up, puts the previous one back.
+- **By hand:** `relay.sh swap <name>` (what the row's button runs), `relay.sh signin <name>` (sign an account in again without losing the current one), `relay.sh restart`.
 
 ## Layout
 
