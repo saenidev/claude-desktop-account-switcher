@@ -1,0 +1,20 @@
+#!/bin/bash
+# Stand-in for launchctl: remembers loaded labels in $HOME/launchd.loaded, and runs a job
+# marked RunAtLoad at once in the background, the way launchd would: with only the plist's
+# EnvironmentVariables added (and HOME/PATH, which launchd also sets). Output goes to $HOME/jobs.out.
+loaded="$HOME/launchd.loaded"; touch "$loaded"
+label_of() { echo "${1#gui/*/}"; }
+case "$1" in
+  bootstrap)
+    plist="$3"; label=$(plutil -extract Label raw "$plist")
+    grep -qxF "$label" "$loaded" || echo "$label" >> "$loaded"
+    if [ "$(plutil -extract RunAtLoad raw "$plist" 2>/dev/null)" = true ]; then
+      args=(); i=0
+      while v=$(plutil -extract "ProgramArguments.$i" raw "$plist" 2>/dev/null); do args+=("$v"); i=$((i+1)); done
+      envs=(); for k in $(plutil -extract EnvironmentVariables json -o - "$plist" 2>/dev/null | jq -r 'keys[]'); do envs+=("$k=$(plutil -extract "EnvironmentVariables.$k" raw "$plist")"); done
+      ( env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin:/usr/sbin:/sbin XPC_SERVICE_NAME="$label" ${envs[@]+"${envs[@]}"} "${args[@]}"; grep -vxF "$label" "$loaded" > "$loaded.tmp"; mv "$loaded.tmp" "$loaded" ) >> "$HOME/jobs.out" 2>&1 &
+    fi ;;
+  bootout) label=$(label_of "$2"); grep -qxF "$label" "$loaded" || exit 3; grep -vxF "$label" "$loaded" > "$loaded.tmp"; mv "$loaded.tmp" "$loaded" ;;
+  print) grep -qxF "$(label_of "$2")" "$loaded" ;;
+  *) exit 1 ;;
+esac

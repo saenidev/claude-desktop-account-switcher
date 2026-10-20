@@ -1,0 +1,16 @@
+#!/bin/bash
+# What the stand-in Claude does on launch in profile folder $1, like the real app: report the
+# account its Cookies is signed in to in config.json (lastKnownAccountUuid; left as it was when
+# signed out), and make that account's session folders. A test Cookies holds the account id
+# in the sessionKey cookie's value, which the real app encrypts; the switcher never reads it.
+# The account's org comes from $HOME/orgs/<accountUuid>.
+profile="$1"; mkdir -p "$profile"
+id=$(sqlite3 "file:$profile/Cookies?mode=ro&immutable=1" "select value from cookies where name='sessionKey'" 2>/dev/null)
+[ -n "$id" ] || exit 0
+[ -f "$profile/config.json" ] || echo '{}' > "$profile/config.json"
+jq --arg u "$id" '.lastKnownAccountUuid = $u' "$profile/config.json" > "$profile/config.json.tmp" && mv "$profile/config.json.tmp" "$profile/config.json"
+org=$(cat "$HOME/orgs/$id" 2>/dev/null)
+[ -n "$org" ] || exit 0
+for kind in claude-code-sessions local-agent-mode-sessions; do
+  [ -e "$profile/$kind/$id/$org" ] || mkdir -p "$profile/$kind/$id/$org"
+done

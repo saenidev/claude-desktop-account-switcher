@@ -255,7 +255,7 @@ const SHOW_DAYS = 3
 async function signinExpiry($: Host, dir: string, accountUuid: string): Promise<number | null> {
   const db = `${dir}/park/${accountUuid}/Cookies`
   const ran = await $.process
-    .run(['/usr/bin/sqlite3', `file:${db}?immutable=1`, "select max(expires_utc)/1000000-11644473600 from cookies where name='sessionKey'"])
+    .run(['/usr/bin/sqlite3', `file:${db}?mode=ro&immutable=1`, "select max(expires_utc)/1000000-11644473600 from cookies where name='sessionKey'"])
     .catch(() => undefined)
   const seconds = Number(ran?.stdout.trim())
   return ran?.exitCode === 0 && seconds > 0 ? seconds * 1000 : null

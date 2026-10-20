@@ -1,0 +1,3 @@
+#!/bin/bash
+# Stand-in for osascript: notifications go to $HOME/notifications.log instead of the screen.
+echo "$*" >> "$HOME/notifications.log"

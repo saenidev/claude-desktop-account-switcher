@@ -1,0 +1,9 @@
+#!/bin/bash
+# Stand-in for the claude CLI's plugin commands: installing a plugin enables it in
+# $HOME/.claude/settings.json, as the real one does.
+settings="$HOME/.claude/settings.json"; mkdir -p "$HOME/.claude"; [ -f "$settings" ] || echo '{}' > "$settings"
+case "$1 $2" in
+  "plugin marketplace") echo "$*" >> "$HOME/claude-cli.log" ;;
+  "plugin install") jq --arg p "$3" '.enabledPlugins[$p] = true' "$settings" > "$settings.tmp" && mv "$settings.tmp" "$settings" ;;
+  *) exit 1 ;;
+esac

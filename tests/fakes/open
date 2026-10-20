@@ -1,0 +1,22 @@
+#!/bin/bash
+# Stand-in for macOS open(1): starts the stand-in Claude app, or records a claude:// link
+# it was asked to open (in $HOME/links.log).
+app="" url="" args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -a) app="$2"; shift 2 ;;
+    -n|-g) shift ;;
+    --args) shift; args=("$@"); break ;;
+    claude://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+if [ -n "$url" ]; then echo "$url" >> "$HOME/links.log"; exit 0; fi
+profile="$HOME/Library/Application Support/Claude"
+for a in ${args[@]+"${args[@]}"}; do case "$a" in --user-data-dir=*) profile="${a#--user-data-dir=}" ;; esac; done
+"$app/Contents/Resources/start" "$profile"
+# The app's main process: shows in ps as "<app>/Contents/MacOS/Claude [args]", as the real one
+# does, and waits until it's told to quit. (cat on a FIFO it holds open itself never ends.)
+name="$app/Contents/MacOS/Claude"; for a in ${args[@]+"${args[@]}"}; do name+=" $a"; done
+fifo="$HOME/.app-fifo.$$.$RANDOM"; mkfifo "$fifo"
+nohup /bin/bash -c 'exec -a "$1" /bin/cat <> "$2" >/dev/null' _ "$name" "$fifo" >/dev/null 2>&1 &

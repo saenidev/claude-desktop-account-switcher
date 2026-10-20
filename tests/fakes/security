@@ -1,0 +1,21 @@
+#!/bin/bash
+# Stand-in for the Keychain's security(1), as much as the switcher uses: generic passwords
+# kept as files under $HOME/keychain/<service>/<account>.
+kc="$HOME/keychain"
+item() {   # parse -s <service> -a <account> [-w] [-X <hex>]
+  S="" A="" W="" X=""
+  while [ $# -gt 0 ]; do
+    case "$1" in -s) S="$2"; shift 2 ;; -a) A="$2"; shift 2 ;; -X) X="$2"; shift 2 ;; -w) W=1; shift ;; *) shift ;; esac
+  done
+}
+case "$1" in
+  find-generic-password) shift; item "$@"; [ -f "$kc/$S/$A" ] || exit 44; [ -n "$W" ] && { cat "$kc/$S/$A"; echo; }; exit 0 ;;
+  delete-generic-password) shift; item "$@"; [ -f "$kc/$S/$A" ] || exit 44; rm "$kc/$S/$A" ;;
+  -i)
+    while read -r line; do
+      eval "set -- $line"
+      [ "$1" = add-generic-password ] || continue
+      shift; item "$@"; mkdir -p "$kc/$S"; printf '%s' "$X" | xxd -r -p > "$kc/$S/$A"
+    done ;;
+  *) exit 1 ;;
+esac
