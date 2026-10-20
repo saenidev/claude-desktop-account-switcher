@@ -132,25 +132,31 @@ parse_args() {
   done
 }
 
+# Where an account's sign-in is: in Claude now, parked and ready, or nowhere (needs signin).
+signin_state() {
+  if [ "$(folder_account "$DEFAULT_DIR")" = "$1" ]; then echo "in Claude now"
+  elif [ -f "$PARK/$1/Cookies" ]; then echo "parked, ready to switch to"
+  else echo "not signed in (relay.sh signin-later $(account_field "$1" name))"; fi
+}
+
 cmd_status() {
-  echo "accounts:"; jq -r '.accounts[] | "  \(.name)  \(.email)  \(.accountUuid)  \(.userDataDir)  app: \(.app // "/Applications/Claude.app")"' "$ACCOUNTS"
-  echo "cooldowns:"; jq -r '.cooldowns | to_entries[] | "  \(.key) until \(.value)"' "$STATE"
-  echo "running instances:"
-  jq -r '.accounts[] | .userDataDir' "$ACCOUNTS" | while read -r d; do
-    d=$(expand "$d"); local pid; pid=$(instance_pid "$d")
-    echo "  $(basename "$d"): ${pid:-not running}  signed in as $(folder_account "$d")"
+  local pid; pid=$(default_pids | head -1)
+  if [ -n "$pid" ]; then echo "Claude: running (pid $pid)"; else echo "Claude: not running"; fi
+  echo "auto-switch: $(jq -r 'if .armed then "on" else "off" end' "$DIR/config.json" 2>/dev/null || echo off)"
+  echo "accounts:"
+  local id; for id in $(jq -r '.accounts[].accountUuid' "$ACCOUNTS"); do
+    local until; until=$(jq -r --arg a "$id" '.cooldowns[$a] // empty' "$STATE")
+    echo "  $(account_field "$id" name)  $(account_field "$id" email)  $(signin_state "$id")${until:+  (out of usage until $until)}"
   done
-  echo "pending resumes:"; jq -r '.resume[] | "  \(.sessionId)  \(.cwd)  (\(.reason))"' "$HANDOFF"
+  echo "pending resumes:"; jq -r '.resume[] | "  \(.sessionId)  (\(.reason))"' "$HANDOFF"
 }
 
 cmd_plan() {
   parse_args "$@"
-  local target from_dir to_dir; target=$(pick_target "$FROM")
-  from_dir=$(expand "$(account_field "$FROM" userDataDir)")
-  echo "from:   $(account_field "$FROM" name) ($FROM) in $from_dir, pid $(instance_pid "$from_dir")"
+  local target; target=$(pick_target "$FROM")
+  echo "from:   $(account_field "$FROM" name) ($FROM): $(signin_state "$FROM")"
   if [ -z "$target" ]; then echo "to:     nobody: every other account is cooling down"; return; fi
-  to_dir=$(expand "$(account_field "$target" userDataDir)")
-  echo "to:     $(account_field "$target" name) ($target) in $to_dir, folder signed in as $(folder_account "$to_dir")"
+  echo "to:     $(account_field "$target" name) ($target): $(signin_state "$target")"
   echo "resume: $(jq -r '[.resume[].sessionId] | join(", ")' "$HANDOFF")"
 }
 
@@ -404,6 +410,14 @@ swap_to() {
   return 1
 }
 
+# List a session to reopen, with why, before Claude closes: the app may bring the session
+# back by itself before any link is sent, and the mod only sees entries already written.
+hand_off() {
+  jq_write "$HANDOFF" --arg s "$1" --arg r "$2" --arg at "$(date -u +%FT%TZ)" \
+    '.resume = ([.resume[] | select(.sessionId != $s)] + [{sessionId: $s, cwd: "", reason: $r, at: $at}])'
+}
+drop_hand_off() { jq_write "$HANDOFF" --arg s "$1" '.resume |= map(select(.sessionId != $s))'; }
+
 # Reopen the handed-off sessions in the (one) Claude window.
 reopen_handoff() {
   local ids id; ids=$(jq -r '.resume[].sessionId' "$HANDOFF")
@@ -450,10 +464,13 @@ cmd_swap() {
   local id; id=$(account_by_name "${1:-}"); [ -n "$id" ] || die "swap: no account named ${1:-}"
   local session=""; [ "${2:-}" = "--resume" ] && session="${3:-}"
   sleep 10   # let the caller's turn finish before its window quits
-  swap_to "$id" || die "swap to ${1} failed; stayed put"
+  [ -n "$session" ] && hand_off "$session" swap
+  if ! swap_to "$id"; then
+    [ -n "$session" ] && drop_hand_off "$session"
+    die "swap to ${1} failed; stayed put"
+  fi
   if [ -n "$session" ]; then
     sleep 12
-    jq_write "$HANDOFF" --arg s "$session" --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: $s, cwd: "", reason: "swap", at: $at}]'
     reopen_handoff >/dev/null
   fi
 }
@@ -503,13 +520,13 @@ fix_scratch_paths() {
 cmd_restart() {
   local session=""; [ "${1:-}" = "--resume" ] && session="${2:-}"
   sleep 10
+  [ -n "$session" ] && hand_off "$session" restart
   quit_default
   apply_prefs_patch
   fix_scratch_paths
   open -a "$APP"
   if [ -n "$session" ]; then
     sleep 15
-    jq_write "$HANDOFF" --arg s "$session" --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: $s, cwd: "", reason: "restart", at: $at}]'
     reopen_handoff >/dev/null
   fi
 }
@@ -523,6 +540,7 @@ cmd_signin() {
   local session=""; [ "${2:-}" = "--resume" ] && session="${3:-}"
   local cur; cur=$(folder_account "$DEFAULT_DIR")
   sleep 10
+  [ -n "$session" ] && hand_off "$session" signin
   quit_default
   move_signin "$cur" "$id"   # nothing parked for $id, so Claude opens signed out
   open -a "$APP"
@@ -538,7 +556,6 @@ cmd_signin() {
   log "signin: back on $(account_field "$cur" name)"
   if [ -n "$session" ]; then
     sleep 15
-    jq_write "$HANDOFF" --arg s "$session" --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: $s, cwd: "", reason: "signin", at: $at}]'
     reopen_handoff >/dev/null
   fi
 }
