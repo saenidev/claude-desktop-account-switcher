@@ -1,5 +1,6 @@
-// What the account row is doing: nothing, asking before a switch, or switching.
-export type Step = { kind: 'idle' } | { kind: 'confirm'; to: string } | { kind: 'switching'; to: string }
+// What the account row is doing: nothing, asking before a switch or sign-in, or doing it.
+export type Action = 'use' | 'signin'
+export type Step = { kind: 'idle' } | { kind: 'confirm'; to: string; action: Action } | { kind: 'switching'; to: string; action: Action }
 
 declare module 'claude-code' {
   interface PluginState {

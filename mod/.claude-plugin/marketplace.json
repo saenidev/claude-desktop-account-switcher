@@ -1,5 +1,5 @@
 {
   "name": "desktop-account-switcher-local",
-  "owner": { "name": "Jun" },
+  "owner": { "name": "desktop-account-switcher" },
   "plugins": [{ "name": "desktop-account-switcher", "source": "./" }]
 }

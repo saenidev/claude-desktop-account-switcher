@@ -1,18 +1,16 @@
 {
   "accounts": [
     {
-      "name": "first",
-      "email": "first@example.com",
+      "name": "work",
+      "email": "you@example.com",
       "accountUuid": "00000000-0000-0000-0000-000000000001",
-      "orgUuid": "00000000-0000-0000-0000-0000000000a1",
-      "userDataDir": "~/Library/Application Support/Claude"
+      "orgUuid": "00000000-0000-0000-0000-0000000000a1"
     },
     {
-      "name": "second",
-      "email": "second@example.com",
+      "name": "personal",
+      "email": "you@example.org",
       "accountUuid": "00000000-0000-0000-0000-000000000002",
-      "orgUuid": "00000000-0000-0000-0000-0000000000a2",
-      "userDataDir": "~/Library/Application Support/Claude"
+      "orgUuid": "00000000-0000-0000-0000-0000000000a2"
     }
   ]
 }

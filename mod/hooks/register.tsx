@@ -121,10 +121,6 @@ export const register: Register = on => {
     const r = await next(e)
     if (!(await isDesktop($))) return r
     const p = await paths($)
-    // Keep app copies on the real app's version with their icons. macOS lets only apps from
-    // the same developer change a launched Anthropic-signed bundle, so this runs from here
-    // (inside Claude) rather than from a launchd agent. Detached: it never delays the session.
-    await $.process.run(['/bin/sh', '-c', 'nohup /bin/bash "$1" sync >/dev/null 2>&1 &', 'sh', p.relay]).catch(() => undefined)
     // Only a session coming back after Claude closed; a compact or clear starts a session too.
     if (e.source !== 'resume' && e.source !== 'startup') return r
     const handoff = await readJson<Handoff>($, p.handoff, { resume: [] })
@@ -265,11 +261,24 @@ function registerRow(on: Parameters<Register>[0]) {
   on('session.start', async ($, e, next) => {
     const r = await next(e)
     if (!(await isDesktop($))) return r
-    await $.command.register({ name: 'account', description: 'Show or hide the account row: switch Claude accounts, turn auto-switch on or off' })
+    await $.command.register({
+      name: 'account',
+      description: 'Show or hide the account row: switch Claude accounts, turn auto-switch on or off; add <name> adds an account',
+      argumentHint: '[add <name>]',
+    })
     return r
   })
 
-  on('command.run', { command: 'account' }, async $ => {
+  on('command.run', { command: 'account' }, async ($, e) => {
+    const [verb, name] = e.args.trim().split(/\s+/)
+    if (verb === 'add') {
+      if (!name) return { text: 'Usage: /account add <name>, a short name for the account to add.' }
+      const p = await paths($)
+      const ran = await $.process.run(['/bin/bash', p.relay, 'add', name, '--resume', await $.session.id()]).catch(() => undefined)
+      if (ran === undefined || ran.exitCode !== 0) return { text: `Couldn't start adding ${name}. See ${p.log}.` }
+      return { text: `Claude closes in a few seconds and opens signed out. Sign in to the account to add as ${name} and wait for the Code tab; then Claude comes back on this account and reopens this session.` }
+    }
+    if (verb) return { text: 'Usage: /account (show or hide the row), or /account add <name>.' }
     const near = (await usage($)).some(w => w.percentUsed > NEAR_FULL)
     const visible = (await read($, shown)) ?? near
     await update($, shown, () => !visible)
@@ -292,8 +301,19 @@ function registerRow(on: Parameters<Register>[0]) {
     const near = windows.filter(w => w.percentUsed > NEAR_FULL)
     const p = await paths($)
     const accounts = (await readJson<{ accounts: Account[] }>($, `${p.dir}/accounts.json`, { accounts: [] })).accounts
-    if (accounts.length < 2) return next(e)
     const current = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
+    if (accounts.length < 2) {
+      if (!(await read($, shown))) return next(e)
+      const { Box, Button, Text } = $.ui.resolve(e)
+      return (
+        <Box gap={1}>
+          <Text>
+            {accounts.length === 0 ? 'The account switcher isn\'t set up yet: run ./relay.sh setup <name> in its repo.' : `Only ${accounts[0]?.name} is set up. Add another account with /account add <name>.`}
+          </Text>
+          <Button key="hide" role="dismiss" dimColor label="Hide" onPress={() => update($, shown, () => false)} />
+        </Box>
+      )
+    }
     const now = Date.now()
     const expiry = new Map<string, number | null>()
     for (const a of accounts.filter(a => a.accountUuid !== current)) expiry.set(a.accountUuid, await signinExpiry($, p.dir, a.accountUuid))
@@ -313,7 +333,11 @@ function registerRow(on: Parameters<Register>[0]) {
     if (s.kind === 'switching') {
       return (
         <Box>
-          <Text dimColor>Switching to {s.to}. Claude closes in a few seconds and reopens this session.</Text>
+          <Text dimColor>
+            {s.action === 'use'
+              ? `Switching to ${s.to}. Claude closes in a few seconds and reopens this session.`
+              : `Claude closes in a few seconds and opens signed out. Sign in to ${s.to}; then Claude comes back on this account and reopens this session.`}
+          </Text>
         </Box>
       )
     }
@@ -321,21 +345,24 @@ function registerRow(on: Parameters<Register>[0]) {
     if (s.kind === 'confirm') {
       const target = accounts.find(a => a.name === s.to)
       const out = target ? outUntil(target) : undefined
+      const label = s.action === 'use' ? `Switch to ${s.to}` : `Sign in ${s.to}`
       return (
         <Box gap={1}>
           <Text>
-            Switch to {s.to}?{out ? ` It's out of usage until ${out}.` : ''} Claude closes and reopens this session.
+            {s.action === 'use'
+              ? `Switch to ${s.to}?${out ? ` It's out of usage until ${out}.` : ''} Claude closes and reopens this session.`
+              : `Sign ${s.to} in again? Claude closes and opens signed out for you to sign in, then comes back on this account.`}
           </Text>
           <Button
             key="yes"
             variant="primary"
-            label={`Switch to ${s.to}`}
+            label={label}
             onPress={async () => {
-              await update($, step, (): Step => ({ kind: 'switching', to: s.to }))
+              await update($, step, (): Step => ({ kind: 'switching', to: s.to, action: s.action }))
               const sessionId = await $.session.id()
-              const ran = await $.process.run(['/bin/bash', p.relay, 'swap-later', s.to, '--resume', sessionId]).catch(() => undefined)
+              const ran = await $.process.run(['/bin/bash', p.relay, s.action, s.to, '--resume', sessionId]).catch(() => undefined)
               if (ran === undefined || ran.exitCode !== 0) {
-                $.ui.toast(`Couldn't start the switch to ${s.to}. See ~/.claude/desktop-account-switcher/relay.log.`)
+                $.ui.toast(`Couldn't start: ${label.toLowerCase()}. See ${p.log}.`)
                 await update($, step, (): Step => ({ kind: 'idle' }))
               }
             }}
@@ -357,14 +384,15 @@ function registerRow(on: Parameters<Register>[0]) {
             const exp = expiry.get(a.accountUuid) ?? null
             if (exp === null || exp <= now) {
               return (
-                <Text key={`to-${a.name}`}>
-                  {a.name} is signed out: run relay.sh signin-later {a.name}
-                </Text>
+                <Box gap={1}>
+                  <Text>{a.name} is signed out</Text>
+                  <Button key={`signin-${a.name}`} label={`Sign in ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name, action: 'signin' }))} />
+                </Box>
               )
             }
             return (
               <Box gap={1}>
-                <Button key={`to-${a.name}`} label={`Switch to ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name }))} />
+                <Button key={`to-${a.name}`} label={`Switch to ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name, action: 'use' }))} />
                 <Text dimColor>{out ? `out until ${out}` : lastKnown(snapshots[a.accountUuid], now)}</Text>
                 {exp - now < WARN_DAYS * DAY ? <Text>sign-in expires {when(new Date(exp).toISOString())}</Text> : null}
               </Box>
