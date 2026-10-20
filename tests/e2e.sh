@@ -138,6 +138,14 @@ check "you're told" grep -q "every other account is too" "$H/notifications.log"
 check "the limit's hand-off is dropped" sh -c "! jq -e '.resume[] | select(.sessionId == \"session-3\")' '$D/handoff.json'"
 jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
 
+section "an account whose last reading shows a used-up window"
+jq --arg b "$B" --arg r "$(date -u -v+2d +%FT%TZ)" --argjson at "$(date +%s)000" \
+  '.[$b] = {at: $at, source: "session", windows: [{kind: "seven_day", percentUsed: 100, resetsAt: $r}]}' "$D/usage.json" > "$T/u" && mv "$T/u" "$D/usage.json"
+check "plan finds nobody to switch to" sh -c "'$REPO/relay.sh' plan --from $A | grep -q 'nobody'"
+jq --arg b "$B" '.[$b].windows[0].resetsAt = "2020-01-01T00:00:00Z"' "$D/usage.json" > "$T/u" && mv "$T/u" "$D/usage.json"
+check "once that window has reset, bob is picked" sh -c "'$REPO/relay.sh' plan --from $A | grep -q '^to: *bob'"
+jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+
 section "the app's files moved (an app update)"
 jq 'del(.lastKnownAccountUuid) | .lastKnownAccount = "moved"' "$P/config.json" > "$T/c" && cp "$P/config.json" "$T/c.saved" && mv "$T/c" "$P/config.json"
 mark; check "use bob is queued" relay use bob
