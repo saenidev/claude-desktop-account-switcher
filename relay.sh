@@ -314,7 +314,11 @@ refresh_copy() {
   local tmp="$app.new.$$"
   ditto "$APP" "$tmp" || { log "refresh: copying $APP failed"; return 1; }
   set_icon "$tmp" "$app"
-  [ -d "$app" ] && mv "$app" "$HOME/.Trash/$(basename "$app" .app) $have $(date +%Y%m%d-%H%M%S).app"
+  # A copy in the Trash still claims claude:// with LaunchServices until it's unregistered.
+  if [ -d "$app" ]; then
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$app"
+    mv "$app" "$HOME/.Trash/$(basename "$app" .app) $have $(date +%Y%m%d-%H%M%S).app"
+  fi
   mv "$tmp" "$app"
   log "refresh: $app ${have:-missing} -> $want"
 }
