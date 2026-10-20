@@ -383,6 +383,7 @@ swap_to() {
   quit_default
   move_signin "$cur" "$target"
   apply_prefs_patch
+  fix_scratch_paths
   mirror_prefs "$cur" "$target"
   open -a "$APP"
   local n=0; while [ "$(folder_account "$DEFAULT_DIR")" != "$target" ] && [ $n -lt 45 ]; do sleep 1; n=$((n+1)); done
@@ -476,12 +477,29 @@ apply_prefs_patch() {
   jq -s '.[0] * .[1]' "$PREFS" "$DIR/prefs-patch.json" > "$PREFS.tmp.$$" && mv "$PREFS.tmp.$$" "$PREFS" && mv "$DIR/prefs-patch.json" "$DIR/backups/prefs-patch.applied.json" && log "prefs: patch applied"
 }
 
+# The app files a session under Scratch only if its folder is inside the app's own
+# scratch-workspaces. Sessions started in an old per-account profile folder
+# (Claude-second) point outside it and show up as one project each. Point them back.
+# Only while Claude is closed: the running app rewrites session files.
+fix_scratch_paths() {
+  local files f n=0
+  files=$(grep -rlE 'Application Support/Claude-[^/"]+/scratch-workspaces/' "$DEFAULT_DIR/claude-code-sessions/" "$DEFAULT_DIR/local-agent-mode-sessions/" 2>/dev/null)
+  [ -n "$files" ] || return 0
+  mkdir -p "$DIR/backups/scratch-paths"
+  while IFS= read -r f; do
+    cp -p "$f" "$DIR/backups/scratch-paths/$(basename "$f")"
+    sed -i '' -E "s#Application Support/Claude-[^/\"]+/scratch-workspaces/#Application Support/$(basename "$DEFAULT_DIR")/scratch-workspaces/#g" "$f" && n=$((n+1))
+  done <<< "$files"
+  log "scratch: pointed $n session(s) back into $(basename "$DEFAULT_DIR")/scratch-workspaces"
+}
+
 # Restart Claude in place (same account), applying any settings fix while it's closed.
 cmd_restart() {
   local session=""; [ "${1:-}" = "--resume" ] && session="${2:-}"
   sleep 10
   quit_default
   apply_prefs_patch
+  fix_scratch_paths
   open -a "$APP"
   if [ -n "$session" ]; then
     sleep 15
