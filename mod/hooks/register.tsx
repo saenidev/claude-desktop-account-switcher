@@ -26,13 +26,15 @@ const CONTINUE = `The Claude account this session was running on ran out of usag
 // Hand-offs relay.sh writes when it closes Claude for something other than a usage limit.
 const REOPENED: Record<string, { text: string; toast: string }> = {
   restart: { text: `The relay restarted the desktop app (same account) and reopened this session. ${CARRY_ON}`, toast: 'Claude restarted; carrying on.' },
-  relaunch: { text: `The relay restarted the desktop app (same account) and reopened this session. ${CARRY_ON}`, toast: 'Claude restarted; carrying on.' },
   signin: { text: `The relay closed the desktop app for a sign-in, put the previous account back, and reopened this session. ${CARRY_ON}`, toast: 'Back on your account; carrying on.' },
   swap: { text: `The desktop app was switched to another account by hand and reopened this session. ${CARRY_ON}`, toast: 'Switched account; carrying on.' },
 }
 
-type Handoff = { resume: { sessionId: string; cwd: string; reason: string; at: string }[]; closedAt?: string }
-type Busy = { sessionId: string; cwd: string; account: string; busy: boolean; at: number }
+// `account`: the account Claude is on when the session reopens (relay.sh fills it in; the
+// mod's own entries get it once the switch has picked an account). Absent on older entries.
+type Handoff = { resume: { sessionId: string; cwd: string; reason: string; at: string; account?: string }[]; closedAt?: string }
+// A session mid-turn has a file in busy/; it's deleted when the turn ends, however it ends.
+type Busy = { sessionId: string; cwd: string; account: string; busy?: boolean; at: number }
 
 async function paths($: Host) {
   const home = (await $.env.get('HOME')) ?? ''
@@ -64,20 +66,26 @@ async function isDesktop($: Host) {
   return !(await $.env.get('CLAUDECODE')) && !(await $.env.get('CLAUDE_CODE_CHILD_SESSION'))
 }
 
-async function markBusy($: Host, sessionId: string, cwd: string, busy: boolean) {
+async function markBusy($: Host, sessionId: string, cwd: string) {
   const p = await paths($)
   const account = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
-  const entry: Busy = { sessionId, cwd, account, busy, at: await $.clock.now() }
+  const entry: Busy = { sessionId, cwd, account, busy: true, at: await $.clock.now() }
   await $.fs.write(`${p.busy}/${sessionId}.json`, JSON.stringify(entry))
+}
+
+// The hooks can write files but not delete them, so rm does it.
+async function clearBusy($: Host, sessionId: string) {
+  const p = await paths($)
+  await $.process.run(['/bin/rm', '-f', `${p.busy}/${sessionId}.json`])
 }
 
 const isoZ = (t: string) => new Date(t).toISOString().replace(/\.\d+Z$/, 'Z')
 
-/** The hand-off and the relay, run when the limit hits. */
+/** The hand-off and the relay, run when the limit hits. Returns what to tell the person. */
 async function relay($: Host, sessionId: string, cwd: string, reason: string, resetsAt: string | undefined, limit?: string) {
   const p = await paths($)
   const account = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
-  if (account === '') return 'no account id in this session; nothing to do'
+  if (account === '') return 'Account switcher: this session has no account id, so it can\'t switch.'
   const now = await $.clock.now()
 
   // This session, and every other session on the same account that is mid-turn.
@@ -86,24 +94,24 @@ async function relay($: Host, sessionId: string, cwd: string, reason: string, re
   for (const f of await $.fs.list(p.busy).catch(() => [])) {
     if (f.kind !== 'file' || !f.name.endsWith('.json')) continue
     const b = await readJson<Busy | null>($, `${p.busy}/${f.name}`, null)
-    if (b && b.busy && b.account === account && now - b.at < BUSY_FRESH_MS && !resume.has(b.sessionId))
+    if (b && b.busy !== false && b.account === account && now - b.at < BUSY_FRESH_MS && !resume.has(b.sessionId))
       resume.set(b.sessionId, { sessionId: b.sessionId, cwd: b.cwd, reason: 'mid-turn when the account ran out', at: new Date(now).toISOString() })
   }
   const { armed } = await readJson($, p.config, { armed: false })
   if (!armed) {
-    await log($, `disarmed: would switch away from ${account} (${reason}); would reopen ${resume.size} session(s)`)
-    return `disarmed: would reopen ${resume.size} session(s); the app was not touched`
+    await log($, `auto-switch is off: not switching away from ${account} (${reason}); ${resume.size} session(s) would have reopened`)
+    return 'This account is out of usage. Auto-switch is off: use /account to switch.'
   }
   const handoff = await readJson<Handoff>($, p.handoff, { resume: [] })
   for (const r of handoff.resume) if (!resume.has(r.sessionId)) resume.set(r.sessionId, r)
   await $.fs.write(p.handoff, JSON.stringify({ ...handoff, resume: [...resume.values()] }, null, 2))
 
   const argv = ['/bin/bash', p.relay, 'launch', '--from', account, ...(resetsAt ? ['--resets-at', isoZ(resetsAt)] : []), ...(limit ? ['--limit', limit] : [])]
-  const ran = await $.process.run(argv, { timeoutMs: 15_000 })
-  await log($, `launched relay away from ${account} (${reason}), exit ${ran.exitCode}`)
-  if (ran.exitCode === 0) return `switching away from this account; ${resume.size} session(s) will reopen`
+  const ran = await $.process.run(argv, { timeoutMs: 15_000 }).catch((err: unknown) => ({ exitCode: -1, stdout: '', stderr: String(err) }))
+  await log($, `launched relay away from ${account} (${reason}), exit ${ran.exitCode}${ran.exitCode === 0 ? '' : `: ${ran.stderr.trim()}`}`)
+  if (ran.exitCode === 0) return `This account is out of usage. Switching to another account; ${resume.size} session(s) will reopen.`
   await $.fs.write(p.handoff, JSON.stringify(handoff, null, 2)) // no switch coming: take the entries back
-  return `relay failed to start: ${ran.stderr.trim()}`
+  return `This account is out of usage, and the switch couldn't start (${ran.stderr.trim() || `exit ${ran.exitCode}`}). See ${p.log}.`
 }
 
 // A hand-off entry counts only when Claude was closed after it was written (relay.sh
@@ -117,6 +125,10 @@ function live(h: Handoff, entry: Handoff['resume'][number], now: number) {
   return closed + 1000 >= Date.parse(entry.at) && now - closed < HANDOFF_MAX_MS
 }
 
+// An entry is for this session only on the account it was meant to come back on: a switch
+// that went back to the old account (its new sign-in didn't come up) reopens nothing.
+const onAccount = (entry: Handoff['resume'][number], account: string) => !entry.account || entry.account === account
+
 export const register: Register = on => {
   // A session reopened by the relay: say once that it should carry on.
   on('classic.SessionStart', async ($, e, next) => {
@@ -127,8 +139,9 @@ export const register: Register = on => {
     if (e.source !== 'resume' && e.source !== 'startup') return r
     const handoff = await readJson<Handoff>($, p.handoff, { resume: [] })
     const now = await $.clock.now()
+    const account = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
     const stale = handoff.resume.filter(x => !live(handoff, x, now) && now - Date.parse(x.at) >= HANDOFF_MAX_MS)
-    const mine = handoff.resume.find(x => x.sessionId === e.session_id && live(handoff, x, now))
+    const mine = handoff.resume.find(x => x.sessionId === e.session_id && live(handoff, x, now) && onAccount(x, account))
     if (mine === undefined && stale.length === 0) return r
     const keep = handoff.resume.filter(x => x !== mine && !stale.includes(x))
     await $.fs.write(p.handoff, JSON.stringify({ ...handoff, resume: keep }, null, 2))
@@ -142,12 +155,21 @@ export const register: Register = on => {
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
-    if (await isDesktop($)) await markBusy($, e.session_id, e.cwd, true).catch(() => undefined)
+    if (await isDesktop($)) await markBusy($, e.session_id, e.cwd).catch(() => undefined)
     return next(e)
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
-  on('classic.Stop', async ($, e, next) => {
-    if (await isDesktop($)) await markBusy($, e.session_id, e.cwd, false).catch(() => undefined)
+  // The main loop's turn is over however it ended (an answer, Esc, an error), so the session
+  // isn't mid-turn any more: a limit switch mustn't reopen it with "carry on". A subagent's
+  // turn ending (agentId) says nothing about the session's.
+  on('turn.complete', async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId === undefined && (await isDesktop($))) await clearBusy($, await $.session.id()).catch(() => undefined)
+    return r
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
+
+  on('session.end', async ($, e, next) => {
+    if (await isDesktop($)) await clearBusy($, e.sessionId).catch(() => undefined)
     return next(e)
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
@@ -176,27 +198,42 @@ export const register: Register = on => {
       $.ui.toast(ran?.exitCode === 0 ? 'Terminal login moved to the other account; run the command again.' : 'Terminal login is out of usage, and no other account is ready.', { timeoutMs: 10_000 })
       return r
     }
-    const { rateLimits } = await $.session.usage()
-    const full: Window[] = rateLimits.filter(w => w.kind !== 'spend_limit' && w.percentUsed >= NEAR_FULL)
-    // A model's own weekly limit (Fable) isn't among the session's windows: ask Anthropic now.
-    let limit: string | undefined
-    if (full.length === 0) {
-      const p = await paths($)
-      await $.process.run(['/bin/bash', p.relay, 'usage', '--force', '--quiet'], { timeoutMs: 30_000 }).catch(() => undefined)
-      const account = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
-      const mine = (await readJson<Record<string, Snapshot>>($, `${p.dir}/usage.json`, {}))[account]
-      const scoped = (mine?.windows ?? []).filter(w => w.label && w.percentUsed >= NEAR_FULL && !(w.resetsAt && Date.parse(w.resetsAt) <= Date.now()))
-      full.push(...scoped)
-      limit = scoped[0]?.label
+    // Anything here that throws would otherwise vanish into the .catch below: say what failed.
+    const failed = async (what: string, err: unknown) => {
+      await log($, `limit in ${e.session_id}: ${what} failed: ${String(err)}`)
+      $.ui.toast(`Account switcher: ${what} failed (${String(err)}). See ~/.claude/desktop-account-switcher/relay.log`, { timeoutMs: 10_000 })
     }
-    const saysLimit = /usage limit|weekly limit|5-hour limit|limit reached|out of (extra )?usage/i.test(e.error_details ?? '')
-    if (full.length === 0 && !saysLimit) {
-      await log($, `rate_limit in ${e.session_id} but no window near full (${rateLimits.map(w => `${w.kind} ${w.percentUsed}%`).join(', ') || 'no reading'}); not switching`)
-      return r
+    try {
+      // With no reading, the error's own words can still say it was a usage limit.
+      const rateLimits: Window[] = await $.session.usage().then(
+        u => u.rateLimits,
+        async (err: unknown) => (await failed('reading this session\'s usage', err), []),
+      )
+      const full: Window[] = rateLimits.filter(w => w.kind !== 'spend_limit' && w.percentUsed >= NEAR_FULL)
+      // A model's own weekly limit (Fable) isn't among the session's windows: ask Anthropic now.
+      let limit: string | undefined
+      if (full.length === 0) {
+        const p = await paths($)
+        await $.process
+          .run(['/bin/bash', p.relay, 'usage', '--force', '--quiet'], { timeoutMs: 30_000 })
+          .catch((err: unknown) => failed('asking Anthropic for usage', err))
+        const account = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
+        const mine = (await readJson<Record<string, Snapshot>>($, `${p.dir}/usage.json`, {}))[account]
+        const scoped = (mine?.windows ?? []).filter(w => w.label && w.percentUsed >= NEAR_FULL && !(w.resetsAt && Date.parse(w.resetsAt) <= Date.now()))
+        full.push(...scoped)
+        limit = scoped[0]?.label
+      }
+      const saysLimit = /usage limit|weekly limit|5-hour limit|limit reached|out of (extra )?usage/i.test(e.error_details ?? '')
+      if (full.length === 0 && !saysLimit) {
+        await log($, `rate_limit in ${e.session_id} but no window near full (${rateLimits.map(w => `${w.kind} ${w.percentUsed}%`).join(', ') || 'no reading'}); not switching`)
+        return r
+      }
+      const resetsAt = full.map(w => w.resetsAt).filter((t): t is string => !!t).sort().at(-1)
+      const said = await relay($, e.session_id, e.cwd, `limit hit: ${full.map(w => `${name(w)} ${w.percentUsed}%`).join(', ') || 'limit message'}; login ${identity?.kind ?? 'unknown'}`, resetsAt, limit)
+      $.ui.toast(said, { timeoutMs: 10_000 })
+    } catch (err) {
+      await failed('switching away from this account', err)
     }
-    const resetsAt = full.map(w => w.resetsAt).filter((t): t is string => !!t).sort().at(-1)
-    const said = await relay($, e.session_id, e.cwd, `limit hit: ${full.map(w => `${name(w)} ${w.percentUsed}%`).join(', ') || 'limit message'}; login ${identity?.kind ?? 'unknown'}`, resetsAt, limit)
-    $.ui.toast(`Account switcher: ${said}`, { timeoutMs: 10_000 })
     return r
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
@@ -228,9 +265,9 @@ async function usage($: Host) {
   return rateLimits.filter(w => w.kind in WINDOW)
 }
 
-// Each account's last usage reading: saved here while it's the one in use (after caam's
-// `limits --cached`), and read from Anthropic by relay.sh usage. The parked account's figures
-// are shown with their age, and a window past its reset time counts as reset.
+// Each account's last usage reading: saved here from the session's own rate-limit windows
+// while it's the account in use, and read from Anthropic by relay.sh usage. The parked
+// account's figures are shown with their age, and a window past its reset time counts as reset.
 type Snapshot = { at: number; source?: string; windows: Window[] }
 
 async function saveSnapshot($: Host) {
@@ -277,6 +314,37 @@ async function signinExpiry($: Host, dir: string, accountUuid: string): Promise<
   return ran?.exitCode === 0 && seconds > 0 ? seconds * 1000 : null
 }
 
+// What the row would show, and whether it shows. The renderer and /account both use this,
+// so /account always flips what's on screen. With fewer than two accounts the row (which
+// then only says so) shows only when asked for; otherwise it shows when asked for, or by
+// itself while usage is above 95% or a parked sign-in has 3 days or less left.
+async function rowState($: Host) {
+  const p = await paths($)
+  const accounts = (await readJson<{ accounts: Account[] }>($, `${p.dir}/accounts.json`, { accounts: [] })).accounts
+  const current = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
+  const asked = await read($, shown)
+  const now = Date.now()
+  const snapshots = await readJson<Record<string, Snapshot>>($, `${p.dir}/usage.json`, {})
+  const live = (w: Window) => !(w.resetsAt && Date.parse(w.resetsAt) <= now)
+  const windows: Window[] = [...(await usage($)), ...scopedOf(snapshots[current]).filter(live)]
+  const near = windows.filter(w => w.percentUsed > NEAR_FULL)
+  const expiry = new Map<string, number | null>()
+  if (accounts.length >= 2) for (const a of accounts.filter(a => a.accountUuid !== current)) expiry.set(a.accountUuid, await signinExpiry($, p.dir, a.accountUuid))
+  const expiringSoon = [...expiry.values()].some(t => t === null || t - now < SHOW_DAYS * DAY)
+  const visible = accounts.length < 2 ? asked === true : (asked ?? (near.length > 0 || expiringSoon))
+  return { p, accounts, current, now, snapshots, windows, near, expiry, visible }
+}
+
+// A switch or sign-in closes Claude within seconds. If this session is still here after
+// this long, it didn't happen: the row goes back to normal and says where to look.
+const SWITCH_TIMEOUT_MS = 90_000
+async function switchTimedOut($: Host, at: number) {
+  const s = await read($, step)
+  if (s.kind !== 'switching' || s.at !== at) return
+  await update($, step, (): Step => ({ kind: 'idle' }))
+  $.ui.toast('That didn\'t happen; see ~/.claude/desktop-account-switcher/relay.log', { timeoutMs: 10_000 })
+}
+
 function registerRow(on: Parameters<Register>[0]) {
   on('session.start', async ($, e, next) => {
     const r = await next(e)
@@ -294,13 +362,16 @@ function registerRow(on: Parameters<Register>[0]) {
     if (verb === 'add') {
       if (!name) return { text: 'Usage: /account add <name>, a short name for the account to add.' }
       const p = await paths($)
+      // add is for a new account only; one already set up is signed in again, never re-pointed.
+      const accounts = (await readJson<{ accounts: Account[] }>($, `${p.dir}/accounts.json`, { accounts: [] })).accounts
+      if (accounts.some(a => a.name === name && a.accountUuid))
+        return { text: `${name} is already set up. To sign it in again, use the Sign in ${name} button on the account row (/account), or run relay.sh signin ${name}.` }
       const ran = await $.process.run(['/bin/bash', p.relay, 'add', name, '--resume', await $.session.id()]).catch(() => undefined)
-      if (ran === undefined || ran.exitCode !== 0) return { text: `Couldn't start adding ${name}. See ${p.log}.` }
+      if (ran === undefined || ran.exitCode !== 0) return { text: `Couldn't start adding ${name}${ran?.stderr.trim() ? `: ${ran.stderr.trim()}` : ''}. See ${p.log}.` }
       return { text: `Claude closes in a few seconds and opens signed out. Sign in to the account to add as ${name} and wait for the Code tab; then Claude comes back on this account and reopens this session.` }
     }
     if (verb) return { text: 'Usage: /account (show or hide the row), or /account add <name>.' }
-    const near = (await usage($)).some(w => w.percentUsed > NEAR_FULL)
-    const visible = (await read($, shown)) ?? near
+    const { visible } = await rowState($)
     await update($, shown, () => !visible)
     await update($, step, (): Step => ({ kind: 'idle' }))
     return { text: visible ? 'Account row hidden.' : 'Account row shown above the prompt.' }
@@ -322,11 +393,9 @@ function registerRow(on: Parameters<Register>[0]) {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || !(await isDesktop($))) return next(e)
     await read($, redraw)
-    const p = await paths($)
-    const accounts = (await readJson<{ accounts: Account[] }>($, `${p.dir}/accounts.json`, { accounts: [] })).accounts
-    const current = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
+    const { p, accounts, current, now, snapshots, windows, near, expiry, visible } = await rowState($)
+    if (!visible) return next(e)
     if (accounts.length < 2) {
-      if (!(await read($, shown))) return next(e)
       const { Box, Button, Text } = $.ui.resolve(e)
       return (
         <Box gap={1}>
@@ -337,15 +406,6 @@ function registerRow(on: Parameters<Register>[0]) {
         </Box>
       )
     }
-    const now = Date.now()
-    const snapshots = await readJson<Record<string, Snapshot>>($, `${p.dir}/usage.json`, {})
-    const live = (w: Window) => !(w.resetsAt && Date.parse(w.resetsAt) <= now)
-    const windows: Window[] = [...(await usage($)), ...scopedOf(snapshots[current]).filter(live)]
-    const near = windows.filter(w => w.percentUsed > NEAR_FULL)
-    const expiry = new Map<string, number | null>()
-    for (const a of accounts.filter(a => a.accountUuid !== current)) expiry.set(a.accountUuid, await signinExpiry($, p.dir, a.accountUuid))
-    const expiringSoon = [...expiry.values()].some(t => t === null || t - now < SHOW_DAYS * DAY)
-    if (!((await read($, shown)) ?? (near.length > 0 || expiringSoon))) return next(e)
     const cooldowns = (await readJson<{ cooldowns?: Record<string, string> }>($, `${p.dir}/state.json`, {})).cooldowns ?? {}
     const armed = (await readJson<{ armed?: boolean }>($, p.config, {})).armed === true
     const me = accounts.find(a => a.accountUuid === current)
@@ -353,7 +413,9 @@ function registerRow(on: Parameters<Register>[0]) {
       const t = cooldowns[a.accountUuid]
       return t !== undefined && Date.parse(t) > now ? when(t) : undefined
     }
-    const s = await read($, step)
+    // A switch past its time (its timer lost, say to a reload of the mod) shows as over.
+    const saved = await read($, step)
+    const s: Step = saved.kind === 'switching' && now - saved.at > SWITCH_TIMEOUT_MS ? { kind: 'idle' } : saved
     const { Box, Button, Text } = $.ui.resolve(e)
 
     if (s.kind === 'switching') {
@@ -384,13 +446,17 @@ function registerRow(on: Parameters<Register>[0]) {
             variant="primary"
             label={label}
             onPress={async () => {
-              await update($, step, (): Step => ({ kind: 'switching', to: s.to, action: s.action }))
+              const at = Date.now()
+              await update($, step, (): Step => ({ kind: 'switching', to: s.to, action: s.action, at }))
               const sessionId = await $.session.id()
               const ran = await $.process.run(['/bin/bash', p.relay, s.action, s.to, '--resume', sessionId]).catch(() => undefined)
               if (ran === undefined || ran.exitCode !== 0) {
-                $.ui.toast(`Couldn't start: ${label.toLowerCase()}. See ${p.log}.`)
+                $.ui.toast(`Couldn't start: ${label.toLowerCase()}${ran?.stderr.trim() ? ` (${ran.stderr.trim()})` : ''}. See ${p.log}.`)
                 await update($, step, (): Step => ({ kind: 'idle' }))
+                return
               }
+              // Claude closes this session within seconds; if it's still here, nothing happened.
+              $.clock.after(SWITCH_TIMEOUT_MS, () => void switchTimedOut($, at))
             }}
           />
           <Button key="cancel" label="Cancel" onPress={() => update($, step, (): Step => ({ kind: 'idle' }))} />
