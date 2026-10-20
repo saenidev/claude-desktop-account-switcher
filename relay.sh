@@ -171,7 +171,7 @@ cmd_relaunch() {
   [ -n "$id" ] || die "relaunch: no account named $name"
   local session=""; [ "${1:-}" = "--resume" ] && session="${2:-}"
   local dir pid; dir=$(expand "$(account_field "$id" userDataDir)"); pid=$(instance_pid "$dir")
-  sleep 3   # let the caller's turn finish writing before its app quits
+  sleep 10  # let the caller's turn finish before its app quits
   if [ -n "$pid" ]; then
     kill -TERM "$pid"; wait_gone "$pid" 30 || { kill -KILL "$pid"; wait_gone "$pid" 5; }
     log "relaunch: $name (pid $pid) closed"
