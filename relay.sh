@@ -132,10 +132,17 @@ parse_args() {
   done
 }
 
+# When a parked sign-in runs out (UTC): the claude.ai sessionKey cookie's expiry, read from
+# the cookie database's metadata. The cookie's value is encrypted and never read.
+signin_expires() {
+  local f="$PARK/$1/Cookies"; [ -f "$f" ] || return 0
+  sqlite3 "file:$f?immutable=1" "select datetime(max(expires_utc)/1000000-11644473600,'unixepoch') from cookies where name='sessionKey'" 2>/dev/null
+}
+
 # Where an account's sign-in is: in Claude now, parked and ready, or nowhere (needs signin).
 signin_state() {
   if [ "$(folder_account "$DEFAULT_DIR")" = "$1" ]; then echo "in Claude now"
-  elif [ -f "$PARK/$1/Cookies" ]; then echo "parked, ready to switch to"
+  elif [ -f "$PARK/$1/Cookies" ]; then echo "parked, ready to switch to (sign-in good until $(signin_expires "$1") UTC)"
   else echo "not signed in (relay.sh signin-later $(account_field "$1" name))"; fi
 }
 

@@ -13,7 +13,8 @@ macOS only. Built against Claude Desktop 3.1623 / Claude Code 2.1.30x.
 
   - **Switch to …** asks first, then does the same switch as the automatic one.
   - **Auto-switch** turns automatic switching on or off.
-  - The row also shows by itself when usage is above 95%.
+  - The row also shows by itself when usage is above 95%, or when the parked account's sign-in has 3 days or less left.
+- **Parked sign-ins expire.** A claude.ai sign-in lasts 28 days from when it was last used. The row warns when the parked account has 7 days or less left (`relay.sh status` always shows the date); sign it in again with `relay.sh signin-later <name>`. Only the cookie's expiry date is read, never its value.
 
 ### What carries over in a switch
 

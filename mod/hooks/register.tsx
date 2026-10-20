@@ -170,6 +170,21 @@ async function usage($: Host) {
   return rateLimits.filter(w => w.kind in WINDOW)
 }
 
+const DAY = 24 * 60 * 60 * 1000
+const WARN_DAYS = 7
+const SHOW_DAYS = 3
+
+// A parked sign-in's expiry (ms), from the sessionKey cookie's metadata (its value is
+// encrypted and never read); null when nothing is parked for that account.
+async function signinExpiry($: Host, dir: string, accountUuid: string): Promise<number | null> {
+  const db = `${dir}/park/${accountUuid}/Cookies`
+  const ran = await $.process
+    .run(['/usr/bin/sqlite3', `file:${db}?immutable=1`, "select max(expires_utc)/1000000-11644473600 from cookies where name='sessionKey'"])
+    .catch(() => undefined)
+  const seconds = Number(ran?.stdout.trim())
+  return ran?.exitCode === 0 && seconds > 0 ? seconds * 1000 : null
+}
+
 function registerRow(on: Parameters<Register>[0]) {
   on('session.start', async ($, e, next) => {
     const r = await next(e)
@@ -198,16 +213,18 @@ function registerRow(on: Parameters<Register>[0]) {
     await read($, redraw)
     const windows = await usage($)
     const near = windows.filter(w => w.percentUsed > NEAR_FULL)
-    if (!((await read($, shown)) ?? near.length > 0)) return next(e)
-
     const p = await paths($)
     const accounts = (await readJson<{ accounts: Account[] }>($, `${p.dir}/accounts.json`, { accounts: [] })).accounts
     if (accounts.length < 2) return next(e)
+    const current = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
+    const now = Date.now()
+    const expiry = new Map<string, number | null>()
+    for (const a of accounts.filter(a => a.accountUuid !== current)) expiry.set(a.accountUuid, await signinExpiry($, p.dir, a.accountUuid))
+    const expiringSoon = [...expiry.values()].some(t => t === null || t - now < SHOW_DAYS * DAY)
+    if (!((await read($, shown)) ?? (near.length > 0 || expiringSoon))) return next(e)
     const cooldowns = (await readJson<{ cooldowns?: Record<string, string> }>($, `${p.dir}/state.json`, {})).cooldowns ?? {}
     const armed = (await readJson<{ armed?: boolean }>($, p.config, {})).armed === true
-    const current = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
     const me = accounts.find(a => a.accountUuid === current)
-    const now = Date.now()
     const outUntil = (a: Account) => {
       const t = cooldowns[a.accountUuid]
       return t !== undefined && Date.parse(t) > now ? when(t) : undefined
@@ -259,10 +276,19 @@ function registerRow(on: Parameters<Register>[0]) {
           .filter(a => a.accountUuid !== current)
           .map(a => {
             const out = outUntil(a)
+            const exp = expiry.get(a.accountUuid) ?? null
+            if (exp === null || exp <= now) {
+              return (
+                <Text key={`to-${a.name}`}>
+                  {a.name} is signed out: run relay.sh signin-later {a.name}
+                </Text>
+              )
+            }
             return (
               <Box gap={1}>
                 <Button key={`to-${a.name}`} label={`Switch to ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name }))} />
                 {out ? <Text dimColor>out until {out}</Text> : null}
+                {exp - now < WARN_DAYS * DAY ? <Text>sign-in expires {when(new Date(exp).toISOString())}</Text> : null}
               </Box>
             )
           })}
