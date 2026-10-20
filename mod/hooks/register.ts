@@ -34,8 +34,8 @@ async function readJson<T>($: Host, path: string, fallback: T): Promise<T> {
 
 async function log($: Host, text: string) {
   const p = await paths($)
-  const stamp = new Date(await $.clock.now()).toISOString().replace('T', ' ').slice(0, 19)
-  await $.process.run(['/bin/sh', '-c', 'printf "%s\\n" "$1" >> "$2"', 'sh', `${stamp} mod: ${text}`, p.log]).catch(() => undefined)
+  // Local time from date(1), matching relay.sh's lines in the same log.
+  await $.process.run(['/bin/sh', '-c', 'printf "%s mod: %s\\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$1" >> "$2"', 'sh', text, p.log]).catch(() => undefined)
 }
 
 // Only Code tab sessions in the desktop app run on the app's login; a terminal

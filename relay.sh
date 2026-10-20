@@ -73,7 +73,8 @@ launch_app() {
 }
 
 # Every running Claude main process, whatever its folder.
-all_instances() { ps -axo pid=,args= | awk -v bin="$BIN" 'index($0, bin) && !/--type=/ {print $1}'; }
+# Match on the program itself ($2), not anywhere in the line: awk's own arguments contain $BIN.
+all_instances() { ps -axo pid=,args= | awk -v bin="$BIN" '$2 == bin && !/--type=/ {print $1}'; }
 
 wait_gone() { local pid="$1" n=0; while kill -0 "$pid" 2>/dev/null && [ $n -lt "$2" ]; do sleep 1; n=$((n+1)); done; ! kill -0 "$pid" 2>/dev/null; }
 wait_up() { local dir="$1" n=0; while [ -z "$(instance_pid "$dir")" ] && [ $n -lt "$2" ]; do sleep 1; n=$((n+1)); done; [ -n "$(instance_pid "$dir")" ]; }
