@@ -48,7 +48,7 @@ test('a turn marks its session busy, and its end clears it', async (t: any, on: 
   await t.classic.UserPromptSubmit({ session_id: 's1', cwd: '/tmp', prompt: 'hi', hook_event_name: 'UserPromptSubmit', transcript_path: '/dev/null' })
   const busy = JSON.parse(files[`${D}/busy/s1.json`] ?? 'null')
   must(busy?.busy === true && busy?.v === 2 && busy?.account === 'acct', `busy marker: ${files[`${D}/busy/s1.json`]}`)
-  await t.turn.complete({ answer: { text: 'done' } })
+  await t.turn.complete({ answer: 'done', reason: 'answer', durationMs: 1, isAborted: false, turnId: 't1' })
   must(!(`${D}/busy/s1.json` in files), `marker left after the turn: ${JSON.stringify(h.runs)}`)
 })
 
