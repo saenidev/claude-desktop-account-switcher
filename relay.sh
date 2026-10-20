@@ -382,6 +382,8 @@ swap_to() {
   [ -f "$PARK/$target/Cookies" ] || { log "swap: no parked sign-in for $(account_field "$target" name)"; return 1; }
   quit_default
   move_signin "$cur" "$target"
+  apply_prefs_patch
+  mirror_prefs "$cur" "$target"
   open -a "$APP"
   local n=0; while [ "$(folder_account "$DEFAULT_DIR")" != "$target" ] && [ $n -lt 45 ]; do sleep 1; n=$((n+1)); done
   if [ "$(folder_account "$DEFAULT_DIR")" = "$target" ]; then
@@ -450,6 +452,44 @@ cmd_swap() {
 }
 cmd_swap_later() { [ -n "$(account_by_name "${1:-}")" ] || die "swap-later: no account named ${1:-}"; run_job swap "$@" && log "swap: $1 queued under launchd"; }
 
+# Some app preferences are stored per account (keys holding the account id, or
+# "<account>/<org>"). Copy the outgoing account's onto the incoming one, so settings follow
+# you across a switch. Only while Claude is closed: the running app rewrites this file.
+PREFS="$DEFAULT_DIR/claude_desktop_config.json"
+mirror_prefs() {
+  local from="$1" to="$2" fo to_org
+  fo=$(account_field "$from" orgUuid); to_org=$(account_field "$to" orgUuid)
+  [ -f "$PREFS" ] || return 0
+  cp -p "$PREFS" "$DIR/backups/claude_desktop_config.before-mirror.json"
+  local tmp="$PREFS.tmp.$$"
+  jq --arg f "$from" --arg t "$to" --arg fo "${fo:-none}" --arg to "${to_org:-none}" '
+    walk(if type == "object" then
+      . + (to_entries | map(select(.key | contains($f)))
+           | map({key: (.key | gsub($f; $t) | gsub($fo; $to)), value}) | from_entries)
+    else . end)' "$PREFS" > "$tmp" && jq empty "$tmp" && mv "$tmp" "$PREFS" && log "prefs: $(account_field "$from" name)'s per-account settings copied to $(account_field "$to" name)"
+}
+
+# A one-off settings fix ($DIR/prefs-patch.json), merged in the next time Claude is closed.
+apply_prefs_patch() {
+  [ -f "$DIR/prefs-patch.json" ] || return 0
+  cp -p "$PREFS" "$DIR/backups/claude_desktop_config.before-patch.json"
+  jq -s '.[0] * .[1]' "$PREFS" "$DIR/prefs-patch.json" > "$PREFS.tmp.$$" && mv "$PREFS.tmp.$$" "$PREFS" && mv "$DIR/prefs-patch.json" "$DIR/backups/prefs-patch.applied.json" && log "prefs: patch applied"
+}
+
+# Restart Claude in place (same account), applying any settings fix while it's closed.
+cmd_restart() {
+  local session=""; [ "${1:-}" = "--resume" ] && session="${2:-}"
+  sleep 10
+  quit_default
+  apply_prefs_patch
+  open -a "$APP"
+  if [ -n "$session" ]; then
+    sleep 15
+    jq_write "$HANDOFF" --arg s "$session" --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: $s, cwd: "", reason: "restart", at: $at}]'
+    reopen_handoff >/dev/null
+  fi
+}
+
 case "${1:-}" in
   resume) cmd_resume ;;
   launch) shift; cmd_launch "$@" ;;
@@ -457,6 +497,8 @@ case "${1:-}" in
   plan)   shift; cmd_plan "$@" ;;
   status) cmd_status ;;
   swap)   shift; cmd_swap "$@" ;;
+  restart) shift; cmd_restart "$@" ;;
+  restart-later) shift; run_job restart "$@" ;;
   swap-later) shift; cmd_swap_later "$@" ;;
   relaunch) shift; cmd_relaunch "$@" ;;
   relaunch-later) shift; cmd_relaunch_later "$@" ;;
