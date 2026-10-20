@@ -490,6 +490,35 @@ cmd_restart() {
   fi
 }
 
+# Sign an account in by hand without losing the current one:
+#   relay.sh signin <name> [--resume <sessionId>]   (run under launchd by signin-later)
+# Parks the current sign-in, opens Claude signed out for you to sign in to <name>, then
+# parks <name> and brings the previous account back. Gives up after 10 minutes.
+cmd_signin() {
+  local id; id=$(account_by_name "${1:-}"); [ -n "$id" ] || die "signin: no account named ${1:-}"
+  local session=""; [ "${2:-}" = "--resume" ] && session="${3:-}"
+  local cur; cur=$(folder_account "$DEFAULT_DIR")
+  sleep 10
+  quit_default
+  move_signin "$cur" "$id"   # nothing parked for $id, so Claude opens signed out
+  open -a "$APP"
+  notify "Sign in to ${1} in Claude. Your other account comes back afterwards."
+  log "signin: waiting for ${1} to be signed in"
+  local n=0; while [ "$(folder_account "$DEFAULT_DIR")" != "$id" ] && [ $n -lt 600 ]; do sleep 2; n=$((n+2)); done
+  if [ "$(folder_account "$DEFAULT_DIR")" = "$id" ]; then log "signin: ${1} signed in"; sleep 8; else log "signin: no sign-in to ${1} within 10 minutes"; fi
+  quit_default
+  if [ "$(folder_account "$DEFAULT_DIR")" = "$id" ]; then move_signin "$id" "$cur"; else
+    local f; for f in Cookies Cookies-journal; do [ -e "$PARK/$cur/$f" ] && mv -f "$PARK/$cur/$f" "$DEFAULT_DIR/$f"; done
+  fi
+  open -a "$APP"
+  log "signin: back on $(account_field "$cur" name)"
+  if [ -n "$session" ]; then
+    sleep 15
+    jq_write "$HANDOFF" --arg s "$session" --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: $s, cwd: "", reason: "signin", at: $at}]'
+    reopen_handoff >/dev/null
+  fi
+}
+
 case "${1:-}" in
   resume) cmd_resume ;;
   launch) shift; cmd_launch "$@" ;;
@@ -497,6 +526,8 @@ case "${1:-}" in
   plan)   shift; cmd_plan "$@" ;;
   status) cmd_status ;;
   swap)   shift; cmd_swap "$@" ;;
+  signin) shift; cmd_signin "$@" ;;
+  signin-later) shift; run_job signin "$@" ;;
   restart) shift; cmd_restart "$@" ;;
   restart-later) shift; run_job restart "$@" ;;
   swap-later) shift; cmd_swap_later "$@" ;;
