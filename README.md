@@ -46,13 +46,29 @@ These stay in `~/.claude/account-relay` and out of git: `config.json` (`{"armed"
 4. Each new profile folder starts with default app preferences, extensions and session lists. What to copy or link is in the audit section of `desktop-signin-map.md`.
 5. Arm it: `echo '{ "armed": true }' > ~/.claude/account-relay/config.json`
 
-## A different Dock icon per account
+## Each account in its own app, one window per folder
 
-An account can open with its own copy of the app: set `"app"` on it in `accounts.json` (default `/Applications/Claude.app`). The relay opens that account with its app, and counts every listed app as a Claude window.
+Here: **orange** (`/Applications/Claude.app`, the original) is second. **Blue** (`~/Applications/Claude Blue.app`) is saenidev.
 
-`dock-icon/build.sh [degrees]` builds `~/Applications/Claude Blue.app`: a copy with the icon's hue rotated (225° turns the orange blue), re-signed ad hoc. The copy doesn't auto-update, so rebuild it after each Claude update. Each rebuild changes its signature, so macOS asks once more for the "Claude Safe Storage" key. Opening the orange app by hand, with no `--user-data-dir`, still opens the default folder.
+What the app does, from its own code and from tests:
 
-macOS sends `claude://` links to the orange app, and starts it if it isn't running, even when the window you meant runs the copy. That once opened a second window on the same folder. So the relay sends each link to one app with `open -a <app> <link>`. Sign-in links from the browser still go to the orange app: to sign a folder in, open it with the orange app, with no other Claude window running.
+- It has no single-instance lock. Two windows can open the same profile folder and share its sign-in, so signing out in one signs out both.
+- Only the `--user-data-dir` switch picks a folder (release builds delete `CLAUDE_USER_DATA_DIR`). Dock, Spotlight, Finder and `claude://` links never pass it, so any app opened by hand opens the default folder.
+- Every window claims `claude://` at startup. Copies keep the same bundle id, so they don't fight over it. macOS sends links to the orange app and starts it if it isn't running.
+- The "Claude Safe Storage" Keychain key trusts Anthropic's team ID, plus one fingerprint per re-signed copy.
+
+How it's handled:
+
+- **Blue is an untouched copy** of the orange app with a Finder custom icon (`dock-icon/seticon.swift`). It's never re-signed, so there are no Keychain prompts and it updates itself. `"app"` and `"icon"` in `accounts.json` name it.
+- **`relay.sh sync`** puts a copy on the orange app's version, when it isn't running, and puts its icon back. macOS lets only Anthropic-signed processes change a launched Anthropic-signed bundle. So the mod runs sync at every session start; the launchd `sync` agent can only refresh a copy that isn't protected yet.
+- **`relay.sh guard`** runs every 5 seconds from a launchd agent:
+  - A window running the wrong app for its folder is closed, and the folder is reopened in its own app. Opening orange by hand ends up in blue.
+  - Of two windows on one folder, the newer one is closed.
+- **The relay sends links to one app** with `open -a <app> <link>`.
+- **Old copies are unregistered** from LaunchServices before they go to the Trash. A trashed copy otherwise still claims `claude://`.
+- **Sign-in links from the browser go to the orange app.** If you sign saenidev in, the guard then moves the window to blue; the sign-in is stored in the folder either way.
+
+Install the agents with `relay.sh install-agents`. `tests/matrix.sh start --resume <sessionId>` runs every entry point (blue or orange opened by hand, a bare link, the relay) in every starting state (nothing open, saenidev only, second only, both). It closes all windows while it runs. The last run's results are in [tests/matrix-results-2026-10-20.md](tests/matrix-results-2026-10-20.md).
 
 ## Use
 
