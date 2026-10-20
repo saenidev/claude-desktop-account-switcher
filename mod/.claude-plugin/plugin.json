@@ -1,1 +1,1 @@
-{ "name": "account-relay", "version": "0.2.0", "description": "When a Claude account runs out, move the desktop app to the next account and reopen Code tab sessions there; /account shows a row to switch by hand", "types": "./types/index.d.ts" }
+{ "name": "desktop-account-switcher", "version": "0.2.0", "description": "When a Claude account runs out, move the desktop app to the next account and reopen Code tab sessions there; /account shows a row to switch by hand", "types": "./types/index.d.ts" }

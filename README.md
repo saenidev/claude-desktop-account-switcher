@@ -40,7 +40,7 @@ macOS only. Built against Claude Desktop 3.1623 / Claude Code 2.1.30x.
 - **One session list.** The app keeps sessions under `claude-code-sessions/<account>/<org>/` (and `local-agent-mode-sessions/…` for Cowork). Every account/org pair is a link to one shared folder, so both accounts see the same sessions. Session files hold no account fields.
 - **Per-account settings follow you.** A few app preferences are stored per account (keys holding the account or org id in `claude_desktop_config.json`). While Claude is closed for a switch, the relay copies the outgoing account's onto the incoming one.
 - **Scratch paths are kept inside the app's folder.** The app files a session under Scratch only if its folder is inside its own `scratch-workspaces`, and on launch it deletes scratch folders no session names by exact path. While Claude is closed, the relay points any session still using an old profile folder's path back inside it.
-- **The mod** (`mod/`, installed as `account-relay@account-relay-local`) runs in every Code tab session in the desktop app:
+- **The mod** (`mod/`, installed as `desktop-account-switcher@desktop-account-switcher-local`) runs in every Code tab session in the desktop app:
   - It records which sessions are mid-turn.
   - When a turn fails with `rate_limit` while a usage window is at 95% or more (or the error says a limit was reached) and auto-switch is on, it writes a hand-off listing the sessions to reopen and starts the relay. If the relay doesn't switch after all (it can't start, no other account has usage, or the new sign-in doesn't come up), those entries are dropped.
   - In a session the relay reopened, it sends one message saying why (a usage limit, a switch by hand, a restart, a sign-in) and to carry on. It acts only when the session starts by being reopened (not on a compact or clear), only if the relay closed Claude after the entry was written (`closedAt`, stamped as it quits Claude), and only within 15 minutes; older entries are dropped.
@@ -58,7 +58,7 @@ macOS only. Built against Claude Desktop 3.1623 / Claude Code 2.1.30x.
 | In this repo | What it is |
 | --- | --- |
 | `relay.sh` | The switcher. Linked from `~/.claude/account-relay/relay.sh`. |
-| `mod/` | The Claude Code mod (hooks + the `/account` row). Linked from `~/.claude/account-relay/mod`, which is the `account-relay-local` plugin marketplace. |
+| `mod/` | The Claude Code mod (hooks + the `/account` row). Linked from `~/.claude/account-relay/mod`, which is the `desktop-account-switcher-local` plugin marketplace. |
 | `accounts.example.json` | Template for `~/.claude/account-relay/accounts.json`. |
 | `tools/migrate-to-inplace.sh` | The one-time move from the old design (shared session list, parked sign-in, blue copy retired). |
 | `docs/` | Research notes on the app's sign-in, and the history of the earlier design. |
@@ -109,7 +109,7 @@ The `-later` forms run under launchd and wait 10 seconds first, so they can be s
    ln -s "$PWD/relay.sh" ~/.claude/account-relay/relay.sh
    ln -s "$PWD/mod" ~/.claude/account-relay/mod
    claude plugin marketplace add ~/.claude/account-relay/mod
-   claude plugin install account-relay@account-relay-local --scope user
+   claude plugin install desktop-account-switcher@desktop-account-switcher-local --scope user
    ```
 4. Sign the second account in: `~/.claude/account-relay/relay.sh signin-later <second-name>`. Claude closes and opens signed out; sign in to the second account; the relay parks it and brings the first back.
 5. Share one session list: with Claude closed, move each account/org folder's contents under `claude-code-sessions/` and `local-agent-mode-sessions/` into one folder and link the others to it (`tools/migrate-to-inplace.sh` shows how; back up first).
@@ -133,6 +133,6 @@ The `-later` forms run under launchd and wait 10 seconds first, so they can be s
 ## Uninstall
 
 1. Turn auto-switch off.
-2. `claude plugin uninstall account-relay@account-relay-local` and `claude plugin marketplace remove account-relay-local`.
+2. `claude plugin uninstall desktop-account-switcher@desktop-account-switcher-local` and `claude plugin marketplace remove desktop-account-switcher-local`.
 3. The parked sign-in stays in `~/.claude/account-relay/park/`; delete it to sign that account out for good.
 4. The shared session list keeps working with one account. To split it again, restore `backups/20261020-before-shared-list/` with Claude closed.

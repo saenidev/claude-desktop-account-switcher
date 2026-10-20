@@ -1,5 +1,5 @@
 {
-  "name": "account-relay-local",
+  "name": "desktop-account-switcher-local",
   "owner": { "name": "Jun" },
-  "plugins": [{ "name": "account-relay", "source": "./" }]
+  "plugins": [{ "name": "desktop-account-switcher", "source": "./" }]
 }

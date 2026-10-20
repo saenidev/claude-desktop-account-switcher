@@ -5,6 +5,6 @@ declare module 'claude-code' {
   interface PluginState {
     // shown: true after /account opens the row, false after it's closed, null until either
     // (the row then shows only while usage is above 95%).
-    'account-relay': { step: Step; redraw: number; shown: boolean | null }
+    'desktop-account-switcher': { step: Step; redraw: number; shown: boolean | null }
   }
 }

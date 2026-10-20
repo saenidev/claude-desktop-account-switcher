@@ -187,7 +187,7 @@ export const register: Register = on => {
     }
     const resetsAt = full.map(w => w.resetsAt).filter((t): t is string => !!t).sort().at(-1)
     const said = await relay($, e.session_id, e.cwd, `limit hit: ${full.map(w => `${w.kind} ${w.percentUsed}%`).join(', ') || 'limit message'}; login ${identity?.kind ?? 'unknown'}`, resetsAt)
-    $.ui.toast(`Account relay: ${said}`, { timeoutMs: 10_000 })
+    $.ui.toast(`Account switcher: ${said}`, { timeoutMs: 10_000 })
     return r
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
@@ -196,10 +196,10 @@ export const register: Register = on => {
 
 // The account row above the prompt.
 
-const step = atom({ plugin: 'account-relay', key: 'step' } as const, { kind: 'idle' } as Step)
+const step = atom({ plugin: 'desktop-account-switcher', key: 'step' } as const, { kind: 'idle' } as Step)
 // Bumped when something the row shows may have changed, so it draws again.
-const redraw = atom({ plugin: 'account-relay', key: 'redraw' } as const, 0)
-const shown = atom({ plugin: 'account-relay', key: 'shown' } as const, null as boolean | null)
+const redraw = atom({ plugin: 'desktop-account-switcher', key: 'redraw' } as const, 0)
+const shown = atom({ plugin: 'desktop-account-switcher', key: 'shown' } as const, null as boolean | null)
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 function when(iso: string) {

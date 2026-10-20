@@ -284,7 +284,7 @@ cmd_doctor() {
   fail() { echo "!!  $*"; bad=1; }
   [ -L "$DIR/relay.sh" ] && [ -e "$DIR/relay.sh" ] && ok "relay.sh -> $(readlink "$DIR/relay.sh")" || fail "$DIR/relay.sh is not a working link"
   [ -L "$DIR/mod" ] && [ -e "$DIR/mod/hooks/hooks.json" ] && ok "mod -> $(readlink "$DIR/mod")" || fail "$DIR/mod is not a working link"
-  jq -e '.enabledPlugins["account-relay@account-relay-local"] == true' "$HOME/.claude/settings.json" >/dev/null 2>&1 && ok "mod installed and enabled" || fail "mod not enabled (claude plugin install account-relay@account-relay-local)"
+  jq -e '.enabledPlugins["desktop-account-switcher@desktop-account-switcher-local"] == true' "$HOME/.claude/settings.json" >/dev/null 2>&1 && ok "mod installed and enabled" || fail "mod not enabled (claude plugin install desktop-account-switcher@desktop-account-switcher-local)"
   local n; n=$(jq '[.accounts[] | select(.accountUuid and .orgUuid and .name)] | length' "$ACCOUNTS" 2>/dev/null || echo 0)
   [ "$n" -ge 2 ] && ok "$n accounts in accounts.json" || fail "accounts.json needs 2+ accounts with name, accountUuid, orgUuid"
   local cur; cur=$(folder_account "$DEFAULT_DIR")
