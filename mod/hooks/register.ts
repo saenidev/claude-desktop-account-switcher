@@ -12,8 +12,15 @@ type Host = EngineInterface
 
 const NEAR_FULL = 95
 const BUSY_FRESH_MS = 6 * 60 * 60 * 1000
-const CONTINUE =
-  'The Claude account this session was running on ran out of usage, so the desktop app moved to another account and reopened this session. Carry on from where you were cut off; if your last step may not have finished, check it before going on.'
+const CARRY_ON = 'Carry on from where you were cut off; if your last step may not have finished, check it before going on.'
+const CONTINUE = `The Claude account this session was running on ran out of usage, so the desktop app moved to another account and reopened this session. ${CARRY_ON}`
+// Hand-offs relay.sh writes when it closes Claude for something other than a usage limit.
+const REOPENED: Record<string, { text: string; toast: string }> = {
+  restart: { text: `The relay restarted the desktop app (same account) and reopened this session. ${CARRY_ON}`, toast: 'Claude restarted; carrying on.' },
+  relaunch: { text: `The relay restarted the desktop app (same account) and reopened this session. ${CARRY_ON}`, toast: 'Claude restarted; carrying on.' },
+  signin: { text: `The relay closed the desktop app for a sign-in, put the previous account back, and reopened this session. ${CARRY_ON}`, toast: 'Back on your account; carrying on.' },
+  swap: { text: `The desktop app was switched to another account by hand and reopened this session. ${CARRY_ON}`, toast: 'Switched account; carrying on.' },
+}
 
 type Handoff = { resume: { sessionId: string; cwd: string; reason: string; at: string }[] }
 type Busy = { sessionId: string; cwd: string; account: string; busy: boolean; at: number }
@@ -106,9 +113,10 @@ export const register: Register = on => {
     const mine = handoff.resume.find(x => x.sessionId === e.session_id)
     if (mine === undefined) return r
     await $.fs.write(p.handoff, JSON.stringify({ resume: handoff.resume.filter(x => x.sessionId !== e.session_id) }, null, 2))
-    await log($, `reopened ${e.session_id} (${e.source}); sending the carry-on message`)
-    $.ui.toast('Reopened on another Claude account; carrying on.', { timeoutMs: 8000 })
-    $.clock.after(2500, () => void $.prompt.submit({ text: CONTINUE }))
+    const msg = REOPENED[mine.reason] ?? { text: CONTINUE, toast: 'Reopened on another Claude account; carrying on.' }
+    await log($, `reopened ${e.session_id} (${e.source}, ${mine.reason}); sending the carry-on message`)
+    $.ui.toast(msg.toast, { timeoutMs: 8000 })
+    $.clock.after(2500, () => void $.prompt.submit({ text: msg.text }))
     return r
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
