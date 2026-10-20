@@ -29,6 +29,12 @@ const REOPENED: Record<string, { text: string; toast: string }> = {
   signin: { text: `The relay closed the desktop app for a sign-in, put the previous account back, and reopened this session. ${CARRY_ON}`, toast: 'Back on your account; carrying on.' },
   swap: { text: `The desktop app was switched to another account by hand and reopened this session. ${CARRY_ON}`, toast: 'Switched account; carrying on.' },
 }
+// A session that was mid-turn when the relay closed Claude, for whatever reason: relay.sh lists
+// it as "closed", with the account it was on (`from`).
+const CLOSED = (switched: boolean) =>
+  switched
+    ? { text: `The desktop app was moved to another Claude account while this session was mid-turn, and reopened it. ${CARRY_ON}`, toast: 'Reopened on another Claude account; carrying on.' }
+    : { text: `The desktop app was closed and reopened while this session was mid-turn. ${CARRY_ON}`, toast: 'Claude reopened; carrying on.' }
 
 // Artifacts belong to the claude.ai account that published them, so after a switch the ones
 // this session published are another account's: not found here unless they were shared with
@@ -45,7 +51,8 @@ async function publishedArtifacts($: Host, transcript: string) {
 
 // `account`: the account Claude is on when the session reopens (relay.sh fills it in; the
 // mod's own entries get it once the switch has picked an account). Absent on older entries.
-type Handoff = { resume: { sessionId: string; cwd: string; reason: string; at: string; account?: string }[]; closedAt?: string }
+// `from`: on "closed" entries, the account the session was on when Claude closed.
+type Handoff = { resume: { sessionId: string; cwd: string; reason: string; at: string; account?: string; from?: string }[]; closedAt?: string }
 // A session mid-turn has a file in busy/; it's deleted when the turn ends, however it ends.
 type Busy = { sessionId: string; cwd: string; account: string; busy?: boolean; at: number }
 
@@ -60,6 +67,20 @@ async function readJson<T>($: Host, path: string, fallback: T): Promise<T> {
     return JSON.parse(await $.fs.read(path)) as T
   } catch {
     return fallback
+  }
+}
+
+// handoff.json and usage.json are changed by the relay and by every session's mod, often at the
+// same moment; each change reads, changes and writes the file under <file>.lock, the folder
+// lock relay.sh takes too (LOCK_SH there). After 10 seconds without it the change goes ahead anyway.
+const LOCK_SH = 'i=0; until mkdir "$1" 2>/dev/null; do i=$((i+1)); [ $i -ge 100 ] && exit 1; [ $(( $(date +%s) - $(stat -f %m "$1" 2>/dev/null || date +%s) )) -gt 10 ] && rmdir "$1" 2>/dev/null; sleep 0.1; done'
+async function withLock<T>($: Host, file: string, change: () => Promise<T>): Promise<T> {
+  const lock = `${file}.lock`
+  const got = (await $.process.run(['/bin/sh', '-c', LOCK_SH, 'sh', lock]).catch(() => undefined))?.exitCode === 0
+  try {
+    return await change()
+  } finally {
+    if (got) await $.process.run(['/bin/rmdir', lock]).catch(() => undefined)
   }
 }
 
@@ -115,15 +136,24 @@ async function relay($: Host, sessionId: string, cwd: string, reason: string, re
     await log($, `auto-switch is off: not switching away from ${account} (${reason}); ${resume.size} session(s) would have reopened`)
     return 'This account is out of usage. Auto-switch is off: use /account to switch.'
   }
-  const handoff = await readJson<Handoff>($, p.handoff, { resume: [] })
-  for (const r of handoff.resume) if (!resume.has(r.sessionId)) resume.set(r.sessionId, r)
-  await $.fs.write(p.handoff, JSON.stringify({ ...handoff, resume: [...resume.values()] }, null, 2))
+  // The entries this adds (sessions not listed already), to take back if no switch comes.
+  const added = await withLock($, p.handoff, async () => {
+    const handoff = await readJson<Handoff>($, p.handoff, { resume: [] })
+    const had = new Set(handoff.resume.map(r => r.sessionId))
+    for (const r of handoff.resume) if (!resume.has(r.sessionId)) resume.set(r.sessionId, r)
+    await $.fs.write(p.handoff, JSON.stringify({ ...handoff, resume: [...resume.values()] }, null, 2))
+    return new Set([...resume.keys()].filter(id => !had.has(id)))
+  })
 
   const argv = ['/bin/bash', p.relay, 'launch', '--from', account, ...(resetsAt ? ['--resets-at', isoZ(resetsAt)] : []), ...(limit ? ['--limit', limit] : [])]
   const ran = await $.process.run(argv, { timeoutMs: 15_000 }).catch((err: unknown) => ({ exitCode: -1, stdout: '', stderr: String(err) }))
   await log($, `launched relay away from ${account} (${reason}), exit ${ran.exitCode}${ran.exitCode === 0 ? '' : `: ${ran.stderr.trim()}`}`)
   if (ran.exitCode === 0) return `This account is out of usage. Switching to another account; ${resume.size} session(s) will reopen.`
-  await $.fs.write(p.handoff, JSON.stringify(handoff, null, 2)) // no switch coming: take the entries back
+  // No switch coming: take back the entries this added, leaving any written since.
+  await withLock($, p.handoff, async () => {
+    const now = await readJson<Handoff>($, p.handoff, { resume: [] })
+    await $.fs.write(p.handoff, JSON.stringify({ ...now, resume: now.resume.filter(r => !added.has(r.sessionId)) }, null, 2))
+  })
   return `This account is out of usage, and the switch couldn't start (${ran.stderr.trim() || `exit ${ran.exitCode}`}). See ${p.log}.`
 }
 
@@ -150,19 +180,25 @@ export const register: Register = on => {
     const p = await paths($)
     // Only a session coming back after Claude closed; a compact or clear starts a session too.
     if (e.source !== 'resume' && e.source !== 'startup') return r
-    const handoff = await readJson<Handoff>($, p.handoff, { resume: [] })
+    // A session starting isn't mid-turn, whatever busy/ says from before Claude last quit.
+    await clearBusy($, e.session_id).catch(() => undefined)
     const now = await $.clock.now()
     const account = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
-    const stale = handoff.resume.filter(x => !live(handoff, x, now) && now - Date.parse(x.at) >= HANDOFF_MAX_MS)
-    const mine = handoff.resume.find(x => x.sessionId === e.session_id && live(handoff, x, now) && onAccount(x, account))
-    if (mine === undefined && stale.length === 0) return r
-    const keep = handoff.resume.filter(x => x !== mine && !stale.includes(x))
-    await $.fs.write(p.handoff, JSON.stringify({ ...handoff, resume: keep }, null, 2))
-    if (stale.length > 0) await log($, `dropped ${stale.length} stale hand-off entr${stale.length === 1 ? 'y' : 'ies'} (${stale.map(x => x.sessionId).join(', ')})`)
+    const mine = await withLock($, p.handoff, async () => {
+      const handoff = await readJson<Handoff>($, p.handoff, { resume: [] })
+      const stale = handoff.resume.filter(x => !live(handoff, x, now) && now - Date.parse(x.at) >= HANDOFF_MAX_MS)
+      const found = handoff.resume.find(x => x.sessionId === e.session_id && live(handoff, x, now) && onAccount(x, account))
+      if (found === undefined && stale.length === 0) return undefined
+      const keep = handoff.resume.filter(x => x !== found && !stale.includes(x))
+      await $.fs.write(p.handoff, JSON.stringify({ ...handoff, resume: keep }, null, 2))
+      if (stale.length > 0) await log($, `dropped ${stale.length} stale hand-off entr${stale.length === 1 ? 'y' : 'ies'} (${stale.map(x => x.sessionId).join(', ')})`)
+      return found
+    })
     if (mine === undefined) return r
-    const msg = REOPENED[mine.reason] ?? { text: CONTINUE, toast: 'Reopened on another Claude account; carrying on.' }
-    // A restart or sign-in comes back on the same account; a switch doesn't.
-    const switched = mine.reason === 'swap' || REOPENED[mine.reason] === undefined
+    // A restart or sign-in comes back on the same account; a switch doesn't. A session cut
+    // off mid-turn was switched if the account it was on isn't this one.
+    const switched = mine.reason === 'closed' ? !!mine.from && mine.from !== account : mine.reason === 'swap' || REOPENED[mine.reason] === undefined
+    const msg = mine.reason === 'closed' ? CLOSED(switched) : (REOPENED[mine.reason] ?? { text: CONTINUE, toast: 'Reopened on another Claude account; carrying on.' })
     const artifacts = switched ? await publishedArtifacts($, e.transcript_path) : []
     const text = artifacts.length > 0 ? `${msg.text}\n\n${ARTIFACTS(artifacts)}` : msg.text
     await log($, `reopened ${e.session_id} (${e.source}, ${mine.reason}); sending the carry-on message${artifacts.length > 0 ? ` (with ${artifacts.length} artifact link(s) from the previous account)` : ''}`)
@@ -294,11 +330,14 @@ async function saveSnapshot($: Host) {
   const windows = await usage($)
   if (account === '' || windows.length === 0) return
   const p = await paths($)
-  const all = await readJson<Record<string, Snapshot>>($, `${p.dir}/usage.json`, {})
-  // Keep the windows only Anthropic reports (a model's own weekly limit) from the last read.
-  const others = (all[account]?.windows ?? []).filter(w => !(w.kind in WINDOW))
-  all[account] = { at: Date.now(), source: 'session', windows: [...windows.map(w => ({ kind: w.kind, percentUsed: w.percentUsed, resetsAt: w.resetsAt })), ...others] }
-  await $.fs.write(`${p.dir}/usage.json`, JSON.stringify(all, null, 2) + '\n')
+  const file = `${p.dir}/usage.json`
+  await withLock($, file, async () => {
+    const all = await readJson<Record<string, Snapshot>>($, file, {})
+    // Keep the windows only Anthropic reports (a model's own weekly limit) from the last read.
+    const others = (all[account]?.windows ?? []).filter(w => !(w.kind in WINDOW))
+    all[account] = { at: Date.now(), source: 'session', windows: [...windows.map(w => ({ kind: w.kind, percentUsed: w.percentUsed, resetsAt: w.resetsAt })), ...others] }
+    await $.fs.write(file, JSON.stringify(all, null, 2) + '\n')
+  })
 }
 
 // The windows only Anthropic reports for an account, from usage.json.

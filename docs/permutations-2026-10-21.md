@@ -1,0 +1,89 @@
+# Every permutation, 2026-10-21
+
+A pass over the switcher's logic: the states the Mac can be in, every action in each of them, and what happens. Each row says what the relay does now; **fixed** marks the ones that were wrong before this pass, with what went wrong. Every fixed row has a section in `tests/e2e.sh`, except where noted.
+
+## The states
+
+| What | Can be |
+| --- | --- |
+| Claude | running, closed |
+| Claude's sign-in | the account the app reports; signed out (that account parked, or not); another account's `Cookies` while the app still reports the old one (a switch cut off half-way) |
+| Each other account's parked sign-in | live; run out (its cookie expired); looks live but claude.ai no longer takes it; none |
+| `switch.lock` | free; held by a live run; left by a killed run; its pid reused by a newer process; held by the keep-alive (a job of its own) |
+| The relay's launchd job | not running; running (`use`, `add`, `signin`, `restart`, a limit switch) |
+| Keep-alive profile | empty; holding a parked sign-in from a keep-alive that was cut off |
+| `handoff.json` | entries from the mod (a limit), from the relay (`--resume`), cut off mid-turn; for this account, another one, any; before or after the last close; written by several sessions at once |
+| `busy/` | sessions mid-turn on this account, another one; left over from a quit that didn't end the turn |
+| Accounts | 1, 2, 3 or more; an org not learnt yet |
+| Terminal login | on the app's account, another one, none; a parked login for the target, or not; the live item missing |
+| Usage figures | read, unreadable, a window used up that hasn't reset |
+
+## Out of usage (the mod's trigger, then `relay.sh switch`)
+
+| When | Now |
+| --- | --- |
+| Next account has a live parked sign-in and usage | Switches, reopens the cut-off sessions. |
+| Next account's parked sign-in has run out, a third is fine | Skips it, switches to the third. **Fixed:** it was tried, didn't come up, and the switch failed, so Claude stayed on the spent account. |
+| Next account's sign-in looks live but doesn't come up | Goes back, then tries the next ready account. **Fixed:** the switch failed on the first. |
+| Every other account cooling down, used up or signed out | Notifies, drops this limit's hand-offs, changes nothing. |
+| The keep-alive holds the lock (04:30) | The job starts and waits for the lock (up to 10 minutes), then switches. **Fixed:** "a switch is already under way" was logged and nothing switched; the account stayed spent. |
+| Another relay job is running | Left to that job; it reopens the sessions the mod listed (they're meant for any account). |
+| Claude has already left that account (several sessions hit the limit; you switched by hand meanwhile) | Records the cooldown, does nothing else. **Fixed:** the "5 minutes" rule covered the first case only by time. It also wrongly ignored a real limit on an account you had switched back to by hand within 5 minutes. |
+| Several sessions hit the limit at the same moment | Each adds its entries to `handoff.json` under its lock. **Fixed:** they read and wrote the file unlocked and could lose each other's entries, so a session wasn't reopened. (Not in the e2e tests: the mod runs only inside Claude.) |
+| Usage figures unreadable | Picks without them, logs it. |
+| A new account's org isn't known yet | Per-account settings are copied by account id only. **Fixed:** keys got a literal `none` for the org, and Remote Control a `:<account>` key. |
+
+## By hand (`use`, `restart`, `signin`, `add`, `remove`)
+
+| When | Now |
+| --- | --- |
+| Another job or the keep-alive is running | Turned away with "a switch or sign-in is running". |
+| `remove` while a switch or sign-in runs | Turned away the same way. **Fixed:** `remove` took no lock and could move an account's parked sign-in out from under a switch to it. |
+| `use` to an account whose parked sign-in ran out | Refused before Claude closes, logged with what to run. **Fixed:** Claude was closed and opened twice for nothing. |
+| `use`/`restart`/`signin` while other sessions are mid-turn | Those sessions are listed as cut off, reopened afterwards, and told to carry on. **Fixed:** only the session given with `--resume` came back. The others were reopened idle (by the app), their turn lost. |
+| `signin` times out, or you sign in to an account other than the one asked for | The previous account comes back whole; what the app held goes to `backups/`. **Fixed:** a `Cookies-journal` from the signed-out profile could be left beside the previous account's `Cookies`. |
+| `signin`/`add` to an account that already has a parked sign-in | The new sign-in is parked; the old one goes to `backups/`. Before, it was overwritten. |
+| `use` to the account Claude is on | Logs "already on", changes nothing. |
+| Claude closed when the command runs | Works the same; nothing is reopened (nothing was cut off). |
+
+## Cut off half-way (the Mac shut down, the job was killed)
+
+| What was cut off | Now |
+| --- | --- |
+| A sign-in waiting for you | Puts the previous sign-in back: at once on SIGTERM, otherwise at the start of the next locked command. |
+| A keep-alive | Parks the sign-in again from the throwaway profile (to `backups/` if that account is gone or has one parked). |
+| A switch, between parking the old sign-in and the app loading the new one | `swap.inflight` says so. On SIGTERM it's put back at once; otherwise by the next locked command, and `doctor` reports it. If the app had come up on the new account, it's left there. **Fixed:** nothing noticed. The next switch parked the new account's `Cookies` as the old account's, overwriting the old account's only sign-in. |
+| Any of these, then Claude opened from the Dock | Still put right by the next command; `doctor` says so. |
+
+## The lock
+
+| When | Now |
+| --- | --- |
+| Held by a live run, however long | Kept. **Fixed:** after 15 minutes it was taken over, and a sign-in can run longer than that (10 minutes waiting for you, plus quitting Claude twice and letting an update install). |
+| Its owner was killed | Taken over. |
+| Its pid now belongs to a newer process | Taken over. (Before, only by the 15-minute rule.) |
+| Two runs find it left over at the same moment | One takes it over (`switch.lock.takeover`); the other is turned away. **Fixed:** both could remove it, the second removing the first's new lock, and both ran. (Not in the e2e tests: a race of milliseconds.) |
+
+## Files changed at the same moment
+
+| File | Now |
+| --- | --- |
+| `handoff.json` | Every change, by the relay or the mod, reads, changes and writes it under `handoff.json.lock`. **Fixed:** several sessions starting together after a switch could put back each other's consumed entries, and a session could then get "carry on" again after a later restart. |
+| `state.json` | Under its lock. **Fixed:** the usage check started after every turn could overwrite a cooldown a switch had just written. |
+| `usage.json` | Under its lock, in the relay and in the mod. |
+| Terminal login | Moves one at a time (`cli.lock`). **Fixed:** a terminal limit and an app switch could move it at once. |
+
+## Smaller ones
+
+- **Keep-alive:** checks again under the lock that the account is still parked (a switch between its check and the lock may have taken it into Claude), forgets the throwaway profile's last account before loading (so "did it load" means something), and reports a sign-in that has already run out instead of trying to renew it ("expires in -3 days").
+- **Status and plan** say when a parked sign-in has run out, instead of "parked, ready to switch to".
+- **Terminal follows the app** even when the live terminal login item is missing: there's nothing to save first. Before, the swap was refused.
+- **Reopening:** the relay reopens only the entries the mod will act on (written before the last close, within 15 minutes, for this account or any). Before, it sent links for every entry, including ones left from a switch that went back.
+- **The e2e test of an update installing during a switch** failed sometimes: its stand-in ShipIt slept a fixed 4 seconds. It now waits for Claude to quit, as the real one does.
+
+## Left as they are
+
+- Switching while Claude is signed out and nothing is parked for its account is refused (`check_app` can't tell that from the app's files having moved). Sign in in Claude first.
+- `add`/`signin` while Claude is signed out is refused the same way.
+- During `signin <name>`, signing in to a different account than `<name>` isn't taken; after 10 minutes the previous account comes back.
+- A limit switch that is turned away because another relay job is running records no cooldown. If that job brings Claude back on the spent account (a restart), the reopened session hits the limit again and starts the switch then.

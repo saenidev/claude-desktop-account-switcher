@@ -33,6 +33,11 @@ cookies() {
   sqlite3 "$1" "create table cookies(host_key text, name text, value text, expires_utc integer);
     insert into cookies values('.claude.ai', 'sessionKey', '$2', ($(date -u +%s) + 20*86400 + 11644473600) * 1000000);"
 }
+# A sign-in that looks good (a sessionKey that hasn't expired) but that claude.ai no longer
+# takes: the stand-in app, like the real one, then reports no account.
+dud_signin() { cookies "$1" ""; }
+# A sign-in whose cookie expired yesterday.
+expire_signin() { sqlite3 "$1" "update cookies set expires_utc = ($(date -u +%s) - 86400 + 11644473600) * 1000000"; }
 signed_in_as() { sqlite3 "file:$1?mode=ro&immutable=1" "select value from cookies where name='sessionKey'" 2>/dev/null; }
 app_pids() { pgrep -f "^$APPDIR/Contents/MacOS/Claude" ; }
 running() { [ -n "$(app_pids)" ]; }
@@ -181,10 +186,10 @@ check "doctor says what's wrong" sh -c "'$REPO/relay.sh' doctor | grep -q 'lastK
 mv "$T/c.saved" "$P/config.json"
 
 section "an update that moves the app's files installs while Claude is closed for a switch"
-# A stand-in ShipIt: still installing as the relay quits Claude, then the app is a new version
-# that keeps no lastKnownAccountUuid in config.json.
+# A stand-in ShipIt: like the real one, it waits for Claude to quit, takes a while to install,
+# and then the app is a new version that keeps no lastKnownAccountUuid in config.json.
 mkdir -p "$T/Squirrel.framework/Resources"
-printf '%s\n' "sleep 4" \
+printf '%s\n' "while pgrep -f '^$APPDIR/Contents/MacOS/Claude' >/dev/null; do sleep 0.2; done" "sleep 3" \
   "plutil -replace CFBundleShortVersionString -string 3.9999.0 '$APPDIR/Contents/Info.plist'" \
   "jq 'del(.lastKnownAccountUuid)' '$P/config.json' > '$T/c' && mv '$T/c' '$P/config.json'" > "$T/Squirrel.framework/Resources/ShipIt"
 /bin/bash "$T/Squirrel.framework/Resources/ShipIt" &
@@ -211,6 +216,89 @@ check "a terminal limit doesn't move to an account with no parked terminal login
 check "terminal claude stays on alice" test "$(cat "$H/keychain/Claude Code-credentials/$USER")" = token-for-alice
 jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
 
+# Back to alice after a section that switched away, for the sections after it.
+back_to_alice() {
+  wait_for "[ -z \"\$(job_pid)\" ]" 40; mark; relay use alice >/dev/null; wait_log "swap: .* -> alice" 40
+  wait_for "[ -z \"\$(job_pid)\" ]" 40; jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+}
+
+section "a limit switch skips an account whose parked sign-in has run out"
+cp "$D/park/$B/Cookies" "$T/bob.cookies"; expire_signin "$D/park/$B/Cookies"
+check "status says bob's sign-in ran out" sh -c "'$REPO/relay.sh' status | grep -q 'bob .*ran out'"
+check "plan goes past bob to carol" sh -c "'$REPO/relay.sh' plan --from $A | grep -q '^to: *carol'"
+mark; check "the mod's launch is queued" relay launch --from "$A"
+check "it switches to carol" wait_log "swap: alice -> carol" 40
+check "bob's sign-in was never tried" sh -c "! tail -n +$((MARK + 1)) '$D/relay.log' | grep -q 'bob.*did not come up'"
+wait_log "switch: done" 20
+check "use bob by hand is refused before Claude closes" sh -c "'$REPO/relay.sh' use bob >/dev/null; sleep 4; grep -q \"bob's parked sign-in has run out\" '$D/relay.log'"
+check "Claude stays on carol" test "$(signed_in_as "$P/Cookies")" = "$C"
+mv "$T/bob.cookies" "$D/park/$B/Cookies"
+back_to_alice
+
+section "a limit switch whose first pick doesn't come up tries the next account"
+cp "$D/park/$B/Cookies" "$T/bob.cookies"; dud_signin "$D/park/$B/Cookies"
+mark; check "the mod's launch is queued" relay launch --from "$A"
+check "bob is tried and doesn't come up" wait_log "bob's sign-in did not come up; going back to alice" 40
+check "then carol is tried" wait_log "swap: alice -> carol" 40
+check "bob's sign-in is parked as bob's again" test -f "$D/park/$B/Cookies"
+check "Claude is on carol" test "$(signed_in_as "$P/Cookies")" = "$C"
+wait_log "switch: done" 20
+mv "$T/bob.cookies" "$D/park/$B/Cookies"
+back_to_alice
+
+section "a limit switch waits for the keep-alive instead of being dropped"
+sleep 60 & holder=$!
+mkdir "$D/switch.lock"; echo "$holder" > "$D/switch.lock/pid"; echo keepalive > "$D/switch.lock/what"
+mark; check "the mod's launch is queued while the keep-alive holds the lock" relay launch --from "$A"
+check "it isn't turned away" sh -c "! tail -n +$((MARK + 1)) '$D/relay.log' | grep -q 'already under way'"
+sleep 3
+check "it hasn't switched while the lock is held" test "$(signed_in_as "$P/Cookies")" = "$A"
+rm -rf "$D/switch.lock"; kill "$holder" 2>/dev/null
+check "once the keep-alive lets go, it switches" wait_log "swap: alice -> bob" 40
+wait_log "switch: done" 20
+back_to_alice
+
+section "a limit trigger from an account Claude has already left"
+mark; check "switch --from bob while Claude is on alice" relay switch --from "$B"
+check "does nothing" wait_log "Claude is on alice now, not bob; nothing to do" 5
+check "Claude stays on alice" test "$(signed_in_as "$P/Cookies")" = "$A"
+jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+
+section "sessions mid-turn when Claude closes are reopened, on any switch"
+mkdir -p "$D/busy"
+jq -n --arg a "$A" --argjson at "$(date +%s)000" '{sessionId: "busy-1", cwd: "/tmp", account: $a, busy: true, at: $at}' > "$D/busy/busy-1.json"
+jq --arg c "$C" --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: "for-carol", cwd: "", reason: "swap", account: $c, at: $at}]' "$D/handoff.json" > "$T/h" && mv "$T/h" "$D/handoff.json"
+mark; check "use bob, with no --resume" relay use bob
+check "the switch finishes" wait_log "swap: alice -> bob" 40
+check "the mid-turn session is listed as cut off on alice" jq -e --arg a "$A" '.resume[] | select(.sessionId == "busy-1") | .reason == "closed" and .from == $a and .account == ""' "$D/handoff.json"
+check "and reopened" wait_for "grep -q 'session=busy-1' '$H/links.log'" 20
+check "an entry meant for another account isn't reopened" sh -c "! grep -q 'session=for-carol' '$H/links.log'"
+check "busy/ is cleared once Claude has quit" test -z "$(ls "$D/busy")"
+back_to_alice
+
+section "a switch cut off while it moves the sign-ins"
+cp "$D/park/$B/Cookies" "$T/bob.cookies"; dud_signin "$D/park/$B/Cookies"
+mark; check "use bob is queued" relay use bob
+check "Claude opens on bob's sign-in, which doesn't come up" wait_for "[ -f '$D/swap.inflight' ] && running && [ -f '$P/Cookies' ] && [ -z \"\$(signed_in_as '$P/Cookies')\" ]" 20
+check "stopping the job (launchd's SIGTERM)" kill -TERM "$(job_pid)"
+check "puts alice's sign-in back at once" wait_log "recover: a switch from alice to bob was cut off" 30
+check "Claude is on alice" test "$(signed_in_as "$P/Cookies")" = "$A"
+check "Claude is running" wait_for running 10
+check "bob's sign-in is parked as bob's" test -f "$D/park/$B/Cookies" -a ! -e "$D/swap.inflight"
+mv "$T/bob.cookies" "$D/park/$B/Cookies"
+wait_for "[ -z \"\$(job_pid)\" ]" 10
+# Killed outright, between parking alice's sign-in and the app loading bob's: Claude is closed
+# with bob's Cookies while the app still reports alice.
+pkill -f "^$APPDIR/Contents/MacOS/Claude"; wait_for "! running" 10
+mv "$P/Cookies" "$D/park/$A/Cookies"; mv "$D/park/$B/Cookies" "$P/Cookies"; echo "$A $B" > "$D/swap.inflight"
+check "doctor says a switch was cut off" sh -c "'$REPO/relay.sh' doctor | grep -q 'a switch was cut off'"
+mark; check "a restart is queued" relay restart
+check "it puts alice's sign-in back first" wait_log "recover: a switch from alice to bob was cut off" 30
+check "Claude is on alice" test "$(signed_in_as "$P/Cookies")" = "$A"
+check "bob's sign-in is parked as bob's, not alice's" test "$(signed_in_as "$D/park/$B/Cookies")" = "$B"
+check "Claude is running after the restart" wait_for "running && [ -z \"\$(job_pid)\" ]" 30
+check "doctor is happy" relay doctor
+
 section "signing in to a known account under a new name (one with quotes, & and <>)"
 DAVE="d'ave & <co> \"x\""
 mark; check "add $DAVE is queued" relay add "$DAVE"
@@ -231,7 +319,7 @@ check "no parked sign-in is left for her" test ! -e "$D/park/$C"
 
 section "a switch whose new sign-in doesn't come up goes back"
 cp "$D/park/$B/Cookies" "$T/bob.cookies"
-sqlite3 "$T/dud" "create table cookies(host_key text, name text, value text, expires_utc integer);" && mv "$T/dud" "$D/park/$B/Cookies"
+dud_signin "$D/park/$B/Cookies"
 mark; check "use bob is queued" relay use bob
 check "bob's sign-in doesn't come up, so it goes back" wait_log "did not come up; going back to alice" 40
 check "the switch fails" wait_log "ERROR switch to bob failed" 20
@@ -277,6 +365,13 @@ check "it skips alice" wait_log "keepalive: a switch or sign-in is running; skip
 check "without calling it not renewed" sh -c "! tail -n +$((MARK + 1)) '$D/relay.log' | grep -q 'not renewed'"
 check "or notifying" test "$(wc -l < "$H/notifications.log")" = "$notes"
 check "use is refused while the lock is held" sh -c "! '$REPO/relay.sh' use alice 2>/dev/null"
+check "remove is refused while the lock is held" sh -c "! '$REPO/relay.sh' remove alice 2>'$T/err' && grep -q 'a switch or sign-in is running' '$T/err'"
+check "alice is still set up" test "$(uuid_of alice)" = "$A"
+check "doctor counts a live owner's lock as held" sh -c "'$REPO/relay.sh' doctor | grep -q 'is running now (use, pid $$)'"
+# The lock's pid now belongs to a process started after the lock was made: a reused pid.
+sleep 30 & young=$!; echo "$young" > "$D/switch.lock/pid"; touch -t "$(date -v-1H +%Y%m%d%H%M)" "$D/switch.lock"
+check "doctor counts a lock whose pid was reused as left over" sh -c "'$REPO/relay.sh' doctor | grep -q 'a lock is left from a run that was cut off'"
+kill "$young" 2>/dev/null
 rm -rf "$D/switch.lock"
 
 section "moving from the old launchd label"

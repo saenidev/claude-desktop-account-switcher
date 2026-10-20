@@ -36,7 +36,7 @@ Finally, if you use `claude` in a terminal, give each account a parked terminal 
 
 ## Using it
 
-- **Automatic.** With auto-switch on, when a turn fails because a 5-hour, weekly or model limit (such as Fable weekly) is used up, Claude closes, comes back on the next account (about 15 to 30 seconds), and reopens the conversation that was cut off. That conversation gets one message telling it to carry on, so the work continues on its own. It only switches to an account that still has usage; if every account is out, you get a notification and nothing changes.
+- **Automatic.** With auto-switch on, when a turn fails because a 5-hour, weekly or model limit (such as Fable weekly) is used up, Claude closes, comes back on the next account (about 15 to 30 seconds), and reopens the conversation that was cut off. That conversation gets one message telling it to carry on, so the work continues on its own. It only switches to an account that still has usage and a parked sign-in that hasn't run out; if that account's sign-in doesn't come up, it goes back and tries the next one. If every account is out, you get a notification and nothing changes. Other sessions that were mid-turn when Claude closed are reopened and told to carry on too, for a switch by hand or a restart as well.
 - **`/account`** in any Code tab session shows or hides a row above the prompt:
 
   > **work** · 5-hour 2% · weekly 2% · [Switch to personal] out until Oct 23, 1am · [Auto-switch: on] · [Hide]
@@ -85,7 +85,7 @@ Day to day, everything is in the `/account` row. `~/.claude/desktop-account-swit
 | `cli-save`, `cli-use <name>` | Park the current terminal login; move terminal `claude` to an account's parked login. |
 | `run -- <claude args>` | Run `claude`, retrying once on the next account after a usage limit. |
 
-`add`, `signin`, `use` and `restart` close Claude, so they run as a launchd job and return at once; they work from inside Claude too. They take `--resume <sessionId>` to reopen a session afterwards. One runs at a time: while a switch, sign-in or restart (or the keep-alive) is running, another is turned away with "a switch or sign-in is running; try again when it's done". How it all works is in [docs/how-it-works.md](docs/how-it-works.md).
+`add`, `signin`, `use` and `restart` close Claude, so they run as a launchd job and return at once; they work from inside Claude too. They take `--resume <sessionId>` to reopen a session afterwards. One runs at a time: while a switch, sign-in or restart (or the keep-alive) is running, another (and `remove`) is turned away with "a switch or sign-in is running; try again when it's done". An automatic switch that comes while the keep-alive runs waits for it instead. How it all works is in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Rules that keep it safe
 
@@ -101,7 +101,7 @@ Day to day, everything is in the `/account` row. `~/.claude/desktop-account-swit
 - **A session says its folder is missing.** For a scratch session, recreate the folder at the exact path in the session's `cwd`; the conversation is in `~/.claude/projects/` and is unaffected. For a worktree, `git worktree add <path> -b claude/<name> main` brings the folder back (unpushed branch tips can't be recovered).
 - **An account sees an empty session list, or scratch sessions show up as projects.** `relay.sh restart` links the list and fixes the paths.
 - **Signed out of an account.** The row's Sign in button, or `relay.sh signin <name>`.
-- **Claude is signed out after a sign-in or keep-alive was cut off** (the Mac shut down, or the job was killed). The next `use`, `restart`, sign-in or switch puts the parked sign-in back first, and `relay.sh doctor` says if one is out of place; `relay.sh restart` fixes it straight away.
+- **Claude is signed out, or on the wrong account, after a sign-in, switch or keep-alive was cut off** (the Mac shut down, or the job was killed). The next `use`, `restart`, sign-in or switch puts the sign-ins back where they belong first, and `relay.sh doctor` says if one is out of place; `relay.sh restart` fixes it straight away.
 - **Undo a change.** Look in `~/.claude/desktop-account-switcher/backups/`; each change backs up what it touched first.
 
 ## Uninstall

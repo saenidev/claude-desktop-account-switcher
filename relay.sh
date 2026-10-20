@@ -48,11 +48,33 @@ pause() { if [ -n "${ACCOUNT_SWITCHER_FAST:-}" ]; then sleep 1; else sleep "$1";
 # private (claude_desktop_config.json is 0600 and can hold secrets), so temp files are made
 # under umask 077 and only then given the original's mode.
 replace_file() { local mode; mode=$(stat -f %Lp "$1" 2>/dev/null) && chmod "$mode" "$2"; mv "$2" "$1"; }
-# Write JSON atomically so a reader never sees half a file.
+# A folder lock (mkdir is atomic) around a read, change and write of one file, for changes that
+# can come at the same moment: the relay's own (a switch and the usage check started after
+# every turn both write state.json) and the mod's in every session (handoff.json, usage.json).
+# The mod takes the same lock (LOCK_SH there). One older than 10 seconds was left by a process
+# that was killed. After 10 seconds without it the change goes ahead anyway rather than not at all.
+LOCK_SH='i=0; until mkdir "$1" 2>/dev/null; do i=$((i+1)); [ $i -ge 100 ] && exit 1; [ $(( $(date +%s) - $(stat -f %m "$1" 2>/dev/null || date +%s) )) -gt 10 ] && rmdir "$1" 2>/dev/null; sleep 0.1; done'
+locked() {   # locked <lock folder> <command...>
+  local l="$1" got="" rc; shift
+  /bin/sh -c "$LOCK_SH" sh "$l" && got=1
+  "$@"; rc=$?
+  [ -n "$got" ] && rmdir "$l" 2>/dev/null
+  return $rc
+}
+# Write JSON atomically so a reader never sees half a file; the switcher's own files under the
+# lock <file>.lock (the app's files are changed only while it's closed).
 jq_write() {
+  case "$1" in "$DIR"/*) locked "$1.lock" jq_write_now "$@" ;; *) jq_write_now "$@" ;; esac
+}
+jq_write_now() {
   local file="$1"; shift; local tmp="$file.tmp.$$"
   if ( umask 077; jq "$@" "$file" > "$tmp" ); then replace_file "$file" "$tmp"; else rm -f "$tmp"; return 1; fi
 }
+
+# handoff.json is changed by the relay and by the mod in every session, often at once (several
+# sessions hit a limit together, several reopened sessions start together): always under its lock.
+handoff_write() { jq_write "$HANDOFF" "$@"; }
+handoff_read() { locked "$HANDOFF.lock" jq "$@" "$HANDOFF"; }
 
 account_field() { jq -r --arg u "$1" --arg f "$2" '.accounts[] | select(.accountUuid == $u) | .[$f] // empty' "$ACCOUNTS"; }
 account_by_name() { jq -r --arg n "$1" '.accounts[] | select(.name == $n) | .accountUuid // empty' "$ACCOUNTS"; }
@@ -85,27 +107,46 @@ signin_cookies() {
 # ---- One thing at a time -------------------------------------------------------------------
 #
 # One lock for everything that moves a sign-in: use, add and signin, restart, a limit switch,
-# and the keep-alive. It's a folder (mkdir is atomic) holding its owner's pid and command. A
-# lock whose owner is gone, or that is older than 15 minutes (a sign-in waits up to 10), was
-# left by a run that was killed, and is taken over.
-LOCK_STALE_MIN=15
+# remove, and the keep-alive. It's a folder (mkdir is atomic) holding its owner's pid and
+# command. A lock whose owner is gone was left by a run that was killed, and is taken over;
+# so is one whose pid now belongs to a process started after the lock was made (the pid was
+# reused, say after a restart of the Mac). A live owner keeps it however long it runs (a
+# sign-in waits up to 10 minutes, on top of quitting and opening Claude twice).
 HAVE_LOCK=""
+mtime() { stat -f %m "$1" 2>/dev/null; }
 lock_stale() {
-  local pid; pid=$(cat "$LOCK/pid" 2>/dev/null)
-  if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then return 0; fi
-  [ -n "$(find "$LOCK" -maxdepth 0 -mmin +$LOCK_STALE_MIN 2>/dev/null)" ]
+  local pid made started; made=$(mtime "$LOCK") || return 1
+  pid=$(cat "$LOCK/pid" 2>/dev/null)
+  # Made but no pid yet: its owner is between mkdir and writing it, or was killed there.
+  if [ -z "$pid" ]; then [ $(( $(date +%s) - made )) -gt 60 ]; return; fi
+  kill -0 "$pid" 2>/dev/null || return 0
+  started=$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ')
+  started=$(LC_ALL=C date -j -f '%a %b %d %T %Y' "$started" +%s 2>/dev/null) || return 1
+  [ "$started" -gt "$made" ]
 }
 lock_held() { [ -d "$LOCK" ] && ! lock_stale; }
 lock_owner() { echo "$(cat "$LOCK/what" 2>/dev/null || echo unknown), pid $(cat "$LOCK/pid" 2>/dev/null || echo unknown)"; }
 # lock_take <command>: returns 1 if something else holds the lock.
 lock_take() {
   if ! mkdir "$LOCK" 2>/dev/null; then
-    lock_stale || return 1
-    log "lock: taking over a lock left by a run that was cut off ($(lock_owner))"
-    rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || return 1
+    # Taking over a stale lock is itself one at a time: two runs that both found it stale
+    # would otherwise each remove it, the second removing the first's new one.
+    if ! mkdir "$LOCK.takeover" 2>/dev/null; then
+      [ $(( $(date +%s) - $(mtime "$LOCK.takeover" || date +%s) )) -gt 10 ] && rmdir "$LOCK.takeover" 2>/dev/null
+      return 1
+    fi
+    local took=""
+    if lock_stale; then
+      log "lock: taking over a lock left by a run that was cut off ($(lock_owner))"
+      rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null && took=1
+    fi
+    rmdir "$LOCK.takeover"
+    [ -n "$took" ] || return 1
   fi
   echo $$ > "$LOCK/pid"; echo "$1" > "$LOCK/what"; HAVE_LOCK=1
 }
+# Wait up to $2 seconds for the lock (the keep-alive holds it for a minute or so per account).
+lock_wait() { local n=0; until lock_take "$1"; do [ $n -ge "$2" ] && return 1; sleep 2; n=$((n+2)); done; }
 lock_release() { [ -n "$HAVE_LOCK" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"; HAVE_LOCK=""; }
 # The commands that close Claude never run over each other.
 lock_or_die() { lock_take "$1" || die "$1: a switch or sign-in is running; try again when it's done"; }
@@ -139,11 +180,21 @@ quit_pid() { kill -TERM "$1"; wait_gone "$1" 20 || kill -KILL "$1"; }
 quit_default() {
   local pids pid; pids=$(default_pids)
   [ -n "$pids" ] || return 0
-  # The mod honours a hand-off entry only if Claude was closed after it was written.
-  jq_write "$HANDOFF" --arg at "$(date -u +%FT%TZ)" '.closedAt = $at'
+  # The mod honours a hand-off entry only if Claude was closed after it was written. A session
+  # mid-turn now (busy/, under 6 hours old) is cut off by this quit, whatever it was for: it's
+  # listed to reopen on whichever account Claude comes back on, with the account it was on.
+  local busy f; busy=$(for f in "$DIR"/busy/*.json; do [ -f "$f" ] && jq -c . "$f" 2>/dev/null; done \
+    | jq -sc --argjson now "$(date +%s)000" '[.[] | select(.sessionId and .busy != false and ($now - (.at // 0)) < 21600000)]')
+  handoff_write --argjson b "${busy:-[]}" --arg at "$(date -u +%FT%TZ)" '
+    .closedAt = $at
+    | ([.resume[].sessionId]) as $have
+    | .resume += [$b[] | select(.sessionId as $s | $have | index($s) | not)
+        | {sessionId, cwd: (.cwd // ""), reason: "closed", account: "", from: (.account // ""), at: $at}]'
   local before; before=$(app_version)
   kill -TERM $pids 2>/dev/null
   for pid in $pids; do wait_gone "$pid" 30 || { kill -KILL "$pid"; wait_gone "$pid" 5; }; done
+  # No turn outlives Claude.
+  rm -f "$DIR"/busy/*.json
   let_update_install "$before"
 }
 
@@ -207,9 +258,13 @@ job_running() { launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -q 'sta
 # A one-shot job: no KeepAlive, so a failed run is never retried in a loop. There's one
 # label, and booting out a running job kills it, so a job is never started over one that's
 # running: returns 2 then, and the caller says so.
+# With RUN_JOB_OVER_LOCK set, only a running job stops it, not the lock (the limit switch waits
+# for a keep-alive to let go of it rather than being dropped).
+RUN_JOB_OVER_LOCK=""
 run_job() {
   local plist="$DIR/$LABEL.plist" uid a args="" env=""; uid=$(id -u)
-  job_running && return 2
+  if [ -n "$RUN_JOB_OVER_LOCK" ]; then launchctl print "gui/$uid/$LABEL" 2>/dev/null | grep -q 'state = running' && return 2
+  else job_running && return 2; fi
   for a in "$@"; do args+="    <string>$(xml "$a")</string>"$'\n'; done
   [ -n "${ACCOUNT_SWITCHER_APP:-}" ] && env+="<key>ACCOUNT_SWITCHER_APP</key><string>$(xml "$ACCOUNT_SWITCHER_APP")</string>"
   [ -n "${ACCOUNT_SWITCHER_FAST:-}" ] && env+="<key>ACCOUNT_SWITCHER_FAST</key><string>1</string>"
@@ -323,6 +378,9 @@ cmd_keepalive() {
       log "keepalive: $name has no parked sign-in"; notify "$name is signed out. Run relay.sh signin $name."; continue
     fi
     local exp left; exp=$(signin_expires_epoch "$id"); left=$(( (exp - now) / 86400 ))
+    if [ "$exp" -le "$now" ]; then
+      log "keepalive: $name's parked sign-in has run out"; notify "$name's sign-in has run out. Run relay.sh signin $name."; continue
+    fi
     if [ -z "$force" ] && [ "$left" -gt "$days" ]; then log "keepalive: $name good for $left more days"; continue; fi
     refresh_parked "$id"
     [ $? -eq 2 ] && continue   # a switch or sign-in was running: skipped, not a failed renewal
@@ -341,7 +399,13 @@ refresh_parked() {
   local id="$1" f
   if ! lock_take keepalive; then log "keepalive: a switch or sign-in is running; skipped $(account_field "$id" name)"; return 2; fi
   recover_signin
+  # A switch between the check and the lock may have taken this sign-in into Claude.
+  if [ ! -f "$PARK/$id/Cookies" ] || [ "$(folder_account "$DEFAULT_DIR")" = "$id" ]; then
+    log "keepalive: $(account_field "$id" name) isn't parked any more; skipped"; lock_release; return 2
+  fi
   mkdir -p "$KEEP"
+  # The profile remembers the last account it loaded; forget it, so loading this one shows.
+  [ -f "$KEEP/config.json" ] && jq_write "$KEEP/config.json" 'del(.lastKnownAccountUuid)'
   # Which account's sign-in is in the throwaway profile, so a run killed half-way can be put back.
   echo "$id" > "$KEEP/account"
   UNDO=put_back_keepalive
@@ -369,7 +433,7 @@ put_back_keepalive() {
   local id f pid b; id=$(cat "$KEEP/account" 2>/dev/null)
   pid=$(instance_pid "$KEEP"); [ -n "$pid" ] && quit_pid "$pid"
   if [ ! -e "$KEEP/Cookies" ] && [ ! -e "$KEEP/Cookies-journal" ]; then rm -f "$KEEP/account"; return 0; fi
-  if [ -n "$id" ] && [ ! -e "$PARK/$id/Cookies" ]; then
+  if [ -n "$(account_field "$id" name)" ] && [ ! -e "$PARK/$id/Cookies" ]; then
     mkdir -p "$PARK/$id"
     for f in Cookies Cookies-journal; do [ -e "$KEEP/$f" ] && mv -f "$KEEP/$f" "$PARK/$id/$f"; done
     log "recover: put $(account_field "$id" name)'s sign-in back from the keep-alive profile (a keep-alive was cut off)"
@@ -389,22 +453,49 @@ put_back_keepalive() {
 # keep-alive cut off the same way is put back first. Run under the lock, at the start of
 # every command that moves a sign-in. With --check, only says what it would put back.
 recover_signin() {
-  local check="${1:-}" id b f was="" who
+  local check="${1:-}" id was="" who
   if [ -e "$KEEP/Cookies" ]; then
     who=$(account_field "$(cat "$KEEP/account" 2>/dev/null)" name)
     if [ -n "$check" ]; then echo "the keep-alive profile still holds ${who:-an unknown account}'s sign-in from a keep-alive that was cut off"
     else put_back_keepalive; fi
   fi
+  if [ -f "$SWAPPING" ]; then
+    if [ -n "$check" ]; then echo "a switch was cut off while it moved the sign-ins ($(swap_names))"
+    else finish_swap; fi
+  fi
   id=$(folder_account "$DEFAULT_DIR")
   [ -n "$id" ] && [ -f "$PARK/$id/Cookies" ] && [ "$(signin_cookies "$DEFAULT_DIR/Cookies" live)" = 0 ] || return 0
   if [ -n "$check" ]; then echo "Claude is signed out and $(account_field "$id" name)'s sign-in is still parked, from a sign-in that was cut off"; return 0; fi
   [ -n "$(default_pids)" ] && { quit_default; was=1; }
-  if [ -e "$DEFAULT_DIR/Cookies" ] || [ -e "$DEFAULT_DIR/Cookies-journal" ]; then
-    b="$DIR/backups/$(date +%Y%m%d-%H%M%S)-signed-out-cookies"; mkdir -p "$b"
-    for f in Cookies Cookies-journal; do [ -e "$DEFAULT_DIR/$f" ] && mv -f "$DEFAULT_DIR/$f" "$b/$f"; done
-  fi
-  for f in Cookies Cookies-journal; do [ -e "$PARK/$id/$f" ] && mv -f "$PARK/$id/$f" "$DEFAULT_DIR/$f"; done
+  move_pair "$PARK/$id" "$DEFAULT_DIR" signed-out-cookies
   log "recover: put $(account_field "$id" name)'s sign-in back into Claude (left parked by a sign-in that was cut off)"
+  [ -n "$was" ] && open_app
+  return 0
+}
+
+# A switch writes swap.inflight ("<from> <to>") just before it moves the sign-ins, and removes
+# it once the new account is up or the old one is back. Found later, the switch was cut off
+# half-way (the Mac shut down, the job was killed): Claude's Cookies may be <to>'s while the
+# app still reports <from>, and moving them now would park <to>'s sign-in as <from>'s. If the
+# app came up on <to>, the switch had worked; otherwise put <from>'s sign-in back.
+SWAPPING="$DIR/swap.inflight"
+swap_names() { local f t; read -r f t < "$SWAPPING"; echo "$(account_field "$f" name) to $(account_field "$t" name)"; }
+# With "open" (the switch's own undo, as it's killed), Claude is opened again even if the
+# switch had closed it.
+finish_swap() {
+  local from to was="${1:-}"; read -r from to < "$SWAPPING"
+  if [ -n "$to" ] && [ "$(folder_account "$DEFAULT_DIR")" = "$to" ]; then
+    log "recover: the cut-off switch to $(account_field "$to" name) had worked"
+    rm -f "$SWAPPING"; swap_cli "$to"; return 0
+  fi
+  [ -n "$(default_pids)" ] && { quit_default; was=1; }
+  # How far the move got (park the current sign-in, then bring the new one in): Claude holds
+  # <to>'s sign-in only once nothing is left parked for <to>; <from>'s is still in Claude
+  # until it has been parked.
+  [ -n "$to" ] && [ ! -e "$PARK/$to/Cookies" ] && [ -e "$DEFAULT_DIR/Cookies" ] && move_pair "$DEFAULT_DIR" "$PARK/$to"
+  [ -n "$from" ] && [ -e "$PARK/$from/Cookies" ] && [ ! -e "$DEFAULT_DIR/Cookies" ] && move_pair "$PARK/$from" "$DEFAULT_DIR"
+  rm -f "$SWAPPING"
+  log "recover: a switch from $(account_field "$from" name) to $(account_field "$to" name) was cut off; put $(account_field "$from" name)'s sign-in back"
   [ -n "$was" ] && open_app
   return 0
 }
@@ -480,17 +571,22 @@ cli_restore() {    # make <uuid>'s parked login the live terminal login
 }
 # Move terminal claude to <uuid> if a parked login exists for it; otherwise leave it alone
 # and return 1, so a caller that says it moved is telling the truth.
-swap_cli() {
+# Terminal logins move one at a time (a switch moving it, and a terminal limit moving it too).
+swap_cli() { locked "$DIR/cli.lock" swap_cli_now "$@"; }
+swap_cli_now() {
   local target="$1" cur; cur=$(cli_account)
   [ "$cur" = "$target" ] && return 0
   if ! cli_parked "$target"; then log "terminal: no parked terminal login for $(account_field "$target" name); terminal stays on $(account_field "$cur" name)"; return 1; fi
-  if [ -n "$cur" ] && ! cli_park "$cur"; then log "terminal: couldn't save $(account_field "$cur" name)'s terminal login; not swapping"; return 1; fi
+  # With no live login there's nothing to save first (logged out, or the item was deleted).
+  if [ -n "$cur" ] && security find-generic-password -s "$CLI_SVC" -a "$USER" >/dev/null 2>&1 && ! cli_park "$cur"; then
+    log "terminal: couldn't save $(account_field "$cur" name)'s terminal login; not swapping"; return 1
+  fi
   cli_restore "$target" && log "terminal: $(account_field "$cur" name) -> $(account_field "$target" name)"
 }
 # Save the live terminal login as its account's parked copy (run once per account after `claude /login`).
 cmd_cli_save() {
   local cur; cur=$(cli_account); [ -n "$(account_field "$cur" name)" ] || die "terminal is logged in as ${cur:-nobody}, not an account in accounts.json"
-  cli_park "$cur" && log "terminal: saved $(account_field "$cur" name)'s terminal login" && echo "saved $(account_field "$cur" name)'s terminal login"
+  locked "$DIR/cli.lock" cli_park "$cur" && log "terminal: saved $(account_field "$cur" name)'s terminal login" && echo "saved $(account_field "$cur" name)'s terminal login"
 }
 cmd_cli_use() {
   local id; id=$(account_by_name "${1:-}"); [ -n "$id" ] || die "cli-use: no account named ${1:-}"
@@ -718,8 +814,21 @@ report_lost() {
 # Where an account's sign-in is: in Claude now, parked and ready, or nowhere (needs signin).
 signin_state() {
   if [ "$(folder_account "$DEFAULT_DIR")" = "$1" ]; then echo "in Claude now"
-  elif [ -f "$PARK/$1/Cookies" ]; then echo "parked, ready to switch to (sign-in good until $(signin_expires "$1") UTC)"
+  elif parked_live "$1"; then echo "parked, ready to switch to (sign-in good until $(signin_expires "$1") UTC)"
+  elif [ -f "$PARK/$1/Cookies" ]; then echo "parked sign-in ran out on $(signin_expires "$1") UTC (relay.sh signin $(account_field "$1" name))"
   else echo "not signed in (relay.sh signin $(account_field "$1" name))"; fi
+}
+
+# Whether account $1 has a parked sign-in that hasn't run out: the only kind a switch can use.
+parked_live() { [ "$(signin_cookies "$PARK/$1/Cookies" live)" -ge 1 ] 2>/dev/null; }
+# The accounts a switch can go to (one id a line): not the one in Claude, with a live parked
+# sign-in, and not among the ids in $1 (ones already tried).
+switch_ready() {
+  local id on; on=$(folder_account "$DEFAULT_DIR")
+  for id in $(account_ids); do
+    [ "$id" != "$on" ] && parked_live "$id" && ! printf '%s\n' "${1:-}" | grep -qxF "$id" && echo "$id"
+  done
+  return 0
 }
 
 cmd_status() {
@@ -740,9 +849,10 @@ cmd_status() {
 
 cmd_plan() {
   parse_args "$@"
-  local target; target=$(pick_target "$FROM" "$LIMIT")
+  local ready target=""; ready=$(switch_ready)
+  [ -n "$ready" ] && target=$(pick_target "$FROM" "$LIMIT" "$ready")
   echo "from:   $(account_field "$FROM" name) ($FROM): $(signin_state "$FROM")${LIMIT:+, out of $LIMIT}"
-  if [ -z "$target" ]; then echo "to:     nobody: every other account is cooling down or used up"; return; fi
+  if [ -z "$target" ]; then echo "to:     nobody: every other account is cooling down, used up or signed out"; return; fi
   echo "to:     $(account_field "$target" name) ($target): $(signin_state "$target")"
   echo "resume: $(jq -r '[.resume[].sessionId] | join(", ")' "$HANDOFF")"
 }
@@ -756,14 +866,24 @@ cmd_plan() {
 # app sees the new sign-in and mints that account's Code tokens itself. Each sign-in is
 # moved, never copied, so only one copy of it is ever in use.
 
-# Move the sign-in files: park the folder's current ones under $1, bring $2's in.
-move_signin() {
-  local out="$1" in="$2" f
-  mkdir -p "$PARK/$out"
-  for f in Cookies Cookies-journal; do [ -e "$DEFAULT_DIR/$f" ] && mv "$DEFAULT_DIR/$f" "$PARK/$out/$f"; done
-  for f in Cookies Cookies-journal; do [ -e "$PARK/$in/$f" ] && mv "$PARK/$in/$f" "$DEFAULT_DIR/$f"; done
+# Move a sign-in (Cookies and Cookies-journal, always together: a journal left beside another
+# account's Cookies would be rolled into it) from folder $1 to folder $2. Nothing is ever
+# overwritten: a sign-in already in $2 goes to backups/<time>-$3 first.
+move_pair() {
+  local from="$1" to="$2" f b
+  [ -e "$from/Cookies" ] || [ -e "$from/Cookies-journal" ] || return 0
+  mkdir -p "$to"
+  if [ -e "$to/Cookies" ] || [ -e "$to/Cookies-journal" ]; then
+    b="$DIR/backups/$(date +%Y%m%d-%H%M%S)-${3:-replaced-signin}"; mkdir -p "$b"
+    for f in Cookies Cookies-journal; do [ -e "$to/$f" ] && mv -f "$to/$f" "$b/$f"; done
+    log "signin: ${to#$DIR/} already held a sign-in; it's kept in ${b#$DIR/}"
+  fi
+  for f in Cookies Cookies-journal; do [ -e "$from/$f" ] && mv -f "$from/$f" "$to/$f"; done
   return 0
 }
+
+# Move the sign-in files: park the folder's current ones under $1, bring $2's in.
+move_signin() { move_pair "$DEFAULT_DIR" "$PARK/$1"; move_pair "$PARK/$2" "$DEFAULT_DIR"; }
 
 # Everything done while Claude is closed, whatever closed it.
 while_closed() {
@@ -774,14 +894,19 @@ while_closed() {
   link_sessions
 }
 
-# Switch the one Claude window to account $1 (a uuid). Returns non-zero, with the
-# previous account restored, if the new sign-in doesn't come up.
+# Switch the one Claude window to account $1 (a uuid). Returns 1 if it didn't close Claude
+# (nothing to switch to, or the app's files aren't where this expects), and 3, with the
+# previous account restored, if the new sign-in didn't come up.
 swap_to() {
   local target="$1" cur why; cur=$(folder_account "$DEFAULT_DIR")
   [ "$cur" = "$target" ] && { log "swap: already on $(account_field "$target" name)"; return 0; }
   [ -f "$PARK/$target/Cookies" ] || { log "swap: no parked sign-in for $(account_field "$target" name)"; return 1; }
+  parked_live "$target" || { log "swap: $(account_field "$target" name)'s parked sign-in has run out (relay.sh signin $(account_field "$target" name))"; return 1; }
   why=$(check_app) || { log "swap: not switching: $why (Claude Desktop $(app_version) may keep it elsewhere now)"; notify "Not switching: Claude's files changed ($why). Run relay.sh doctor."; return 1; }
   quit_checked || { log "swap: not switching to $(account_field "$target" name): Claude's files changed in an update"; return 1; }
+  # From here until the new account is up or the old one is back, a cut-off run is put right
+  # (finish_swap): as it's killed, or by the next command.
+  echo "$cur $target" > "$SWAPPING"; UNDO="finish_swap open"
   move_signin "$cur" "$target"
   while_closed
   mirror_prefs "$cur" "$target"
@@ -791,6 +916,7 @@ swap_to() {
   local n=0 max=45; [ -n "${ACCOUNT_SWITCHER_FAST:-}" ] && max=10
   while [ "$(folder_account "$DEFAULT_DIR")" != "$target" ] && [ $n -lt $max ]; do sleep 1; n=$((n+1)); done
   if [ "$(folder_account "$DEFAULT_DIR")" = "$target" ]; then
+    rm -f "$SWAPPING"; UNDO=""
     log "swap: $(account_field "$cur" name) -> $(account_field "$target" name)"
     swap_cli "$target"   # terminal claude follows, when a parked terminal login exists
     return 0
@@ -798,8 +924,9 @@ swap_to() {
   log "swap: $(account_field "$target" name)'s sign-in did not come up; going back to $(account_field "$cur" name)"
   quit_default
   move_signin "$target" "$cur"
+  rm -f "$SWAPPING"; UNDO=""
   open_app
-  return 1
+  return 3
 }
 
 # List a session to reopen, with why, before Claude closes: the app may bring the session
@@ -807,21 +934,35 @@ swap_to() {
 # $3 is the account Claude will be on when it reopens; the mod acts on an entry only in a
 # session on that account.
 hand_off() {
-  jq_write "$HANDOFF" --arg s "$1" --arg r "$2" --arg a "${3:-}" --arg at "$(date -u +%FT%TZ)" \
+  handoff_write --arg s "$1" --arg r "$2" --arg a "${3:-}" --arg at "$(date -u +%FT%TZ)" \
     '.resume = ([.resume[] | select(.sessionId != $s)] + [{sessionId: $s, cwd: "", reason: $r, account: $a, at: $at}])'
 }
-drop_hand_off() { jq_write "$HANDOFF" --arg s "$1" '.resume |= map(select(.sessionId != $s))'; }
-# The entries the mod wrote for a usage limit, when no switch happened after all.
+drop_hand_off() { handoff_write --arg s "$1" '.resume |= map(select(.sessionId != $s))'; }
+# When no switch happened after all: the entries the mod wrote for this usage limit (not yet
+# given an account, or given one of the accounts in $2 that the switch then failed to reach),
+# and the sessions this run cut off since $1 (an ISO time; reopened on the spent account
+# they'd only hit the limit again). Entries an earlier switch gave its account are its own.
 drop_limit_hand_offs() {
-  jq_write "$HANDOFF" '.resume |= map(select(.reason | test("^(limit hit|mid-turn)") | not))'
+  handoff_write --arg since "$1" --arg tried "${2:-}" '($tried | split("\n") | map(select(. != ""))) as $t
+    | .resume |= map(select(((.reason | test("^(limit hit|mid-turn)")) and (((.account // "") == "") or ((.account // "") as $a | $t | index($a))))
+        or (.reason == "closed" and .at >= $since) | not))'
   log "switch: dropped the hand-off entries for this limit"
 }
 
-# Reopen the handed-off sessions in the Claude window.
+# Reopen the handed-off sessions in the Claude window, after every command that closed Claude
+# (--resume or not: sessions cut off mid-turn are listed too). Only those the mod will act on:
+# written before Claude was last closed (within 15 minutes), and meant for the account it's
+# on now (or for any). Others are left from a switch that went back, or never happened.
 reopen_handoff() {
-  local ids id; ids=$(jq -r '.resume[].sessionId' "$HANDOFF")
+  local ids id; ids=$(handoff_read -r --arg on "$(folder_account "$DEFAULT_DIR")" --argjson now "$(date -u +%s)" '
+    def epoch: try (sub("\\.[0-9]+"; "") | sub("[+]00:00$"; "Z") | fromdateiso8601) catch 0;
+    ((.closedAt // "") | epoch) as $closed
+    | .resume[] | select(((.account // "") == "" or .account == $on) and $closed > 0
+        and $closed + 1 >= (.at | epoch) and $now - $closed < 900) | .sessionId')
+  # $1: seconds to let the app load first, when there's anything to reopen.
+  [ -n "$ids" ] && [ -n "${1:-}" ] && pause "$1"
   for id in $ids; do send_link "claude://resume?session=$id" && log "switch: reopened session $id"; sleep 3; done
-  echo "$ids" | grep -c .
+  printf '%s' "$ids" | grep -c .
 }
 
 cmd_resume() {
@@ -833,7 +974,7 @@ cmd_resume() {
 cmd_launch() {
   parse_args "$@"
   [ -n "$FROM" ] || die "launch needs --from"
-  run_job switch --from "$FROM" --resets-at "${RESETS_AT:-}" --limit "${LIMIT:-}"
+  RUN_JOB_OVER_LOCK=1 run_job switch --from "$FROM" --resets-at "${RESETS_AT:-}" --limit "${LIMIT:-}"
   case $? in
     0) log "launch: switch away from $FROM queued under launchd" ;;
     # Several sessions hit the limit together, or a switch was already going: the one
@@ -847,33 +988,57 @@ cmd_switch() {
   parse_args "$@"
   [ -n "$FROM" ] || die "switch needs --from"
 
-  # One switch at a time, however many sessions hit the limit together.
-  lock_take switch || { log "switch: a switch or sign-in holds the lock ($(lock_owner)); nothing to do"; exit 0; }
-  recover_signin
+  local since; since=$(date -u +%FT%TZ)
 
-  # A second trigger from the account we already left is a no-op.
-  local last; last=$(jq -r '.switches[-1] // empty | select(.from != null) | "\(.from) \(.at)"' "$STATE")
-  if [ -n "$last" ] && [ "${last%% *}" = "$FROM" ] && [ $(( $(date -u +%s) - ${last##* } )) -lt 300 ]; then
-    log "switch: already left $FROM in the last 5 minutes; nothing to do"; exit 0
-  fi
+  # One switch at a time, however many sessions hit the limit together. The job only starts
+  # when no other relay job runs, so whatever holds the lock is the keep-alive (a minute or
+  # so per account): wait for it rather than leave the account spent.
+  lock_wait switch 600 || { log "switch: the lock stayed held ($(lock_owner)); not switching"; drop_limit_hand_offs "$since"; exit 1; }
+  recover_signin
 
   local until="${RESETS_AT:-$(date -u -v+5H +%FT%TZ)}"
   jq_write "$STATE" --arg a "$FROM" --arg u "$until" '.cooldowns[$a] = $u'
   log "switch: $(account_field "$FROM" name) is out${LIMIT:+ ($LIMIT)}; cooling down until $until"
 
+  # A trigger that arrives after Claude has left that account (several sessions hit the limit
+  # together, or it was switched by hand meanwhile) has nothing to switch away from. Its
+  # entries are left as they are: the switch that left reopens what it closed.
+  local on; on=$(folder_account "$DEFAULT_DIR")
+  if [ -n "$on" ] && [ "$on" != "$FROM" ]; then
+    log "switch: Claude is on $(account_field "$on" name) now, not $(account_field "$FROM" name); nothing to do"; exit 0
+  fi
+
   cmd_usage --force --quiet   # pick by the other accounts' figures as of now, where a login allows
-  local target; target=$(pick_target "$FROM" "$LIMIT")
+  # Each account that's ready (a live parked sign-in, not cooling down, no window used up), in
+  # order, until one comes up. One that doesn't is left out and the next is tried.
+  local tried="" target ready rc stamp="" said=""
+  while :; do
+    ready=$(switch_ready "$tried"); target=""
+    [ -n "$ready" ] && target=$(pick_target "$FROM" "$LIMIT" "$ready")
+    [ -n "$target" ] || break
+    # The mod's entries for this limit come back on the account switched to.
+    handoff_write --arg t "$target" --arg was "$stamp" '.resume |= map(if (.reason | test("^(limit hit|mid-turn)")) and ((.account // "") == "" or ($was != "" and .account == $was)) then . + {account: $t} else . end)'
+    stamp="$target"
+    swap_to "$target"; rc=$?
+    [ $rc -eq 0 ] && break
+    tried+="$target"$'\n'
+    if [ $rc -ne 3 ]; then
+      drop_limit_hand_offs "$since" "$tried"
+      die "could not switch to $(account_field "$target" name); stayed on $(account_field "$FROM" name)"
+    fi
+    log "switch: trying the next account"; said=1
+  done
   if [ -z "$target" ]; then
-    notify "$(account_field "$FROM" name) is out of usage, and every other account is too."
-    drop_limit_hand_offs
+    drop_limit_hand_offs "$since" "$tried"
+    if [ -n "$said" ]; then
+      notify "$(account_field "$FROM" name) is out of usage, and no other account's sign-in came up. Run relay.sh doctor."
+      die "switch: no other account's sign-in came up; stayed on $(account_field "$FROM" name)"
+    fi
+    notify "$(account_field "$FROM" name) is out of usage, and every other account is too (or signed out)."
     die "switch: no account to switch to"
   fi
-  # The mod's entries for this limit come back on the account switched to.
-  jq_write "$HANDOFF" --arg t "$target" '.resume |= map(if (.reason | test("^(limit hit|mid-turn)")) and ((.account // "") == "") then . + {account: $t} else . end)'
-  swap_to "$target" || { drop_limit_hand_offs; die "could not switch to $(account_field "$target" name); stayed on $(account_field "$FROM" name)"; }
   jq_write "$STATE" --arg f "$FROM" --arg t "$target" --argjson at "$(date -u +%s)" '.switches += [{from: $f, to: $t, at: $at}] | .switches |= .[-20:]'
-  pause 12   # let the app load before handing it links
-  local n; n=$(reopen_handoff)
+  local n; n=$(reopen_handoff 12)   # after letting the app load
   notify "Switched to $(account_field "$target" name). Reopened $n session(s)."
   report_lost
   log "switch: done"
@@ -891,10 +1056,7 @@ cmd_swap() {
     [ -n "$session" ] && drop_hand_off "$session"
     die "switch to ${1} failed; stayed put"
   fi
-  if [ -n "$session" ]; then
-    pause 12
-    reopen_handoff >/dev/null
-  fi
+  reopen_handoff 12 >/dev/null
   report_lost 5
 }
 
@@ -906,10 +1068,13 @@ mirror_prefs() {
   fo=$(account_field "$from" orgUuid); to_org=$(account_field "$to" orgUuid)
   [ -f "$PREFS" ] || return 0
   cp -p "$PREFS" "$DIR/backups/claude_desktop_config.before-mirror.json"
-  jq_write "$PREFS" --arg f "$from" --arg t "$to" --arg fo "${fo:-none}" --arg to "${to_org:-none}" '
+  [ -n "$from" ] && [ -n "$to" ] || return 0
+  # An org not known yet (an account just added) is left as it is in the key, never replaced
+  # by a placeholder.
+  jq_write "$PREFS" --arg f "$from" --arg t "$to" --arg fo "$fo" --arg to "$to_org" '
     walk(if type == "object" then
       . + (to_entries | map(select(.key | contains($f)))
-           | map({key: (.key | gsub($f; $t) | gsub($fo; $to)), value}) | from_entries)
+           | map({key: (.key | gsub($f; $t) | if $fo != "" and $to != "" then gsub($fo; $to) else . end), value}) | from_entries)
     else . end)' && log "prefs: $(account_field "$from" name)'s per-account settings copied to $(account_field "$to" name)"
 }
 
@@ -919,6 +1084,8 @@ mirror_prefs() {
 mirror_rc() {
   local f="$DEFAULT_DIR/remote-control-state.json" fk tk serve
   [ -f "$f" ] || return 0
+  # Both keys need the org; one not known yet is left alone.
+  [ -n "$(account_field "$1" orgUuid)" ] && [ -n "$(account_field "$2" orgUuid)" ] || return 0
   fk="$(account_field "$1" orgUuid):$1"; tk="$(account_field "$2" orgUuid):$2"
   serve=$(jq -r --arg k "$fk" '.identities[$k].serve // empty' "$f")
   [ -n "$serve" ] || return 0
@@ -973,10 +1140,7 @@ cmd_restart() {
   fi
   while_closed
   open_app
-  if [ -n "$session" ]; then
-    pause 15
-    reopen_handoff >/dev/null
-  fi
+  reopen_handoff 15 >/dev/null
   report_lost 5
 }
 
@@ -1111,15 +1275,14 @@ cmd_signin() {
     move_signin "$new" "$cur"
     while_closed
   else
-    local f; for f in Cookies Cookies-journal; do [ -e "$PARK/$cur/$f" ] && mv -f "$PARK/$cur/$f" "$DEFAULT_DIR/$f"; done
+    # Whatever the app was left holding (signed out, or another account than the one asked
+    # for) goes to backups/; the previous account's sign-in comes back whole.
+    move_pair "$PARK/$cur" "$DEFAULT_DIR" unused-signin
   fi
   UNDO=""
   open_app
   log "signin: back on $(account_field "$cur" name)"
-  if [ -n "$session" ]; then
-    pause 15
-    reopen_handoff >/dev/null
-  fi
+  reopen_handoff 15 >/dev/null
   report_lost 5
 }
 
@@ -1127,16 +1290,14 @@ cmd_signin() {
 # Claude, park whatever got signed in under its account (or in backups/ if it isn't one in
 # accounts.json, or one is parked there already), put $1's sign-in back, and open Claude.
 signin_undo() {
-  local cur="$1" now f b; quit_default
+  local cur="$1" now; quit_default
   now=$(folder_account "$DEFAULT_DIR")
   if [ -e "$DEFAULT_DIR/Cookies" ] && [ "$now" != "$cur" ]; then
-    if [ -n "$(account_field "$now" name)" ] && [ ! -e "$PARK/$now/Cookies" ]; then b="$PARK/$now"
-    else b="$DIR/backups/$(date +%Y%m%d-%H%M%S)-cut-off-signin"; fi
-    mkdir -p "$b"; for f in Cookies Cookies-journal; do [ -e "$DEFAULT_DIR/$f" ] && mv -f "$DEFAULT_DIR/$f" "$b/$f"; done
+    if [ -n "$(account_field "$now" name)" ] && [ ! -e "$PARK/$now/Cookies" ]; then move_pair "$DEFAULT_DIR" "$PARK/$now"
+    else move_pair "$DEFAULT_DIR" "$DIR/backups/$(date +%Y%m%d-%H%M%S)-cut-off-signin"; fi
   fi
-  if [ -e "$PARK/$cur/Cookies" ]; then
-    for f in Cookies Cookies-journal; do [ -e "$PARK/$cur/$f" ] && mv -f "$PARK/$cur/$f" "$DEFAULT_DIR/$f"; done
-  fi
+  # Anything else left in the profile (a signed-out Cookies) goes to backups/ as it comes back.
+  [ -e "$PARK/$cur/Cookies" ] && move_pair "$PARK/$cur" "$DEFAULT_DIR" signed-out-cookies
   log "signin: cut off; put $(account_field "$cur" name)'s sign-in back"
   open_app
 }
@@ -1149,6 +1310,9 @@ cmd_add() { ADDING=1 cmd_signin "$@"; }
 # delete it), its parked terminal login is deleted, and it's dropped from accounts.json.
 cmd_remove() {
   local name="${1:-}" id; id=$(account_by_name "$name"); [ -n "$id" ] || die "remove: no account named $name"
+  # Not while a switch, sign-in or keep-alive may be moving this account's sign-in.
+  lock_or_die remove
+  recover_signin
   [ "$id" = "$(folder_account "$DEFAULT_DIR")" ] && die "remove: Claude is on $name now; switch to another account first (relay.sh use <name>)"
   local b; b="$DIR/backups/$(date +%Y%m%d-%H%M%S)-removed-$name"; mkdir -p "$b"
   jq --arg u "$id" '.accounts[] | select(.accountUuid == $u)' "$ACCOUNTS" > "$b/account.json"
