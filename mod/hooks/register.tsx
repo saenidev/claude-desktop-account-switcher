@@ -12,7 +12,9 @@ import type { Step } from '../types'
 // switching on or off; the row also shows by itself while usage is above 95%.
 //
 // Nothing here reads a token: the account comes from the app's own
-// CLAUDE_CODE_ACCOUNT_UUID, the usage from the session's rate-limit windows.
+// CLAUDE_CODE_ACCOUNT_UUID, the usage from the session's rate-limit windows and from
+// usage.json, which relay.sh usage fills from Anthropic (with windows the session doesn't
+// report, like a model's own weekly limit).
 
 type Host = EngineInterface
 type Account = { name: string; accountUuid: string }
@@ -72,7 +74,7 @@ async function markBusy($: Host, sessionId: string, cwd: string, busy: boolean) 
 const isoZ = (t: string) => new Date(t).toISOString().replace(/\.\d+Z$/, 'Z')
 
 /** The hand-off and the relay, run when the limit hits. */
-async function relay($: Host, sessionId: string, cwd: string, reason: string, resetsAt: string | undefined) {
+async function relay($: Host, sessionId: string, cwd: string, reason: string, resetsAt: string | undefined, limit?: string) {
   const p = await paths($)
   const account = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
   if (account === '') return 'no account id in this session; nothing to do'
@@ -96,7 +98,7 @@ async function relay($: Host, sessionId: string, cwd: string, reason: string, re
   for (const r of handoff.resume) if (!resume.has(r.sessionId)) resume.set(r.sessionId, r)
   await $.fs.write(p.handoff, JSON.stringify({ ...handoff, resume: [...resume.values()] }, null, 2))
 
-  const argv = ['/bin/bash', p.relay, 'launch', '--from', account, ...(resetsAt ? ['--resets-at', isoZ(resetsAt)] : [])]
+  const argv = ['/bin/bash', p.relay, 'launch', '--from', account, ...(resetsAt ? ['--resets-at', isoZ(resetsAt)] : []), ...(limit ? ['--limit', limit] : [])]
   const ran = await $.process.run(argv, { timeoutMs: 15_000 })
   await log($, `launched relay away from ${account} (${reason}), exit ${ran.exitCode}`)
   if (ran.exitCode === 0) return `switching away from this account; ${resume.size} session(s) will reopen`
@@ -179,14 +181,25 @@ export const register: Register = on => {
       return r
     }
     const { rateLimits } = await $.session.usage()
-    const full = rateLimits.filter(w => w.kind !== 'spend_limit' && w.percentUsed >= NEAR_FULL)
+    const full: Window[] = rateLimits.filter(w => w.kind !== 'spend_limit' && w.percentUsed >= NEAR_FULL)
+    // A model's own weekly limit (Fable) isn't among the session's windows: ask Anthropic now.
+    let limit: string | undefined
+    if (full.length === 0) {
+      const p = await paths($)
+      await $.process.run(['/bin/bash', p.relay, 'usage', '--force', '--quiet'], { timeoutMs: 30_000 }).catch(() => undefined)
+      const account = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
+      const mine = (await readJson<Record<string, Snapshot>>($, `${p.dir}/usage.json`, {}))[account]
+      const scoped = (mine?.windows ?? []).filter(w => w.label && w.percentUsed >= NEAR_FULL && !(w.resetsAt && Date.parse(w.resetsAt) <= Date.now()))
+      full.push(...scoped)
+      limit = scoped[0]?.label
+    }
     const saysLimit = /usage limit|weekly limit|5-hour limit|limit reached|out of (extra )?usage/i.test(e.error_details ?? '')
     if (full.length === 0 && !saysLimit) {
       await log($, `rate_limit in ${e.session_id} but no window near full (${rateLimits.map(w => `${w.kind} ${w.percentUsed}%`).join(', ') || 'no reading'}); not switching`)
       return r
     }
     const resetsAt = full.map(w => w.resetsAt).filter((t): t is string => !!t).sort().at(-1)
-    const said = await relay($, e.session_id, e.cwd, `limit hit: ${full.map(w => `${w.kind} ${w.percentUsed}%`).join(', ') || 'limit message'}; login ${identity?.kind ?? 'unknown'}`, resetsAt)
+    const said = await relay($, e.session_id, e.cwd, `limit hit: ${full.map(w => `${name(w)} ${w.percentUsed}%`).join(', ') || 'limit message'}; login ${identity?.kind ?? 'unknown'}`, resetsAt, limit)
     $.ui.toast(`Account switcher: ${said}`, { timeoutMs: 10_000 })
     return r
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
@@ -209,16 +222,20 @@ function when(iso: string) {
 }
 
 const WINDOW: Record<string, string> = { five_hour: '5-hour', seven_day: 'weekly' }
+// A window from the session (five_hour, seven_day) or from Anthropic via relay.sh usage, where a
+// model's own weekly limit comes as kind weekly_scoped with a label ("Fable weekly").
+type Window = { kind: string; label?: string; percentUsed: number; resetsAt?: string }
+const name = (w: Window) => WINDOW[w.kind] ?? w.label ?? w.kind
 
 async function usage($: Host) {
   const { rateLimits } = await $.session.usage().catch(() => ({ rateLimits: [] }))
   return rateLimits.filter(w => w.kind in WINDOW)
 }
 
-// Each account's last usage reading, saved while it's the one in use (after caam's
-// `limits --cached`): the parked account's figures are as old as its last session, so
-// they're shown with their age, and a window past its reset time counts as reset.
-type Snapshot = { at: number; windows: { kind: string; percentUsed: number; resetsAt?: string }[] }
+// Each account's last usage reading: saved here while it's the one in use (after caam's
+// `limits --cached`), and read from Anthropic by relay.sh usage. The parked account's figures
+// are shown with their age, and a window past its reset time counts as reset.
+type Snapshot = { at: number; source?: string; windows: Window[] }
 
 async function saveSnapshot($: Host) {
   const identity = await $.session.identity().catch(() => undefined)
@@ -228,9 +245,14 @@ async function saveSnapshot($: Host) {
   if (account === '' || windows.length === 0) return
   const p = await paths($)
   const all = await readJson<Record<string, Snapshot>>($, `${p.dir}/usage.json`, {})
-  all[account] = { at: Date.now(), windows: windows.map(w => ({ kind: w.kind, percentUsed: w.percentUsed, resetsAt: w.resetsAt })) }
+  // Keep the windows only Anthropic reports (a model's own weekly limit) from the last read.
+  const others = (all[account]?.windows ?? []).filter(w => !(w.kind in WINDOW))
+  all[account] = { at: Date.now(), source: 'session', windows: [...windows.map(w => ({ kind: w.kind, percentUsed: w.percentUsed, resetsAt: w.resetsAt })), ...others] }
   await $.fs.write(`${p.dir}/usage.json`, JSON.stringify(all, null, 2) + '\n')
 }
+
+// The windows only Anthropic reports for an account, from usage.json.
+const scopedOf = (s: Snapshot | undefined) => (s?.windows ?? []).filter(w => !(w.kind in WINDOW))
 
 function ago(ms: number) {
   const m = Math.round(ms / 60000)
@@ -240,9 +262,7 @@ function ago(ms: number) {
 // "weekly 100% (resets Oct 23, 1am) · as of 3h ago", or "weekly reset since" once past it.
 function lastKnown(s: Snapshot | undefined, now: number) {
   if (s === undefined) return 'no usage reading yet'
-  const parts = s.windows
-    .filter(w => w.kind in WINDOW)
-    .map(w => (w.resetsAt && Date.parse(w.resetsAt) <= now ? `${WINDOW[w.kind]} reset since` : `${WINDOW[w.kind]} ${Math.round(w.percentUsed)}%`))
+  const parts = s.windows.map(w => (w.resetsAt && Date.parse(w.resetsAt) <= now ? `${name(w)} reset since` : `${name(w)} ${Math.round(w.percentUsed)}%`))
   return `${parts.join(' · ')} · as of ${ago(now - s.at)}`
 }
 
@@ -280,7 +300,12 @@ function registerRow(on: Parameters<Register>[0]) {
   // Usage moves with every turn.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
-    if (await isDesktop($)) await saveSnapshot($).catch(() => undefined)
+    if (await isDesktop($)) {
+      await saveSnapshot($).catch(() => undefined)
+      // Every account's figures from Anthropic; relay.sh asks at most every 10 minutes. Detached.
+      const p = await paths($)
+      await $.process.run(['/bin/sh', '-c', 'nohup /bin/bash "$1" usage --quiet >/dev/null 2>&1 &', 'sh', p.relay]).catch(() => undefined)
+    }
     await update($, redraw, n => n + 1)
     return r
   })
@@ -288,20 +313,21 @@ function registerRow(on: Parameters<Register>[0]) {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || !(await isDesktop($))) return next(e)
     await read($, redraw)
-    const windows = await usage($)
-    const near = windows.filter(w => w.percentUsed > NEAR_FULL)
     const p = await paths($)
     const accounts = (await readJson<{ accounts: Account[] }>($, `${p.dir}/accounts.json`, { accounts: [] })).accounts
     if (accounts.length < 2) return next(e)
     const current = (await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')) ?? ''
     const now = Date.now()
+    const snapshots = await readJson<Record<string, Snapshot>>($, `${p.dir}/usage.json`, {})
+    const live = (w: Window) => !(w.resetsAt && Date.parse(w.resetsAt) <= now)
+    const windows: Window[] = [...(await usage($)), ...scopedOf(snapshots[current]).filter(live)]
+    const near = windows.filter(w => w.percentUsed > NEAR_FULL)
     const expiry = new Map<string, number | null>()
     for (const a of accounts.filter(a => a.accountUuid !== current)) expiry.set(a.accountUuid, await signinExpiry($, p.dir, a.accountUuid))
     const expiringSoon = [...expiry.values()].some(t => t === null || t - now < SHOW_DAYS * DAY)
     if (!((await read($, shown)) ?? (near.length > 0 || expiringSoon))) return next(e)
     const cooldowns = (await readJson<{ cooldowns?: Record<string, string> }>($, `${p.dir}/state.json`, {})).cooldowns ?? {}
     const armed = (await readJson<{ armed?: boolean }>($, p.config, {})).armed === true
-    const snapshots = await readJson<Record<string, Snapshot>>($, `${p.dir}/usage.json`, {})
     const me = accounts.find(a => a.accountUuid === current)
     const outUntil = (a: Account) => {
       const t = cooldowns[a.accountUuid]
@@ -345,7 +371,7 @@ function registerRow(on: Parameters<Register>[0]) {
       )
     }
 
-    const used = windows.map(w => `${WINDOW[w.kind]} ${Math.round(w.percentUsed)}%`).join(' · ')
+    const used = windows.map(w => `${name(w)} ${Math.round(w.percentUsed)}%`).join(' · ')
     return (
       <Box gap={1}>
         <Text weight="semibold">{me?.name ?? 'Unknown account'}</Text>

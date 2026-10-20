@@ -4,8 +4,9 @@
 #
 # The app's account is its claude.ai sign-in, the Cookies file in its one profile
 # folder. Accounts not in use have theirs parked in $DIR/park/<accountUuid>/; a switch
-# closes Claude, moves the sign-ins, and opens it again. Never reads, copies or prints
-# a token. See README.md.
+# closes Claude, moves the sign-ins, and opens it again. Sign-ins are moved, never read; the
+# one token used is a terminal login's, sent to Anthropic for usage (`relay.sh usage`), never
+# printed or logged. See README.md.
 #
 #   relay.sh launch --from <accountUuid> [--resets-at <iso>]   start an out-of-usage switch under launchd (returns at once)
 #   relay.sh switch --from <accountUuid> [--resets-at <iso>]   do it (what launchd runs)
@@ -14,6 +15,7 @@
 #   relay.sh swap-later <name> [--resume <sessionId>]          switch to <name> by hand, under launchd (the /account button)
 #   relay.sh signin-later <name> [--resume <sessionId>]        open Claude signed out to sign <name> in (a new name adds the account), then come back
 #   relay.sh restart-later [--resume <sessionId>]              restart Claude on the same account, fixing settings and scratch paths
+#   relay.sh usage [--force]                                   read every account's usage from Anthropic (every 10 min at most)
 #   relay.sh doctor | history [<n>] | keepalive [<days>] [--force] | install-keepalive
 #   relay.sh resume                                            reopen held sessions
 #
@@ -52,8 +54,10 @@ app_for_dir() {
   local a; a=$(jq -r --arg d "$1" --arg h "$HOME" '.accounts[] | select((.userDataDir | sub("^~"; $h)) == $d) | .app // empty' "$ACCOUNTS")
   expand "${a:-$APP}"
 }
+USAGE="$DIR/usage.json"
 [ -f "$STATE" ] || echo '{"cooldowns":{},"switches":[]}' > "$STATE"
 [ -f "$HANDOFF" ] || echo '{"resume":[]}' > "$HANDOFF"
+[ -f "$USAGE" ] || echo '{}' > "$USAGE"
 
 # Write JSON atomically so a reader never sees half a file.
 jq_write() { local file="$1"; shift; local tmp="$file.tmp.$$"; jq "$@" "$file" > "$tmp" && mv "$tmp" "$file"; }
@@ -75,15 +79,24 @@ instance_pid() {
   done < <(ps -axo pid=,args=)
 }
 
-# The first other account whose cooldown has passed, in accounts.json order after $1.
+# The first other account whose cooldown has passed and whose last usage reading has no
+# window used up, in accounts.json order after $1. A used-up window that hasn't reset yet is
+# still used up however old the reading is: usage only goes down at a reset. Windows counted:
+# 5-hour and weekly, and the model's own weekly limit named in $2 (say "Fable weekly") when
+# that is what ran out.
 pick_target() {
-  local from="$1" now; now=$(date -u +%s)
-  jq -r --arg from "$from" --argjson now "$now" --slurpfile st "$STATE" '
+  local from="$1" label="${2:-}" now; now=$(date -u +%s)
+  jq -r --arg from "$from" --arg label "$label" --argjson now "$now" --slurpfile st "$STATE" --slurpfile u "$USAGE" '
+    def epoch: sub("\\.[0-9]+";"") | fromdateiso8601;
+    def spent($a): [($u[0][$a].windows // [])[]
+      | select(.kind == "five_hour" or .kind == "seven_day" or ($label != "" and .label == $label))
+      | select(.percentUsed >= 100 and ((.resetsAt // "") != "") and ((.resetsAt | epoch) > $now))] | length > 0;
     (.accounts | map(.accountUuid)) as $ids
     | ($ids | index($from) // -1) as $i
     | [range(1; ($ids | length))] | map($ids[($i + .) % ($ids | length)])
     | map(select(. != $from))
-    | map(select((($st[0].cooldowns[.] // "1970-01-01T00:00:00Z") | sub("\\.[0-9]+";"") | fromdateiso8601) <= $now))
+    | map(select((($st[0].cooldowns[.] // "1970-01-01T00:00:00Z") | epoch) <= $now))
+    | map(select(spent(.) | not))
     | .[0] // empty' "$ACCOUNTS"
 }
 
@@ -123,11 +136,12 @@ wait_up() { local dir="$1" n=0; while [ -z "$(instance_pid "$dir")" ] && [ $n -l
 folder_account() { jq -r '.lastKnownAccountUuid // empty' "$1/config.json" 2>/dev/null; }
 
 parse_args() {
-  FROM=""; RESETS_AT=""
+  FROM=""; RESETS_AT=""; LIMIT=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --from) FROM="$2"; shift 2 ;;
       --resets-at) RESETS_AT="$2"; shift 2 ;;
+      --limit) LIMIT="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -320,6 +334,15 @@ cmd_doctor() {
     cli_parked "$id" && ok "$(account_field "$id" name) has a parked terminal login" \
       || fail "$(account_field "$id" name) has no parked terminal login: relay.sh cli-save, claude /login as $(account_field "$id" name), relay.sh cli-save, then relay.sh cli-use $(account_field "$tcur" name)"
   done
+  local lost; lost=$(check_sessions)
+  [ -z "$lost" ] && ok "no sessions lost from the shared list since the last check" \
+    || fail "$(echo "$lost" | grep -c .) session(s) gone from the shared list with no deletion marker: $(echo $lost) (copies may be in $DIR/backups)"
+  if update_waiting || shipit_running; then ok "Claude $(app_version "$APP"); an update is downloaded and installs at the next quit"
+  else ok "Claude $(app_version "$APP"), no update waiting"; fi
+  cmd_usage --quiet
+  for id in $(jq -r '.accounts[].accountUuid // empty' "$ACCOUNTS"); do
+    ok "$(account_field "$id" name) usage: $(usage_line "$id") ($(usage_reach "$id"))"
+  done
   launchctl print "gui/$(id -u)/$LABEL.keepalive" >/dev/null 2>&1 && ok "daily keep-alive installed" || fail "daily keep-alive not installed (relay.sh install-keepalive)"
   [ -d "$LOCK" ] && fail "a switch lock is held ($LOCK); remove it if no switch is running" || ok "no switch running"
   echo "auto-switch: $(jq -r 'if .armed then "on" else "off" end' "$DIR/config.json" 2>/dev/null || echo off)"
@@ -331,16 +354,91 @@ cmd_history() {
   grep -E 'swap: [a-z]+ -> |switch: .* is out|signin: |keepalive: .*(renewed|not renewed)|launched relay away|not switching' "$LOG" | tail -n "${1:-20}"
 }
 
-# An account's last usage reading, which the mod saves while that account is in use
-# (after caam's `limits --cached`). A window past its reset time counts as reset.
+# An account's last usage reading: from Anthropic (relay.sh usage), or saved by the mod while
+# that account is in use (after caam's `limits --cached`). A window past its reset time counts
+# as reset.
 usage_line() {
   jq -r --arg a "$1" --argjson now "$(date -u +%s)" '
     .[$a] // empty
-    | (.windows | map(select(.kind == "five_hour" or .kind == "seven_day")
-        | (if .kind == "five_hour" then "5-hour" else "weekly" end) as $k
+    | (.windows | map(
+        (if .kind == "five_hour" then "5-hour" elif .kind == "seven_day" then "weekly" else (.label // .kind) end) as $k
         | if (.resetsAt // "") != "" and ((.resetsAt | sub("\\.[0-9]+"; "") | fromdateiso8601) <= $now)
           then "\($k) reset since" else "\($k) \(.percentUsed | round)%" end) | join(" · "))
-      + " · as of \((($now - (.at / 1000)) / 60) | floor)m ago"' "$DIR/usage.json" 2>/dev/null | grep . || echo "no reading yet"
+      + " · as of \((($now - (.at / 1000)) / 60) | floor)m ago"' "$USAGE" 2>/dev/null | grep . || echo "no reading yet"
+}
+
+# ---- Usage from Anthropic -------------------------------------------------------------
+#
+# Each account's usage windows from api.anthropic.com/api/oauth/usage, read with that account's
+# terminal login: the live one for the account terminal claude is on, the parked Keychain copy
+# for the others (after Claude Graft's usage monitor). It has windows the app's sessions don't
+# report, like a model's own weekly limit ("Fable weekly"). A login whose access token has
+# expired is skipped, never renewed: renewing rotates the refresh token, and the parked copy is
+# the only one. Its account keeps its last figures. The token goes to curl on stdin (-K -):
+# never on a command line, in a log or on screen.
+USAGE_EVERY=600     # seconds between checks, unless --force
+USAGE_LOCK="$DIR/usage.lock"
+
+# The terminal login of account $1 (JSON on stdout), live or parked.
+cli_login() {
+  if [ "$(cli_account)" = "$1" ]; then security find-generic-password -s "$CLI_SVC" -a "$USER" -w 2>/dev/null
+  else security find-generic-password -s "$CLI_PARK_SVC" -a "$1" -w 2>/dev/null; fi
+}
+
+# Account $1's windows as usage.json holds them, on stdout. Returns 1 when it has no usable
+# login, 2 when Anthropic is rate-limiting usage checks, 3 on any other failure.
+fetch_usage() {
+  local login out code
+  login=$(cli_login "$1"); [ -n "$login" ] || return 1
+  [ "$(printf '%s' "$login" | jq -r '(.claudeAiOauth.expiresAt // 0) / 1000 | floor')" -gt "$(( $(date +%s) + 60 ))" ] || { login=""; return 1; }
+  out=$(printf '%s' "$login" | jq -r '"header = \"Authorization: Bearer \(.claudeAiOauth.accessToken)\""' \
+    | curl -sS -m 15 -K - -H 'anthropic-beta: oauth-2025-04-20' -H 'Accept: application/json' -w '\n%{http_code}' https://api.anthropic.com/api/oauth/usage 2>/dev/null)
+  login=""
+  code=${out##*$'\n'}; out=${out%$'\n'*}
+  [ "$code" = 429 ] && return 2
+  [ "$code" = 200 ] || return 3
+  printf '%s' "$out" | jq -c '
+    def z: sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z");
+    [ (.five_hour // empty | {kind: "five_hour", percentUsed: .utilization, resetsAt: (.resets_at // "" | z)}),
+      (.seven_day // empty | {kind: "seven_day", percentUsed: .utilization, resetsAt: (.resets_at // "" | z)}),
+      (.limits[]? | select(.kind == "weekly_scoped")
+        | {kind: "weekly_scoped", label: "\(.scope.model.display_name // "scoped") weekly", percentUsed: .percent, resetsAt: (.resets_at // "" | z)}) ]' || return 3
+}
+
+# Whether account $1's usage can be read from Anthropic now, and if not, why.
+usage_reach() {
+  local exp; exp=$(cli_login "$1" | jq -r '(.claudeAiOauth.expiresAt // 0) / 1000 | floor' 2>/dev/null)
+  if [ -z "$exp" ]; then echo "not read live: no terminal login (relay.sh cli-save)"
+  elif [ "$exp" -le "$(date +%s)" ]; then echo "not read live: its parked terminal login's token expired $(( ($(date +%s) - exp) / 3600 ))h ago"
+  else echo "read live from Anthropic"; fi
+}
+
+# relay.sh usage [--force]: read every account's usage from Anthropic into usage.json (at most
+# every 10 minutes unless --force; after a 429, not before the wait is over), then print it.
+cmd_usage() {
+  local force="" quiet="" a
+  for a in "$@"; do case "$a" in --force) force=1 ;; --quiet) quiet=1 ;; esac; done
+  local now last until; now=$(date -u +%s)
+  last=$(jq -r '.usageCheckedAt // 0' "$STATE"); until=$(jq -r '.usageWaitUntil // 0' "$STATE")
+  # A check takes 30 seconds at most; a lock older than 2 minutes is left from one that was killed.
+  [ -n "$(find "$USAGE_LOCK" -maxdepth 0 -mmin +2 2>/dev/null)" ] && rmdir "$USAGE_LOCK"
+  if [ "$now" -lt "$until" ]; then :
+  elif { [ -n "$force" ] || [ $((now - last)) -ge $USAGE_EVERY ]; } && mkdir "$USAGE_LOCK" 2>/dev/null; then
+    local id windows rc
+    for id in $(jq -r '.accounts[].accountUuid // empty' "$ACCOUNTS"); do
+      windows=$(fetch_usage "$id"); rc=$?
+      case $rc in
+        0) jq_write "$USAGE" --arg a "$id" --argjson w "$windows" --argjson at "$(date +%s)000" '.[$a] = {at: $at, source: "anthropic", windows: $w}' ;;
+        2) jq_write "$STATE" --argjson t $((now + 900)) '.usageWaitUntil = $t'
+           log "usage: Anthropic is rate-limiting usage checks; next try in 15 minutes"; break ;;
+        3) log "usage: couldn't read $(account_field "$id" name)'s usage from Anthropic" ;;
+      esac
+    done
+    jq_write "$STATE" --argjson t "$now" '.usageCheckedAt = $t'
+    rmdir "$USAGE_LOCK"
+  fi
+  [ -n "$quiet" ] && return 0
+  for id in $(jq -r '.accounts[].accountUuid // empty' "$ACCOUNTS"); do echo "$(account_field "$id" name): $(usage_line "$id") ($(usage_reach "$id"))"; done
 }
 
 # Where an account's sign-in is: in Claude now, parked and ready, or nowhere (needs signin).
@@ -351,8 +449,10 @@ signin_state() {
 }
 
 cmd_status() {
+  cmd_usage --quiet
   local pid; pid=$(default_pids | head -1)
-  if [ -n "$pid" ]; then echo "Claude: running (pid $pid)"; else echo "Claude: not running"; fi
+  if [ -n "$pid" ]; then echo "Claude: $(app_version "$APP"), running (pid $pid)"; else echo "Claude: $(app_version "$APP"), not running"; fi
+  if update_waiting || shipit_running; then echo "update: downloaded; installs the next time Claude quits (a switch or restart lets it finish first)"; fi
   echo "auto-switch: $(jq -r 'if .armed then "on" else "off" end' "$DIR/config.json" 2>/dev/null || echo off)"
   echo "terminal claude: on $(account_field "$(cli_account)" name)"
   echo "accounts:"
@@ -366,9 +466,9 @@ cmd_status() {
 
 cmd_plan() {
   parse_args "$@"
-  local target; target=$(pick_target "$FROM")
-  echo "from:   $(account_field "$FROM" name) ($FROM): $(signin_state "$FROM")"
-  if [ -z "$target" ]; then echo "to:     nobody: every other account is cooling down"; return; fi
+  local target; target=$(pick_target "$FROM" "$LIMIT")
+  echo "from:   $(account_field "$FROM" name) ($FROM): $(signin_state "$FROM")${LIMIT:+, out of $LIMIT}"
+  if [ -z "$target" ]; then echo "to:     nobody: every other account is cooling down or used up"; return; fi
   echo "to:     $(account_field "$target" name) ($target): $(signin_state "$target")"
   echo "resume: $(jq -r '[.resume[].sessionId] | join(", ")' "$HANDOFF")"
 }
@@ -399,7 +499,7 @@ EOF
 cmd_launch() {
   parse_args "$@"
   [ -n "$FROM" ] || die "launch needs --from"
-  run_job switch --from "$FROM" --resets-at "${RESETS_AT:-}" && log "launch: switch away from $FROM queued under launchd"
+  run_job switch --from "$FROM" --resets-at "${RESETS_AT:-}" --limit "${LIMIT:-}" && log "launch: switch away from $FROM queued under launchd"
 }
 
 account_by_name() { jq -r --arg n "$1" '.accounts[] | select(.name == $n) | .accountUuid // empty' "$ACCOUNTS"; }
@@ -588,8 +688,34 @@ quit_default() {
   [ -n "$pids" ] || return 0
   # The mod honours a hand-off entry only if Claude was closed after it was written.
   jq_write "$HANDOFF" --arg at "$(date -u +%FT%TZ)" '.closedAt = $at'
+  local before; before=$(app_version "$APP")
   kill -TERM $pids 2>/dev/null
   for pid in $pids; do wait_gone "$pid" 30 || { kill -KILL "$pid"; wait_gone "$pid" 5; }; done
+  let_update_install "$before"
+}
+
+# Claude downloads its updates by itself, and ShipIt (Squirrel) installs one when Claude quits.
+# The relay quits Claude, so that's when a downloaded update lands. Opening Claude again while
+# ShipIt is still waiting keeps the old version running until some later quit, when the update
+# replaces the app underneath it (seen on 2026-10-20: a relay restart at 20:25, the install at
+# 20:31). So after quitting, wait for ShipIt to finish, and open the new version.
+SHIPIT_STATE="$HOME/Library/Caches/com.anthropic.claudefordesktop.ShipIt/ShipItState.plist"
+shipit_running() { pgrep -f 'Squirrel.framework/Resources/ShipIt' >/dev/null; }
+# A downloaded update waiting to be installed: ShipIt's state names an update bundle that's there.
+update_waiting() {
+  local b; b=$(jq -r '.updateBundleURL // empty' "$SHIPIT_STATE" 2>/dev/null | sed 's#^file://##; s#%20# #g')
+  [ -n "$b" ] && [ -d "$b" ]
+}
+let_update_install() {
+  local before="$1" n=0
+  shipit_running || update_waiting || return 0
+  log "update: Claude $before closed with an update waiting; letting it install before reopening"
+  sleep 2
+  while shipit_running && [ $n -lt 180 ]; do sleep 2; n=$((n+2)); done
+  local after; after=$(app_version "$APP")
+  if [ "$after" != "$before" ]; then log "update: Claude $before -> $after installed while closed"; notify "Claude updated to $after."
+  elif shipit_running; then log "update: ShipIt still running after 3 minutes; opening Claude $before anyway"
+  else log "update: nothing installed; Claude stays at $before"; fi
 }
 
 # Move the sign-in files: park the folder's current ones under $1, bring $2's in.
@@ -669,9 +795,10 @@ cmd_switch() {
 
   local until="${RESETS_AT:-$(date -u -v+5H +%FT%TZ)}"
   jq_write "$STATE" --arg a "$FROM" --arg u "$until" '.cooldowns[$a] = $u'
-  log "switch: $(account_field "$FROM" name) is out; cooling down until $until"
+  log "switch: $(account_field "$FROM" name) is out${LIMIT:+ ($LIMIT)}; cooling down until $until"
 
-  local target; target=$(pick_target "$FROM")
+  cmd_usage --force --quiet   # pick by the other accounts' figures as of now, where a login allows
+  local target; target=$(pick_target "$FROM" "$LIMIT")
   if [ -z "$target" ]; then
     notify "$(account_field "$FROM" name) is out of usage, and every other account is too."
     drop_limit_hand_offs
@@ -682,6 +809,7 @@ cmd_switch() {
   sleep 12   # let the app load before handing it links
   local n; n=$(reopen_handoff)
   notify "Switched to $(account_field "$target" name). Reopened $n session(s)."
+  report_lost
   log "switch: done"
 }
 
@@ -699,6 +827,7 @@ cmd_swap() {
     sleep 12
     reopen_handoff >/dev/null
   fi
+  report_lost 5
 }
 cmd_swap_later() { [ -n "$(account_by_name "${1:-}")" ] || die "swap-later: no account named ${1:-}"; run_job swap "$@" && log "swap: $1 queued under launchd"; }
 
@@ -821,6 +950,34 @@ link_sessions() {
   done
 }
 
+# Sessions that go missing (after Claude Graft's record sweep). Deleting a session in the app
+# removes its local_<id>.json and leaves a deleted_<id> marker; a session file gone with no
+# marker was lost, by a folder moved out from under the app or its launch sweep (as happened
+# once with the second profile's links). seen-sessions.json lists every session seen; each
+# check reports the ones lost since, logs them, and forgets them, so each is reported once.
+# Copies may be in backups/ (each shared-list change takes one).
+SEEN="$DIR/seen-sessions.json"
+shared_list() { local l; for l in "$DEFAULT_DIR/$1"/*/*; do [ -L "$l" ] && { readlink "$l"; return; }; done; }
+check_sessions() {
+  local kind canon ids lost all_lost=""
+  [ -f "$SEEN" ] || echo '{}' > "$SEEN"
+  for kind in claude-code-sessions local-agent-mode-sessions; do
+    canon=$(shared_list "$kind"); [ -n "$canon" ] && [ -d "$canon" ] || continue
+    ids=$(find "$canon" -maxdepth 1 -name 'local_*.json' | sed 's#.*/local_##; s#\.json$##' | sort)
+    lost=$(jq -r --arg k "$kind" '.[$k][]?' "$SEEN" | sort | comm -23 - <(printf '%s\n' "$ids") \
+      | while read -r id; do [ -n "$id" ] && [ ! -e "$canon/deleted_$id" ] && echo "$id"; done)
+    [ -n "$lost" ] && { log "sessions: $kind lost $(echo "$lost" | grep -c .) session(s) with no deletion marker: $(echo $lost)"; all_lost+="$lost"$'\n'; }
+    jq_write "$SEEN" --arg k "$kind" --arg ids "$ids" '.[$k] = ($ids | split("\n") | map(select(. != "")))'
+  done
+  printf '%s' "$all_lost"
+}
+# Check after Claude has opened and swept its folders.
+report_lost() {
+  local lost; sleep "${1:-0}"; lost=$(check_sessions)
+  [ -n "$lost" ] && notify "$(echo "$lost" | grep -c .) session(s) went missing from Claude's list. See relay.sh doctor."
+  return 0
+}
+
 fix_scratch_paths() {
   local files f n=0
   files=$(grep -rlE 'Application Support/Claude-[^/"]+/scratch-workspaces/' "$DEFAULT_DIR/claude-code-sessions/" "$DEFAULT_DIR/local-agent-mode-sessions/" 2>/dev/null)
@@ -849,6 +1006,7 @@ cmd_restart() {
     sleep 15
     reopen_handoff >/dev/null
   fi
+  report_lost 5
 }
 
 # Sign an account in by hand without losing the current one:
@@ -895,6 +1053,7 @@ cmd_signin() {
     sleep 15
     reopen_handoff >/dev/null
   fi
+  report_lost 5
 }
 
 case "${1:-}" in
@@ -922,5 +1081,6 @@ case "${1:-}" in
   run) shift; cmd_run "$@" ;;
   cli-use) shift; id=$(account_by_name "${1:-}"); [ -n "$id" ] || die "cli-use: no account named ${1:-}"; swap_cli "$id" && echo "terminal claude is on $(account_field "$(cli_account)" name)" ;;
   history) shift; cmd_history "$@" ;;
+  usage) shift; cmd_usage "$@" ;;
   *) echo "usage: relay.sh launch|switch|plan --from <accountUuid> [--resets-at <iso>] | status | relaunch[-later] <name> [--resume <id>] | resume" >&2; exit 2 ;;
 esac

@@ -6,7 +6,7 @@ macOS only. Built against Claude Desktop 3.1623 / Claude Code 2.1.30x.
 
 ## Using it
 
-- **Automatic.** With auto-switch on, when a turn fails because a 5-hour or weekly limit is used up, Claude closes, comes back on the next account (about 15 to 30 seconds), and reopens the conversation that was cut off. That conversation gets one message telling it to carry on, so the work continues on its own. It only switches to an account that still has usage; if every account is out, you get a notification and nothing changes.
+- **Automatic.** With auto-switch on, when a turn fails because a 5-hour, weekly or model limit (Fable weekly) is used up, Claude closes, comes back on the next account (about 15 to 30 seconds), and reopens the conversation that was cut off. That conversation gets one message telling it to carry on, so the work continues on its own. It only switches to an account that still has usage; if every account is out, you get a notification and nothing changes.
 - **`/account`** in any Code tab session shows or hides a row above the prompt:
 
   > **saenidev** · 5-hour 2% · weekly 2% · [Switch to second] out until Oct 23, 1am · [Auto-switch: on] · [Hide]
@@ -14,7 +14,7 @@ macOS only. Built against Claude Desktop 3.1623 / Claude Code 2.1.30x.
   - **Switch to …** asks first, then does the same switch as the automatic one.
   - **Auto-switch** turns automatic switching on or off.
   - The row also shows by itself when usage is above 95%, or when the parked account's sign-in has 3 days or less left.
-- **The other account's usage.** The row and `relay.sh status` show the parked account's last-known usage with its age ("weekly 100% · as of 3h ago"); a window past its reset time shows as reset. The mod saves each account's figures while it's the one in use, so the parked account's are as old as its last session (after caam's `limits --cached`).
+- **Usage, live where it can be.** Every 10 minutes at most (after a turn, or `relay.sh usage`), the relay asks Anthropic (`api/oauth/usage`) for each account's usage with that account's terminal login: the live one, or its parked copy (after Claude Graft's usage monitor). That reading has windows the app's sessions don't report, such as the model's own weekly limit ("Fable weekly 0%"), which the row and `relay.sh status` show next to 5-hour and weekly. A parked login's access token lasts some hours; once it has expired the relay doesn't renew it (renewing rotates the refresh token, and the parked copy is the only one), so that account shows its last-known usage with its age ("weekly 100% · as of 3h ago"), saved by the mod while it was the one in use (after caam's `limits --cached`). A window past its reset time shows as reset. If Anthropic rate-limits these checks, the relay waits 15 minutes and the last figures stay. `relay.sh doctor` says which accounts are read live.
 - **Keeping the parked sign-in alive.** A claude.ai sign-in was seen to last 28 days from signing in. Every day at 04:30 a launchd job (`relay.sh keepalive`, installed with `relay.sh install-keepalive`) opens Claude in the background on a throwaway profile folder holding only the parked sign-in, lets claude.ai load, quits it and parks the sign-in again; your own window is never touched. It counts as renewed only if the expiry date moved (after caam's `keepalive`). Whether claude.ai extends a sign-in this way isn't known yet: on a sign-in a few hours old it didn't. If it can't be renewed, you get a notification 3 days before it expires, and the row warns from 7 days out and shows itself from 3; sign it in again with `relay.sh signin-later <name>`. Only cookie expiry dates are read, never values.
 - **Terminal `claude` follows the app.** Its login is the Keychain item `Claude Code-credentials`. Each account not in use has its terminal login parked in its own Keychain item (`desktop-account-switcher-cli`, one per account), never in a file. When the app switches, the terminal switches too, if a parked terminal login exists for the new account; the outgoing login is saved first, so the parked copy is always the newest (refresh tokens rotate, and putting back an old copy can revoke the login). Values go Keychain to Keychain on stdin; they're never printed, logged or put on a command line.
 - **A limit in a terminal session moves only the terminal.** A terminal `claude`, or a nested one run from a Code tab session, signs in with the terminal login. The mod tells a nested one apart by `CLAUDECODE`/`CLAUDE_CODE_CHILD_SESSION`, which Claude Code sets for the processes it starts and the app doesn't set on its sessions, so a `claude -p` from a session's shell is never counted as a Code tab session. When it hits a limit (and auto-switch is on), the mod cools that account down and moves only the terminal login (`relay.sh cli-switch`); the app is left alone.
@@ -36,22 +36,23 @@ macOS only. Built against Claude Desktop 3.1623 / Claude Code 2.1.30x.
 
 ## How it works
 
-- **The app's account is its claude.ai sign-in**, the `Cookies` file in its one profile folder (`~/Library/Application Support/Claude`). The account not in use has its sign-in parked in `~/.claude/desktop-account-switcher/park/<accountUuid>/`. A switch closes Claude, moves the two sign-ins, and opens Claude again; the app then makes its own Code tab token for that account. No token is ever read, copied or printed. The research behind this is in [docs/how-the-desktop-app-signs-in.md](docs/how-the-desktop-app-signs-in.md).
+- **The app's account is its claude.ai sign-in**, the `Cookies` file in its one profile folder (`~/Library/Application Support/Claude`). The account not in use has its sign-in parked in `~/.claude/desktop-account-switcher/park/<accountUuid>/`. A switch closes Claude, moves the two sign-ins, and opens Claude again; the app then makes its own Code tab token for that account. The sign-ins are moved, never read. The one token the relay uses is a terminal login's access token, to ask Anthropic for that account's usage: it goes to `curl` on stdin, never on a command line, in a log or on screen. The research behind this is in [docs/how-the-desktop-app-signs-in.md](docs/how-the-desktop-app-signs-in.md).
 - **One session list.** The app keeps sessions under `claude-code-sessions/<account>/<org>/` (and `local-agent-mode-sessions/…` for Cowork). Every account/org pair is a link to one shared folder, so every account sees the same sessions. Session files hold no account fields. When the app makes a real folder for an account in `accounts.json` (a new account's first sign-in), the next sign-in, switch or restart moves its sessions into the shared folder, keeps the emptied folder as `<org>.merged-<time>`, and links it.
 - **Per-account settings follow you.** A few app preferences are stored per account (keys holding the account or org id in `claude_desktop_config.json`). While Claude is closed for a switch, the relay copies the outgoing account's onto the incoming one.
 - **Scratch paths are kept inside the app's folder.** The app files a session under Scratch only if its folder is inside its own `scratch-workspaces`, and on launch it deletes scratch folders no session names by exact path. While Claude is closed, the relay points any session still using an old profile folder's path back inside it.
 - **The mod** (`mod/`, installed as `desktop-account-switcher@desktop-account-switcher-local`) runs in every Code tab session in the desktop app:
   - It records which sessions are mid-turn.
-  - When a turn fails with `rate_limit` while a usage window is at 95% or more (or the error says a limit was reached) and auto-switch is on, it writes a hand-off listing the sessions to reopen and starts the relay. If the relay doesn't switch after all (it can't start, no other account has usage, or the new sign-in doesn't come up), those entries are dropped.
+  - When a turn fails with `rate_limit` while a usage window is at 95% or more (or the error says a limit was reached) and auto-switch is on (with no 5-hour or weekly window that full, it asks Anthropic first whether the model's own weekly limit is; the switch then cools the account down until that limit resets), it writes a hand-off listing the sessions to reopen and starts the relay. If the relay doesn't switch after all (it can't start, no other account has usage, or the new sign-in doesn't come up), those entries are dropped.
   - In a session the relay reopened, it sends one message saying why (a usage limit, a switch by hand, a restart, a sign-in) and to carry on. It acts only when the session starts by being reopened (not on a compact or clear), only if the relay closed Claude after the entry was written (`closedAt`, stamped as it quits Claude), and only within 15 minutes; older entries are dropped.
   - It draws the `/account` row.
 - **The relay** (`relay.sh`) runs as a one-shot launchd job, so it survives Claude quitting:
   1. Takes a lock, so only one switch runs at a time; a second trigger within 5 minutes is ignored.
   2. Puts the spent account on cooldown until its reset time (from the usage window).
-  3. Picks the next account that isn't cooling down and has a parked sign-in.
-  4. Quits Claude, moves the sign-ins, copies per-account settings across, fixes scratch paths, and opens Claude.
+  3. Reads every account's usage from Anthropic where a login allows, and picks the next account that isn't cooling down, has a parked sign-in, and has no window used up (5-hour or weekly, or the model limit that ran out) that hasn't reset since its last reading.
+  4. Quits Claude. If Claude has downloaded an update, it installs as Claude quits; the relay waits (up to 3 minutes) for it to finish, so Claude opens on the new version instead of being replaced underneath later. Then it moves the sign-ins, copies per-account settings across, fixes scratch paths, and opens Claude.
   5. Waits up to 45 seconds for the new account to come up; if it doesn't, puts the previous sign-in back.
   6. Reopens each handed-off session with `claude://resume?session=<id>`.
+  7. Checks the shared session list for sessions that went missing (below).
 
 ## Files
 
@@ -70,7 +71,9 @@ Live state, never in git, in `~/.claude/desktop-account-switcher/`:
 | --- | --- |
 | `accounts.json` | Each account's `name`, `email`, `accountUuid`, `orgUuid`. |
 | `config.json` | `{ "armed": true }` turns automatic switching on (the row's toggle writes it). |
-| `state.json` | Cooldowns (`accountUuid` → reset time) and the last switches. |
+| `state.json` | Cooldowns (`accountUuid` → reset time), the last switches, and when usage was last read from Anthropic. |
+| `usage.json` | Each account's last usage reading (`source`: `anthropic` or `session`) and when it was taken. |
+| `seen-sessions.json` | The session ids in the shared list at the last check, to tell when one goes missing. |
 | `park/<accountUuid>/` | The parked sign-in (`Cookies`, `Cookies-journal`) of each account not in use. |
 | `handoff.json` | Sessions waiting to be reopened, and when the relay last closed Claude (`closedAt`). |
 | `busy/` | Which sessions are mid-turn. |
@@ -89,7 +92,8 @@ Everything day to day is in the `/account` row. The relay commands, for when you
 | `relay.sh signin-later <name> [--resume <sessionId>]` | Sign `<name>` in, again after a sign-out or for the first time: parks the current sign-in, opens Claude signed out for you to sign in, then parks the new sign-in and brings the current account back. A name not in `accounts.json` adds whichever other account you sign in to. Gives up after 10 minutes. |
 | `relay.sh restart-later [--resume <sessionId>]` | Restart Claude on the same account, applying `prefs-patch.json` if present and fixing scratch paths. |
 | `relay.sh resume` | Reopen sessions still waiting in the hand-off. |
-| `relay.sh doctor` | Check the whole setup: links, mod installed, accounts, parked sign-ins and days left, one Claude window, shared session list, keep-alive job, no stuck lock. |
+| `relay.sh usage [--force]` | Every account's usage from Anthropic (asks at most every 10 minutes unless `--force`), and whether each is read live. |
+| `relay.sh doctor` | Check the whole setup: links, mod installed, accounts, parked sign-ins and days left, one Claude window, shared session list, sessions lost from it, Claude's version and any waiting update, each account's usage, keep-alive job, no stuck lock. |
 | `relay.sh history [<n>]` | The last switches, sign-ins and keep-alive results. |
 | `relay.sh keepalive [<days>] [--force]` | Renew parked sign-ins with fewer than `<days>` left now (what the daily job runs). |
 | `relay.sh install-keepalive` | Install the daily 04:30 keep-alive job. |
@@ -130,7 +134,7 @@ The `-later` forms run under launchd and wait 10 seconds first, so they can be s
 2. Park its terminal login: `relay.sh cli-save` (if the current one isn't saved yet), `claude /login` as the new account, `relay.sh cli-save`, then `relay.sh cli-use <current name>`.
 3. Check with `relay.sh doctor`.
 
-Out-of-usage switches go to the next account after the spent one in `accounts.json` order that isn't cooling down, so the order of the entries is the order accounts are tried. The `/account` row shows a Switch button for each other account.
+Out-of-usage switches go to the next account after the spent one in `accounts.json` order that isn't cooling down or used up, so the order of the entries is the order accounts are tried. The `/account` row shows a Switch button for each other account.
 
 ## Rules that keep it safe
 
@@ -146,6 +150,8 @@ Out-of-usage switches go to the next account after the spent one in `accounts.js
 - **Scratch sessions show up as projects.** Their paths point outside the app's folder; `relay.sh restart-later` fixes them.
 - **Signed out of an account.** `relay.sh signin-later <name>`.
 - **An account sees an empty session list.** Its folder isn't linked to the shared one (`relay.sh doctor` says which); `relay.sh restart-later` links it and moves its sessions across.
+- **Sessions went missing.** After every switch, restart and sign-in, and in `relay.sh doctor`, the relay compares the shared session list with the sessions it saw last time (`seen-sessions.json`). Deleting a session in the app leaves a `deleted_<id>` marker; a session file gone with no marker was lost (a folder moved out from under the app, or its launch sweep), and you get a notification once and a `relay.log` line naming it. Copies are in `backups/` from the last shared-list change.
+- **Claude updates.** `relay.sh status` and `doctor` show Claude's version and whether an update is downloaded and waiting; it installs the next time Claude quits, and a switch or restart lets it finish first. Holding updates back isn't possible from here: the app's only switch is the `disableAutoUpdates` policy in `/Library/Managed Preferences`, which needs an administrator.
 - **Undo a change.** Look in `~/.claude/desktop-account-switcher/backups/`; each change backs up what it touched first.
 
 ## Uninstall
