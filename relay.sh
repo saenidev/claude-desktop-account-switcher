@@ -515,6 +515,7 @@ finish_swap() {
   done < <(sed 1d "$SWAPPING" | grep -vx back | tail -r)
   [ $n -gt 0 ] && log "recover: Claude was opened during the cut-off switch; what it made is kept in ${b#$DIR/}"
   rm -f "$SWAPPING"
+  [ -n "$(default_pids)" ] || link_sessions "$from"
   log "recover: a switch from $(account_field "$from" name) to $(account_field "$to" name) was cut off; put $(account_field "$from" name)'s sign-in back"
   [ -n "$was" ] && open_app
   return 0
@@ -686,6 +687,8 @@ cmd_doctor() {
     for id in $(jq -r '.accounts[] | select((.orgUuid // "") != "") | .accountUuid // empty' "$ACCOUNTS"); do
       [ -n "$canon" ] && [ ! -e "$DEFAULT_DIR/$kind/$id/$(account_field "$id" orgUuid)" ] && fail "$kind: $(account_field "$id" name) has no link to the shared list (relay.sh restart adds it)"
     done
+    [ -n "$canon" ] && [ -L "$DEFAULT_DIR/$kind/$cur/$(account_field "$cur" orgUuid)" ] \
+      && fail "$kind: $(account_field "$cur" name)'s list is a link, and Claude saves no session there (relay.sh restart moves the shared list to it)"
   done
   local tcur; tcur=$(cli_account)
   if [ -z "$tcur" ]; then warn "terminal claude isn't logged in; it won't follow the app"
@@ -910,13 +913,15 @@ backup_dir() { local b="$DIR/backups/$(date +%Y%m%d-%H%M%S)-$1"; [ -e "$b" ] && 
 # Move the sign-in files: park the folder's current ones under $1, bring $2's in.
 move_signin() { move_pair "$DEFAULT_DIR" "$PARK/$1"; move_pair "$PARK/$2" "$DEFAULT_DIR"; }
 
-# Everything done while Claude is closed, whatever closed it.
+# Everything done while Claude is closed, whatever closed it. $1: the account it opens on
+# next, when that isn't the one it reports now (a switch).
 while_closed() {
   apply_prefs_patch
   fix_scratch_paths
   drop_old_link
   fill_orgs
-  link_sessions
+  link_sessions "${1:-}"
+  apply_sessions_patch
 }
 
 # Switch the one Claude window to account $1 (a uuid). Returns 1 if it didn't close Claude
@@ -933,7 +938,7 @@ swap_to() {
   # (finish_swap): as it's killed, or by the next command.
   echo "$cur $target" > "$SWAPPING"; UNDO="finish_swap open"
   NOTE_MOVES=1 move_signin "$cur" "$target"
-  while_closed
+  while_closed "$target"
   mirror_prefs "$cur" "$target"
   mirror_rc "$cur" "$target"
   open_app
@@ -951,6 +956,7 @@ swap_to() {
   echo back >> "$SWAPPING"
   NOTE_MOVES=1 move_signin "$target" "$cur"
   rm -f "$SWAPPING"; UNDO=""
+  link_sessions "$cur"
   open_app
   return 3
 }
@@ -1131,6 +1137,23 @@ apply_prefs_patch() {
     && mv "$DIR/prefs-patch.json" "$DIR/backups/prefs-patch.applied.json" && log "prefs: patch applied"
 }
 
+# A one-off session list fix ($DIR/sessions-patch/local_*.json: session records to add or
+# replace, such as ones the app couldn't save), moved into the shared list the next time
+# Claude is closed. The records they replace are backed up first.
+apply_sessions_patch() {
+  local src="$DIR/sessions-patch" canon b f n=0
+  ls "$src"/local_*.json >/dev/null 2>&1 || return 0
+  canon=$(shared_list claude-code-sessions)
+  [ -d "$canon" ] || { log "sessions: no shared list; the session patch waits"; return 0; }
+  b=$(backup_dir sessions-patch)
+  for f in "$src"/local_*.json; do
+    [ -e "$canon/${f##*/}" ] && cp -p "$canon/${f##*/}" "$b/"
+    mv -f "$f" "$canon/" && n=$((n+1))
+  done
+  rmdir "$src" 2>/dev/null
+  log "sessions: patch applied: $n session record(s) put in the shared list (the ones replaced are in ${b#$DIR/})"
+}
+
 # ~/.claude/account-relay is the old name of $DIR, left as a link for sessions still running
 # the old mod. Once Claude has quit none are left, so the link goes.
 drop_old_link() {
@@ -1224,13 +1247,16 @@ shared_list() { local l; for l in "$DEFAULT_DIR/$1"/*/*; do [ -L "$l" ] && { rea
 # the first account's own (the one setup added). A real folder of an account in accounts.json (the app makes one
 # when a new account first loads) has its sessions moved into the shared folder (backed up
 # first), is kept as <org>.merged-<stamp>, and becomes a link. An account whose org is known
-# gets its link even before the app makes the folder. Only while Claude is closed: the
-# running app rewrites session files.
+# gets its link even before the app makes the folder. Then the shared folder moves to $1, the
+# account Claude opens on next (default: the one it reports now), since the app saves no
+# session into a link of its own (ENOTDIR, logged, and the session is gone from the list at
+# the next start). Only while Claude is closed: the running app rewrites session files.
 link_sessions() {
-  local stamp kind root canon d id org f moved first; stamp=$(date +%Y%m%d-%H%M%S)
+  local live="${1:-$(folder_account "$DEFAULT_DIR")}" stamp kind root canon d id org f moved first; stamp=$(date +%Y%m%d-%H%M%S)
   first=$(jq -r '[.accounts[] | select(.accountUuid and .orgUuid)] | if length >= 2 then .[0].accountUuid else empty end' "$ACCOUNTS")
   for kind in claude-code-sessions local-agent-mode-sessions; do
     root="$DEFAULT_DIR/$kind"; canon=$(shared_list "$kind")
+    [ -n "$canon" ] && [ ! -e "$canon" ] && { live_list "$root" "$canon" "$live"; canon=$(shared_list "$kind"); }
     if [ -z "$canon" ]; then
       [ -n "$first" ] || continue   # fewer than two accounts: nothing to share yet
       canon="$root/$first/$(account_field "$first" orgUuid)"; mkdir -p "$canon"
@@ -1252,7 +1278,26 @@ link_sessions() {
         mkdir -p "$root/$id" && ln -s "$canon" "$root/$id/$org" && log "sessions: $kind/$(account_field "$id" name)/$org linked to the shared list"
       fi
     done
+    live_list "$root" "$canon" "$live"
   done
+}
+
+# Make account $3's folder under $1 the shared folder $2 itself, and every link point at it.
+# The shared folder's old place becomes a link too. A run cut off after the move (the old
+# place missing) is finished here: shared_list still names the old place then.
+live_list() {
+  local root="$1" canon="$2" live="$3" org dest l
+  org=$(account_field "$live" orgUuid); [ -n "$live" ] && [ -n "$org" ] || return 0
+  dest="$root/$live/$org"
+  [ "$dest" = "$canon" ] && return 0
+  if [ -d "$canon" ] && [ ! -L "$canon" ]; then
+    [ -L "$dest" ] || [ ! -e "$dest" ] || { log "sessions: ${root##*/}/$(account_field "$live" name) has a list of its own; not moving the shared one there"; return 0; }
+    mkdir -p "$root/$live"; rm -f "$dest"; mv "$canon" "$dest" || return 0
+  fi
+  [ -d "$dest" ] && [ ! -L "$dest" ] || return 0
+  [ -e "$canon" ] || ln -s "$dest" "$canon"
+  for l in "$root"/*/*; do [ -L "$l" ] && [ "$(readlink "$l")" != "$dest" ] && ln -sfn "$dest" "$l"; done
+  log "sessions: ${root##*/}: the shared list is $(account_field "$live" name)'s folder now"
 }
 
 # Sign an account in without losing the current one:
@@ -1283,6 +1328,7 @@ cmd_signin() {
   # From here until the previous account is back, a kill puts its sign-in back (signin_undo).
   UNDO="signin_undo $cur"
   move_signin "$cur" "${id:-new}"   # nothing parked for it, so Claude opens signed out
+  [ -n "$id" ] && link_sessions "$id"   # so a session started while signed in to it is saved
   open_app
   notify "Sign in to ${name} in Claude. Your other account comes back afterwards."
   log "signin: waiting for ${name} to be signed in$([ -z "$id" ] && echo " (a new account)")"
@@ -1307,11 +1353,12 @@ cmd_signin() {
   if [ -n "$new" ]; then
     [ -z "$id" ] && add_account "$name" "$new"
     move_signin "$new" "$cur"
-    while_closed
+    while_closed "$cur"
   else
     # Whatever the app was left holding (signed out, or another account than the one asked
     # for) goes to backups/; the previous account's sign-in comes back whole.
     move_pair "$PARK/$cur" "$DEFAULT_DIR" unused-signin
+    link_sessions "$cur"
   fi
   UNDO=""
   open_app
@@ -1333,6 +1380,7 @@ signin_undo() {
   # Anything else left in the profile (a signed-out Cookies) goes to backups/ as it comes back.
   [ -e "$PARK/$cur/Cookies" ] && move_pair "$PARK/$cur" "$DEFAULT_DIR" signed-out-cookies
   log "signin: cut off; put $(account_field "$cur" name)'s sign-in back"
+  link_sessions "$cur"
   open_app
 }
 

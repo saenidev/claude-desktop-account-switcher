@@ -20,3 +20,8 @@ org=$(cat "$HOME/orgs/$id" 2>/dev/null)
 for kind in claude-code-sessions local-agent-mode-sessions; do
   [ -e "$profile/$kind/$id/$org" ] || mkdir -p "$profile/$kind/$id/$org"
 done
+# It saves its sessions into that folder, and, like the real app, fails to (ENOTDIR, logged)
+# when the folder is a link.
+s="$profile/claude-code-sessions/$id/$org"
+if [ -L "$s" ]; then echo "Failed to save session local_app-$id: ENOTDIR: not a directory, open '$s'" >> "$HOME/app-errors.log"
+else echo '{}' > "$s/local_app-$id.json"; fi

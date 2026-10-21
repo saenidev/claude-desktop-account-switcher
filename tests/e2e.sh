@@ -141,6 +141,13 @@ check "the session is reopened" wait_for "grep -q 'claude://resume?session=sessi
 check "the terminal moved to bob" test "$(cat "$H/keychain/Claude Code-credentials/$USER")" = token-for-bob
 check "alice's terminal login is parked" test "$(cat "$H/keychain/desktop-account-switcher-cli/$A")" = token-for-alice
 check "one Claude window" test "$(app_pids | wc -l | tr -d ' ')" = 1
+check "bob's list is the shared folder now, not a link" test -d "$P/claude-code-sessions/$B/$OB" -a ! -L "$P/claude-code-sessions/$B/$OB"
+check "alice's list links to it" test "$(readlink "$P/claude-code-sessions/$A/$OA")" = "$P/claude-code-sessions/$B/$OB"
+check "the sessions moved with it" test -f "$P/claude-code-sessions/$B/$OB/local_alice.json" -a -f "$P/claude-code-sessions/$B/$OB/local_bob.json"
+check "Cowork's list moved too" test -d "$P/local-agent-mode-sessions/$B/$OB" -a ! -L "$P/local-agent-mode-sessions/$B/$OB"
+check "the app saved its session on bob" test -f "$P/claude-code-sessions/$B/$OB/local_app-$B.json"
+check "and never failed to save one" test ! -s "$H/app-errors.log"
+check "doctor is happy on bob" relay doctor
 
 section "out of usage"
 jq '.resume = [] | del(.closedAt)' "$D/handoff.json" > "$T/h" && mv "$T/h" "$D/handoff.json"
@@ -151,6 +158,8 @@ check "Claude is signed in as alice" test "$(signed_in_as "$P/Cookies")" = "$A"
 check "bob cools down until his reset" jq -e --arg b "$B" '.cooldowns[$b] > (now | todate)' "$D/state.json"
 check "the cut-off session is reopened" wait_for "grep -q 'session=session-2' '$H/links.log'" 20
 check "the mod's entry is stamped with the account switched to" jq -e --arg a "$A" '.resume[] | select(.sessionId == "session-2") | .account == $a' "$D/handoff.json"
+check "the shared folder is alice's again" test -d "$P/claude-code-sessions/$A/$OA" -a ! -L "$P/claude-code-sessions/$A/$OA" -a -f "$P/claude-code-sessions/$A/$OA/local_app-$B.json"
+check "bob's list links to it" test "$(readlink "$P/claude-code-sessions/$B/$OB")" = "$P/claude-code-sessions/$A/$OA"
 wait_log "switch: done" 20
 
 section "every account out"
@@ -293,12 +302,18 @@ wait_for "[ -z \"\$(job_pid)\" ]" 10
 # a relay before they were noted left it. (tests/sweep.sh cuts a switch off at every move.)
 pkill -f "^$APPDIR/Contents/MacOS/Claude"; wait_for "! running" 10
 mv "$P/Cookies" "$D/park/$A/Cookies"; mv "$D/park/$B/Cookies" "$P/Cookies"; echo "$A $B" > "$D/swap.inflight"
+check "the cut-off switch left the shared folder on alice" test -d "$P/claude-code-sessions/$A/$OA" -a ! -L "$P/claude-code-sessions/$A/$OA"
 check "doctor says a switch was cut off" sh -c "'$REPO/relay.sh' doctor | grep -q 'a switch was cut off'"
+# Session records the app couldn't save, rebuilt by hand, go in with the restart.
+mkdir -p "$D/sessions-patch"; echo '{"note":"rebuilt"}' > "$D/sessions-patch/local_rebuilt.json"; echo '{"note":"newer"}' > "$D/sessions-patch/local_alice.json"
 mark; check "a restart is queued" relay restart
 check "it puts alice's sign-in back first" wait_log "recover: a switch from alice to bob was cut off" 30
 check "Claude is on alice" test "$(signed_in_as "$P/Cookies")" = "$A"
 check "bob's sign-in is parked as bob's, not alice's" test "$(signed_in_as "$D/park/$B/Cookies")" = "$B"
 check "Claude is running after the restart" wait_for "running && [ -z \"\$(job_pid)\" ]" 30
+check "the patched session records are in the shared list" sh -c "grep -q rebuilt '$P/claude-code-sessions/$A/$OA/local_rebuilt.json' && grep -q newer '$P/claude-code-sessions/$A/$OA/local_alice.json'"
+check "the record they replaced is backed up" sh -c "grep -q \"alice's session\" '$D'/backups/*-sessions-patch/local_alice.json"
+check "the patch is used up" test ! -e "$D/sessions-patch"
 check "doctor is happy" relay doctor
 
 section "signin <name>, signing in to another account already set up instead"
@@ -340,6 +355,8 @@ check "bob's sign-in doesn't come up, so it goes back" wait_log "did not come up
 check "the switch fails" wait_log "ERROR switch to bob failed" 20
 check "Claude is on alice again" test "$(signed_in_as "$P/Cookies")" = "$A"
 check "Claude is running" running
+check "and the shared folder is alice's again" test -d "$P/claude-code-sessions/$A/$OA" -a ! -L "$P/claude-code-sessions/$A/$OA"
+check "with nothing left unsaved" test ! -s "$H/app-errors.log"
 mv "$T/bob.cookies" "$D/park/$B/Cookies"
 
 section "a second command never kills one that's running"
