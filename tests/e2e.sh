@@ -2,7 +2,7 @@
 # End-to-end tests: run relay.sh the way a person does, in a throwaway home folder, against a
 # stand-in Claude app and stand-ins for open, launchctl, the Keychain, notifications and the
 # claude CLI (tests/fakes). Nothing touches the real Claude, Keychain or launchd.
-#   tests/e2e.sh                      (about a minute and a half)
+#   tests/e2e.sh                      (about ten minutes)
 #   E2E_FAILFAST=1 tests/e2e.sh       stop at the first failure, with the log
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -461,15 +461,17 @@ section "the mod in Claude Code's own engine (claude plugin test)"
 # carries, what a hook must return. tests/host/mod.test.ts stands in for the host's services.
 # tests/host/sequences.test.ts runs every order of up to 4 of a session's events, and checks that
 # this covers any length.
-mkdir -p "$T/modkit"; cp -R "$REPO/mod/." "$T/modkit/"; cp "$REPO/tests/host/mod.test.ts" "$REPO/tests/host/sequences.test.ts" "$T/modkit/hooks/"
+mkdir -p "$T/modkit"; cp -R "$REPO/mod/." "$T/modkit/"; cp "$REPO/tests/host/mod.test.ts" "$REPO/tests/host/sequences.test.ts" "$REPO/tests/host/two-sessions.test.ts" "$T/modkit/hooks/"
 HOME="$REAL_HOME" "$REAL_CLAUDE" plugin test "$T/modkit" > "$T/modkit.out" 2>&1
 for t in "a turn marks its session busy, and its end clears it" "a limit lists the session and the ones mid-turn, then starts the switch" "a reopened session is told why, once"; do
   check "engine: $t" grep -qF "(pass) $t" "$T/modkit.out"
 done
 check "engine: all 4680 orders of up to 4 events (time passing among them) hold to the model" test "$(grep -c '^(pass) events ' "$T/modkit.out")" = 4680
 check "engine: every state they reach is reached within 3 events and took every event, so any length is covered" grep -qF "(pass) every state reached, with every event, covers sequences of any length" "$T/modkit.out"
+check "engine: every interleaving of two sessions' events holds to the model" test "$(grep -c '^(pass) two sessions [PCRLW]' "$T/modkit.out")" -ge 7500
+check "engine: and every state they reach took every event, so any length is covered" grep -qF "(pass) two sessions: every state reached, with every event, covers any length" "$T/modkit.out"
 check "engine: nothing failed" sh -c "! grep -q '^(fail)' '$T/modkit.out'"
-mv "$T/modkit/hooks/sequences.test.ts" "$T/sequences.test.ts"   # the session below needs only the mod
+mv "$T/modkit/hooks/sequences.test.ts" "$T/modkit/hooks/two-sessions.test.ts" "$T/"   # the session below needs only the mod
 
 section "a real Claude Code session hits a usage limit (against a stand-in API)"
 # The real claude, with the mod, started as the app starts a session on bob: with a token the

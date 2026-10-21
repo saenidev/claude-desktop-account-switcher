@@ -129,6 +129,12 @@ So whatever a state is reached by, the next step is the same, and a sequence of 
 
 All 4680 pass, and so does the last test. The first run (before the 16 minutes and the last test were added) failed 210 sequences, every one a limit followed by a reopen. The fixture had Claude closing at the clock's first instant, so a limit at that same instant counted as written before the close, under the one-second grace that `relay.sh` needs because it stamps the close to the second. With the close moved 5 seconds before the first event, all pass. With one bug put in by hand (a reopened session not clearing its own busy marker), 332 fail before the engine stops.
 
+### Two sessions at once
+
+`tests/host/two-sessions.test.ts` does the same for two sessions on one account, interleaved. Each session can get a prompt, its turn's end, a start on a reopen and a usage limit, and 16 minutes can pass: 9 events. The one-session test covers a session's other events (its end, startup, compact), which act like these. Every sequence of up to 4 runs (7380). Then, for each state of the model first reached only by a longer sequence, one sequence reaching it is run again followed by each event, until every state reached has had every event: 7506 sequences, 56 states. The model adds what one session does to the other. A limit lists the other session too if it's mid-turn; a reopen drops the other's entries once they're more than 15 minutes old; nothing else crosses over.
+
+All pass, and so does the check that every state took every event and always left the same files. On its first run, that last check found one state leaving different files. The difference was only the reason written in limit entries: "limit hit: ..." for the session that hit the limit, "mid-turn ..." for one listed with it. Everything that reads the reason (the mod's carry-on message and `relay.sh`'s two places) treats both alike, so the check compares them as one kind of entry.
+
 ## The mod in a real Claude Code session
 
 `tests/host/live.sh` runs the mod in a real `claude -p` session: the real host, the real model, started as the app starts a session (`CLAUDE_CODE_ENTRYPOINT=claude-desktop` and an account id), in a throwaway home folder, so neither the installed mod nor the real data folder is touched. It costs a few cents of usage a run, so it is run by hand, not by `tests/e2e.sh`. What it shows, 9 checks, all passing:
