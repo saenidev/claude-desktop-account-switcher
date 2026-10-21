@@ -114,12 +114,20 @@ Two parts of the logic have too many states to list by hand, so `tests/sweep.sh`
 
 ## Every order of a session's events
 
-`tests/host/sequences.test.ts` runs in Claude Code's own engine with the suite. It covers every sequence of up to 4 of the events one session can get: a prompt, the turn's end, the session's end, a start on a reopen, at startup or after a compact, and a usage limit. That is 7 + 49 + 343 + 2401 = 2800 sequences. After every event it checks the files and what the session was told against a model stated once:
+`tests/host/sequences.test.ts` runs in Claude Code's own engine with the suite. It covers every sequence of up to 4 of the events one session can get. The events are a prompt, the turn's end, the session's end, a start on a reopen, at startup or after a compact, a usage limit, and 16 minutes passing, which is longer than a hand-off entry counts. That's 8 + 64 + 512 + 4096 = 4680 sequences. After every event it checks the files and what the session was told against a model stated once:
 - the busy marker is there exactly while a prompt was the last thing to happen;
-- the reopen entry is used up by the first start, with the carry-on message once, and never by a compact;
-- a limit lists this session and the other one mid-turn on its account (never an older mod's marker or another account's), each once, and starts the switch.
+- the reopen entry is used up by the first start, with the carry-on message once, never by a compact, and not at all once it's more than 15 minutes old;
+- a limit lists this session and the other one mid-turn on its account (never an older mod's marker or another account's), each once, and starts the switch;
+- the next start drops entries more than 15 minutes old.
 
-All 2800 pass. Its first run failed 210 sequences, every one a limit followed by a reopen. The fixture had Claude closing at the clock's first instant, so a limit at that same instant counted as written before the close, under the one-second grace that `relay.sh` needs because it stamps the close to the second. With the close moved 5 seconds before the first event, all pass. With one bug put in by hand (a reopened session not clearing its own busy marker), 388 fail.
+**Why that covers any length.** The mod keeps nothing between events but its files. The sequences reach 10 states of the model, and a last test shows three things:
+- each state is first reached within 3 events;
+- each has had all 8 events applied;
+- every sequence that reaches a state leaves the same files (times aside, and the model's states carry how old each entry is).
+
+So whatever a state is reached by, the next step is the same, and a sequence of any length only takes steps the test has checked. This holds while the events in between come seconds apart (3 here) or more than 15 minutes apart. An entry ageing past 15 minutes through many short gaps lands in the same states.
+
+All 4680 pass, and so does the last test. The first run (before the 16 minutes and the last test were added) failed 210 sequences, every one a limit followed by a reopen. The fixture had Claude closing at the clock's first instant, so a limit at that same instant counted as written before the close, under the one-second grace that `relay.sh` needs because it stamps the close to the second. With the close moved 5 seconds before the first event, all pass. With one bug put in by hand (a reopened session not clearing its own busy marker), 332 fail before the engine stops.
 
 ## The mod in a real Claude Code session
 
@@ -139,4 +147,4 @@ Every event the real host fires, in every order, in a live desktop session. The 
 
 ## The slow run
 
-The run I called a 12-minute run was shorter: the session's own record has it launched at 20:48:28 UTC and done at 20:57:21, 8 minutes 53 seconds, against 5 minutes 24 seconds for the run before it. Its one failure was a check that fails at once, with no wait behind it. It had no section timings (they were added right after), so which part was slow can't be known now. In that half hour other sessions on the Mac were running test suites (pytest in three other projects, one with four subagents of its own, and sf-map workflows driving Chromium and `npm test`), which is evidence of load, not proof that it was the cause. The timed runs since took five to six minutes; the latest took 317 seconds, no section more than about 30. Every wait in the suite is bounded (each `wait_for` gives up after its time-out and counts a failure), so a run that is slow but passes means the stand-ins were slow to answer, not that something hung.
+The run I called a 12-minute run was shorter: the session's own record has it launched at 20:48:28 UTC and done at 20:57:21, 8 minutes 53 seconds, against 5 minutes 24 seconds for the run before it. Its one failure was a check that fails at once, with no wait behind it. It had no section timings (they were added right after). But its failure printed the end of `relay.log`, with times. Its last sections (the mod's) ran from about 05:56:00 to the end of the run at 05:57:21, about 80 seconds, against about 70 to the end of the next run, which had timings. The next run reached those sections 4 minutes 55 seconds in; this one, about 7 minutes 30 seconds in. So the extra time was spread over the relay's sections before them, not lost in one section waiting out a time-out. In that half hour other sessions on the Mac were running test suites (pytest in three other projects, one with four subagents of its own, and sf-map workflows driving Chromium and `npm test`), which is evidence of load, not proof that it was the cause. The timed runs since took five to six minutes; the latest took 317 seconds, no section more than about 30. Every wait in the suite is bounded (each `wait_for` gives up after its time-out and counts a failure), so a run that is slow but passes means the stand-ins were slow to answer, not that something hung.

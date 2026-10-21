@@ -459,13 +459,15 @@ check "and moves nothing" test "$(signed_in_as "$P/Cookies")" = "$B"
 section "the mod in Claude Code's own engine (claude plugin test)"
 # The engine applies Claude Code's own rules: how hooks may be registered, what each event
 # carries, what a hook must return. tests/host/mod.test.ts stands in for the host's services.
-# tests/host/sequences.test.ts runs every order of up to 4 of a session's events.
+# tests/host/sequences.test.ts runs every order of up to 4 of a session's events, and checks that
+# this covers any length.
 mkdir -p "$T/modkit"; cp -R "$REPO/mod/." "$T/modkit/"; cp "$REPO/tests/host/mod.test.ts" "$REPO/tests/host/sequences.test.ts" "$T/modkit/hooks/"
 HOME="$REAL_HOME" "$REAL_CLAUDE" plugin test "$T/modkit" > "$T/modkit.out" 2>&1
 for t in "a turn marks its session busy, and its end clears it" "a limit lists the session and the ones mid-turn, then starts the switch" "a reopened session is told why, once"; do
   check "engine: $t" grep -qF "(pass) $t" "$T/modkit.out"
 done
-check "engine: all 2800 orders of up to 4 events hold to the model" test "$(grep -c '^(pass) events ' "$T/modkit.out")" = 2800
+check "engine: all 4680 orders of up to 4 events (time passing among them) hold to the model" test "$(grep -c '^(pass) events ' "$T/modkit.out")" = 4680
+check "engine: every state they reach is reached within 3 events and took every event, so any length is covered" grep -qF "(pass) every state reached, with every event, covers sequences of any length" "$T/modkit.out"
 check "engine: nothing failed" sh -c "! grep -q '^(fail)' '$T/modkit.out'"
 mv "$T/modkit/hooks/sequences.test.ts" "$T/sequences.test.ts"   # the session below needs only the mod
 
