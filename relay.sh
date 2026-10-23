@@ -1012,6 +1012,7 @@ swap_to() {
   while_closed "$target"
   mirror_prefs "$cur" "$target"
   mirror_rc "$cur" "$target"
+  forget_rc_links
   open_app
   # 45 seconds for the new sign-in to come up (ACCOUNT_SWITCHER_FAST: 10, for the tests).
   local n=0 max=45; [ -n "${ACCOUNT_SWITCHER_FAST:-}" ] && max=10
@@ -1188,6 +1189,29 @@ mirror_prefs() {
 # Remote Control's on/off is kept per account (identities["org:account"].serve in
 # remote-control-state.json); an account with none starts with it off. Carry the on/off over,
 # never the environments, which belong to each account.
+# Each session's transcript names the Remote Control link it last had ("bridge-session"
+# records), and turning Remote Control on reattaches that link. A link made on another account
+# can't be: the switch fails ("Previous session is unavailable") until Claude Code has written
+# an empty record, and works on the next try. So while Claude is closed for a switch, write that
+# empty record for every session that had a link; turning Remote Control on then starts a new
+# link on the new account the first time.
+forget_rc_links() {
+  local f last sid n=0
+  while IFS= read -r f; do
+    last=$(grep '"type":"bridge-session"' "$f" | tail -1)
+    [ -n "$(printf '%s' "$last" | jq -r '.bridgeSessionId // empty' 2>/dev/null)" ] || continue
+    sid=$(printf '%s' "$last" | jq -r '.sessionId // empty' 2>/dev/null); [ -n "$sid" ] || continue
+    jq -cn --arg s "$sid" '{type: "bridge-session", sessionId: $s, bridgeSessionId: "", lastSequenceNum: 0}' >> "$f" && n=$((n+1))
+  done < <(grep -l '"type":"bridge-session"' "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null)
+  # The app keeps its own list of a session's links (bridgeSessionIds) and hands the last one to
+  # Claude Code to reattach. find doesn't follow the other accounts' links to the shared list,
+  # so each session file is seen once.
+  while IFS= read -r f; do
+    jq_write "$f" '.bridgeSessionIds = []' && n=$((n+1))
+  done < <(find "$DEFAULT_DIR/claude-code-sessions" -name 'local_*.json' -type f -exec grep -l '"bridgeSessionIds": *\[ *"' {} + 2>/dev/null)
+  [ "$n" -gt 0 ] && log "remote control: forgot $n Remote Control link record(s); sessions start new links on the new account"
+  return 0
+}
 mirror_rc() {
   local f="$DEFAULT_DIR/remote-control-state.json" fk tk serve
   [ -f "$f" ] || return 0

@@ -130,9 +130,18 @@ jq --arg u "$A" '.oauthAccount.accountUuid = $u' "$H/.claude.json" > "$T/j" && m
 section "switch by hand, reopening the session"
 # A private per-account setting: it's copied to the new account, and the file stays private.
 jq -n --arg a "$A" '{("sidebar-" + $a): {width: 300}}' > "$P/claude_desktop_config.json"; chmod 600 "$P/claude_desktop_config.json"
+# A session linked to Remote Control on alice, and one never linked.
+mkdir -p "$H/.claude/projects/-proj-x"
+jq -cn --arg a "$A" '{type: "user", sessionId: "s-rc"}, {type: "bridge-session", sessionId: "s-rc", bridgeSessionId: "cse_alice", lastSequenceNum: 7, ownerAccountUuid: $a}' > "$H/.claude/projects/-proj-x/s-rc.jsonl"
+jq -cn '{type: "user", sessionId: "s-plain"}' > "$H/.claude/projects/-proj-x/s-plain.jsonl"
+jq -cn '{cliSessionId: "s-rc", bridgeSessionIds: ["session_alice"], title: "linked"}' > "$P/claude-code-sessions/$A/$OA/local_rc.json"   # compact, as the app writes it
 mark; check "use bob is queued" relay use bob --resume session-1
 check "the hand-off says which account the session comes back on" wait_for "jq -e --arg b '$B' '.resume[] | select(.sessionId == \"session-1\") | .account == \$b' '$D/handoff.json' >/dev/null" 10
 check "the switch finishes" wait_log "swap: alice -> bob" 40
+check "the session linked on alice starts a new Remote Control link on bob" sh -c "grep '\"type\":\"bridge-session\"' '$H/.claude/projects/-proj-x/s-rc.jsonl' | tail -1 | jq -e '.sessionId == \"s-rc\" and .bridgeSessionId == \"\"'"
+check "its history is kept" test "$(wc -l < "$H/.claude/projects/-proj-x/s-rc.jsonl" | tr -d ' ')" = 3
+check "the app's record of its link is cleared, the rest kept" jq -e '.bridgeSessionIds == [] and .title == "linked"' "$P/claude-code-sessions/$B/$OB/local_rc.json"
+check "a session never linked is left alone" test "$(wc -l < "$H/.claude/projects/-proj-x/s-plain.jsonl" | tr -d ' ')" = 1
 check "alice's per-account setting is copied to bob" jq -e --arg b "$B" '.["sidebar-" + $b].width == 300' "$P/claude_desktop_config.json"
 check "claude_desktop_config.json is still 0600" test "$(stat -f %Lp "$P/claude_desktop_config.json")" = 600
 check "Claude is signed in as bob" test "$(signed_in_as "$P/Cookies")" = "$B"
