@@ -208,7 +208,14 @@ quit_default() {
 # replaces the app underneath it (seen on 2026-10-20: a relay restart at 20:25, the install at
 # 20:31). So after quitting, wait for ShipIt to finish, and open the new version.
 SHIPIT_STATE="$HOME/Library/Caches/com.anthropic.claudefordesktop.ShipIt/ShipItState.plist"
-shipit_running() { pgrep -f 'Squirrel.framework/Resources/ShipIt' >/dev/null; }
+# Only Claude's own ShipIt, inside its bundle: other apps' updaters are ShipIt too.
+shipit_running() {
+  local p s="$APP/Contents/Frameworks/Squirrel.framework/Resources/ShipIt"
+  for p in $(pgrep -f 'Squirrel.framework/Resources/ShipIt'); do
+    case "$(ps -p "$p" -o args= 2>/dev/null)" in "$s"*|*" $s"*) return 0 ;; esac
+  done
+  return 1
+}
 # A downloaded update waiting to be installed: ShipIt's state names an update bundle that's there.
 update_waiting() {
   local b; b=$(jq -r '.updateBundleURL // empty' "$SHIPIT_STATE" 2>/dev/null | sed 's#^file://##; s#%20# #g')
@@ -602,7 +609,38 @@ swap_cli_now() {
   if [ -n "$cur" ] && security find-generic-password -s "$CLI_SVC" -a "$USER" >/dev/null 2>&1 && ! cli_park "$cur"; then
     log "terminal: couldn't save $(account_field "$cur" name)'s terminal login; not swapping"; return 1
   fi
-  cli_restore "$target" && log "terminal: $(account_field "$cur" name) -> $(account_field "$target" name)"
+  cli_restore "$target" && log "terminal: $(account_field "$cur" name) -> $(account_field "$target" name)" \
+    && swap_rc_pointers "$cur" "$target"
+}
+# Terminal `claude rc` keeps, per project folder, the session it reattaches on its next start
+# (~/.claude/projects/<folder>/bridge-pointer.json). That session is the terminal account's;
+# on another account the reattach finds nothing and rc starts with no session at all. So a
+# terminal move parks the outgoing account's pointers (park/<uuid>/rc-pointers/) and puts the
+# incoming account's back; a folder it has none for keeps its environment and forgets the
+# session, so rc makes a new one. A folder being served right now is left alone.
+RC_POINTERS="$HOME/.claude/projects"
+swap_rc_pointers() {   # swap_rc_pointers <from uuid or ""> <to uuid>
+  local from="$1" to="$2" p key pid saved n=0
+  for p in "$RC_POINTERS"/*/bridge-pointer.json; do
+    [ -f "$p" ] || continue
+    key=$(basename "$(dirname "$p")"); pid=$(jq -r '.pid // empty' "$p" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o args= | grep -q 'claude'; then
+      log "remote control: $key is being served now; its pointer stays"; continue
+    fi
+    [ -n "$from" ] && { mkdir -p "$PARK/$from/rc-pointers"; cp -p "$p" "$PARK/$from/rc-pointers/$key.json"; }
+    saved="$PARK/$to/rc-pointers/$key.json"
+    if [ -f "$saved" ]; then cp -p "$saved" "$p"
+    else jq_write "$p" '.sessionId = "" | with_entries(select(.key | test("SessionIds") | not))'; fi
+    n=$((n+1))
+  done
+  # Folders the incoming account served before that have no pointer now.
+  for saved in "$PARK/$to/rc-pointers"/*.json; do
+    [ -f "$saved" ] || continue
+    key=$(basename "$saved" .json)
+    [ -d "$RC_POINTERS/$key" ] && [ ! -e "$RC_POINTERS/$key/bridge-pointer.json" ] && cp -p "$saved" "$RC_POINTERS/$key/bridge-pointer.json" && n=$((n+1))
+  done
+  [ "$n" -gt 0 ] && log "remote control: $n terminal rc pointer(s) moved to $(account_field "$to" name)"
+  return 0
 }
 # Save the live terminal login as its account's parked copy (run once per account after `claude /login`).
 cmd_cli_save() {
@@ -614,6 +652,39 @@ cmd_cli_use() {
   swap_cli "$id" || { echo "terminal claude stays on $(account_field "$(cli_account)" name): see $LOG" >&2; return 1; }
   echo "terminal claude is on $(account_field "$(cli_account)" name)"
 }
+# Give <name> a parked terminal login: save the live one, run `claude auth login` for <name>,
+# park what it signed in to if that's <name>, and leave the terminal on the app's account, so
+# from then on the terminal follows the app to <name> too. Signing in to anyone else puts the
+# previous terminal login back.
+cmd_cli_login() {
+  local id name email cur got app; id=$(account_by_name "${1:-}"); [ -n "$id" ] || die "cli-login: no account named ${1:-}"
+  name=$(account_field "$id" name); email=$(account_field "$id" email); cur=$(cli_account)
+  if [ -n "$cur" ] && security find-generic-password -s "$CLI_SVC" -a "$USER" >/dev/null 2>&1; then
+    [ -n "$(account_field "$cur" name)" ] || die "cli-login: terminal claude is logged in as $cur, not an account in accounts.json; signing in would lose that login"
+    [ "$cur" = "$id" ] || locked "$DIR/cli.lock" cli_park "$cur" || die "cli-login: couldn't save $(account_field "$cur" name)'s terminal login; not signing in"
+  fi
+  echo "Sign in as $name${email:+ ($email)} in the browser that opens."
+  log "terminal: signing terminal claude in as $name"
+  if ! claude auth login --claudeai ${email:+--email "$email"}; then
+    cli_put_back "$cur" "$id"
+    die "cli-login: the sign-in to $name didn't finish; terminal claude is on $(account_field "$(cli_account)" name)"
+  fi
+  got=$(cli_account)
+  if [ "$got" != "$id" ]; then
+    local who; who=$(account_field "$got" name); who=${who:-${got:-nobody}}
+    cli_put_back "$cur" "$id"
+    die "cli-login: that sign-in was $who, not $name; terminal claude is on $(account_field "$(cli_account)" name)"
+  fi
+  locked "$DIR/cli.lock" cli_park "$id" || die "cli-login: signed in as $name, but couldn't park that login"
+  log "terminal: parked $name's terminal login"
+  # Back where it was (its rc pointers never left that account), then on to the app's account.
+  cli_put_back "$cur" "$id"
+  app=$(folder_account "$DEFAULT_DIR")
+  [ -n "$app" ] && [ "$app" != "$(cli_account)" ] && cli_parked "$app" && swap_cli "$app"
+  echo "$name has a terminal login now; terminal claude is on $(account_field "$(cli_account)" name) and follows the app"
+}
+# Put <uuid>'s parked terminal login back after a cli-login for <other uuid> that didn't take.
+cli_put_back() { [ -n "$1" ] && [ "$1" != "$2" ] && cli_parked "$1" && locked "$DIR/cli.lock" cli_restore "$1"; }
 # A terminal run hit the limit: cool that account down and move only the terminal login.
 cmd_cli_switch() {
   local from; from=$(cli_account); [ -n "$from" ] || die "cli-switch: terminal isn't logged in"
@@ -697,7 +768,7 @@ cmd_doctor() {
     for id in $(account_ids); do
       [ "$id" = "$tcur" ] && continue
       cli_parked "$id" && ok "$(account_field "$id" name) has a parked terminal login" \
-        || warn "$(account_field "$id" name) has no parked terminal login, so terminal claude stays put when the app moves to it: relay.sh cli-save, claude /login as $(account_field "$id" name), relay.sh cli-save, then relay.sh cli-use $(account_field "$tcur" name)"
+        || warn "$(account_field "$id" name) has no parked terminal login, so terminal claude stays put when the app moves to it: relay.sh cli-login $(account_field "$id" name)"
     done
   fi
   local lost; lost=$(check_sessions)
@@ -948,7 +1019,9 @@ swap_to() {
   if [ "$(folder_account "$DEFAULT_DIR")" = "$target" ]; then
     rm -f "$SWAPPING"; UNDO=""
     log "swap: $(account_field "$cur" name) -> $(account_field "$target" name)"
-    swap_cli "$target"   # terminal claude follows, when a parked terminal login exists
+    # Terminal claude follows, when a parked terminal login exists; without one, say how to make it.
+    swap_cli "$target" || cli_parked "$target" \
+      || notify "Terminal claude stayed on $(account_field "$(cli_account)" name). Run relay.sh cli-login $(account_field "$target" name) once so it follows the app."
     return 0
   fi
   log "swap: $(account_field "$target" name)'s sign-in did not come up; going back to $(account_field "$cur" name)"
@@ -1352,6 +1425,8 @@ cmd_signin() {
   quit_default
   if [ -n "$new" ]; then
     [ -z "$id" ] && add_account "$name" "$new"
+    [ -z "$id" ] && ! cli_parked "$new" && [ "$(cli_account)" != "$new" ] \
+      && notify "Added $name. So terminal claude follows the app to it, run relay.sh cli-login $name once."
     move_signin "$new" "$cur"
     while_closed "$cur"
   else
@@ -1487,6 +1562,7 @@ Using it
   plan --from <accountUuid> what an out-of-usage switch would do, changing nothing
 
 Terminal claude
+  cli-login <name>          sign terminal claude in as <name> once, so it follows the app there
   cli-save                  park the current terminal login as its account's
   cli-use <name>            move terminal claude to <name>'s parked login
   run -- <claude args>      run claude, retrying once on the next account after a usage limit
@@ -1537,6 +1613,7 @@ case "$cmd" in
   install-keepalive) cmd_install_keepalive ;;
   cli-save) cmd_cli_save ;;
   cli-use) cmd_cli_use "$@" ;;
+  cli-login) cmd_cli_login "$@" ;;
   cli-switch) cmd_cli_switch "$@" ;;
   run) cmd_run "$@" ;;
   help|-h|--help) usage ;;

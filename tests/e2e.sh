@@ -25,6 +25,7 @@ echo "$OA" > "$H/orgs/$A"; echo "$OB" > "$H/orgs/$B"; echo "$OC" > "$H/orgs/$C"
 
 REAL_CLAUDE=$(command -v claude || echo claude); REAL_HOME="$HOME"; REAL_PATH="$PATH"   # for the real claude, which the stand-ins would shadow
 export HOME="$H" ACCOUNT_SWITCHER_APP="$APPDIR" ACCOUNT_SWITCHER_FAST=1
+unset ACCOUNT_SWITCHER_JOB   # set in a session the relay reopened; here jobs go through the stand-in launchd
 export PATH="$H/.local/bin:$PATH"
 relay() { "$REPO/relay.sh" "$@"; }
 
@@ -198,11 +199,11 @@ mv "$T/c.saved" "$P/config.json"
 section "an update that moves the app's files installs while Claude is closed for a switch"
 # A stand-in ShipIt: like the real one, it waits for Claude to quit, takes a while to install,
 # and then the app is a new version that keeps no lastKnownAccountUuid in config.json.
-mkdir -p "$T/Squirrel.framework/Resources"
+mkdir -p "$APPDIR/Contents/Frameworks/Squirrel.framework/Resources"
 printf '%s\n' "while pgrep -f '^$APPDIR/Contents/MacOS/Claude' >/dev/null; do sleep 0.2; done" "sleep 3" \
   "plutil -replace CFBundleShortVersionString -string 3.9999.0 '$APPDIR/Contents/Info.plist'" \
-  "jq 'del(.lastKnownAccountUuid)' '$P/config.json' > '$T/c' && mv '$T/c' '$P/config.json'" > "$T/Squirrel.framework/Resources/ShipIt"
-/bin/bash "$T/Squirrel.framework/Resources/ShipIt" &
+  "jq 'del(.lastKnownAccountUuid)' '$P/config.json' > '$T/c' && mv '$T/c' '$P/config.json'" > "$APPDIR/Contents/Frameworks/Squirrel.framework/Resources/ShipIt"
+/bin/bash "$APPDIR/Contents/Frameworks/Squirrel.framework/Resources/ShipIt" &
 mark; check "use bob is queued" relay use bob
 check "the relay waits for the update" wait_log "update: Claude 3.1623.0 -> 3.9999.0 installed while closed" 30
 check "and then doesn't switch" wait_log "doesn't keep its files where this expects" 10
@@ -226,6 +227,24 @@ check "a terminal limit doesn't move to an account with no parked terminal login
 check "terminal claude stays on alice" test "$(cat "$H/keychain/Claude Code-credentials/$USER")" = token-for-alice
 jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
 
+section "a terminal login for an account that has none"
+check "doctor says how to give carol one" sh -c "'$REPO/relay.sh' doctor | grep -q 'carol has no parked terminal login.*relay.sh cli-login carol'"
+echo cancel > "$H/cli-login-as"
+check "a sign-in given up on fails" sh -c "! '$REPO/relay.sh' cli-login carol 2>/dev/null"
+check "terminal claude is still alice's" test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "token-for-alice:$A"
+echo "$B" > "$H/cli-login-as"
+check "signing in as bob instead is refused" sh -c "! '$REPO/relay.sh' cli-login carol 2>'$T/err' && grep -q 'that sign-in was bob, not carol' '$T/err'"
+check "terminal claude is back on alice" test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "token-for-alice:$A"
+check "carol still has no parked terminal login" test ! -e "$H/keychain/desktop-account-switcher-cli/$C"
+check "bob's parked terminal login is untouched" test "$(cat "$H/keychain/desktop-account-switcher-cli/$B")" = token-for-bob
+echo "$C" > "$H/cli-login-as"; jq --arg c "$C" '(.accounts[] | select(.accountUuid == $c)).email = "carol@example.com"' "$D/accounts.json" > "$T/a" && mv "$T/a" "$D/accounts.json"
+check "cli-login carol succeeds" relay cli-login carol
+check "it asked for carol's email" grep -q "auth login --claudeai --email carol@example.com" "$H/claude-cli.log"
+check "carol's terminal login is parked" test "$(cat "$H/keychain/desktop-account-switcher-cli/$C")" = "fresh-token-for-$C"
+check "terminal claude is on alice again, like the app" test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "token-for-alice:$A"
+check "doctor is happy with carol's terminal login" sh -c "'$REPO/relay.sh' doctor | grep -q 'carol has a parked terminal login'"
+rm -f "$H/cli-login-as"
+
 # Back to alice after a section that switched away, for the sections after it.
 back_to_alice() {
   wait_for "[ -z \"\$(job_pid)\" ]" 40; mark; relay use alice >/dev/null; wait_log "swap: .* -> alice" 40
@@ -236,14 +255,29 @@ section "a limit switch skips an account whose parked sign-in has run out"
 cp "$D/park/$B/Cookies" "$T/bob.cookies"; expire_signin "$D/park/$B/Cookies"
 check "status says bob's sign-in ran out" sh -c "'$REPO/relay.sh' status | grep -q 'bob .*ran out'"
 check "plan goes past bob to carol" sh -c "'$REPO/relay.sh' plan --from $A | grep -q '^to: *carol'"
+# Terminal `claude rc` in two folders on alice: one stopped, one serving right now.
+RCP="$H/.claude/projects"; mkdir -p "$RCP/-proj-a" "$RCP/-proj-live"
+bash -c 'exec -a claude sleep 300' & RC_LIVE=$!
+jq -n '{sessionId: "alice-rc", environmentId: "env-a", source: "standalone", pid: 999999, activeSessionIds: ["alice-rc"], activeSessionIdsPersistedAt: 1}' > "$RCP/-proj-a/bridge-pointer.json"
+jq -n --argjson p "$RC_LIVE" '{sessionId: "alice-live", environmentId: "env-l", source: "standalone", pid: $p}' > "$RCP/-proj-live/bridge-pointer.json"
 mark; check "the mod's launch is queued" relay launch --from "$A"
 check "it switches to carol" wait_log "swap: alice -> carol" 40
+check "terminal rc pointers move with it" wait_log "remote control: 1 terminal rc pointer(s) moved to carol" 10
+check "terminal claude moved to carol with the app" test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "fresh-token-for-$C:$C"
+check "alice's terminal login is parked" test "$(cat "$H/keychain/desktop-account-switcher-cli/$A")" = token-for-alice
+check "rc in a stopped folder starts a new session on carol, in the same environment" jq -e '.sessionId == "" and .environmentId == "env-a" and (has("activeSessionIds") | not)' "$RCP/-proj-a/bridge-pointer.json"
+check "alice's rc pointer is parked" jq -e '.sessionId == "alice-rc"' "$D/park/$A/rc-pointers/-proj-a.json"
+check "a folder being served keeps its pointer" jq -e '.sessionId == "alice-live"' "$RCP/-proj-live/bridge-pointer.json"
 check "bob's sign-in was never tried" sh -c "! tail -n +$((MARK + 1)) '$D/relay.log' | grep -q 'bob.*did not come up'"
 wait_log "switch: done" 20
 check "use bob by hand is refused before Claude closes" sh -c "'$REPO/relay.sh' use bob >/dev/null; sleep 4; grep -q \"bob's parked sign-in has run out\" '$D/relay.log'"
 check "Claude stays on carol" test "$(signed_in_as "$P/Cookies")" = "$C"
 mv "$T/bob.cookies" "$D/park/$B/Cookies"
 back_to_alice
+check "terminal claude came back to alice with the app" test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "token-for-alice:$A"
+check "alice's rc session comes back with her" jq -e '.sessionId == "alice-rc" and .activeSessionIds == ["alice-rc"]' "$RCP/-proj-a/bridge-pointer.json"
+check "carol's is parked" jq -e '.sessionId == ""' "$D/park/$C/rc-pointers/-proj-a.json"
+kill "$RC_LIVE" 2>/dev/null
 
 section "a limit switch whose first pick doesn't come up tries the next account"
 cp "$D/park/$B/Cookies" "$T/bob.cookies"; dud_signin "$D/park/$B/Cookies"
