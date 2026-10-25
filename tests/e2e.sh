@@ -166,6 +166,11 @@ mark; check "the mod's launch is queued" relay launch --from "$B" --resets-at "$
 check "it switches to the next account" wait_log "swap: bob -> alice" 40
 check "Claude is signed in as alice" test "$(signed_in_as "$P/Cookies")" = "$A"
 check "bob cools down until his reset" jq -e --arg b "$B" '.cooldowns[$b] > (now | todate)' "$D/state.json"
+check "status says bob is out of usage" sh -c "'$REPO/relay.sh' status | grep -q 'bob .*out of usage until'"
+cp "$D/state.json" "$T/s.keep"
+jq --arg b "$B" --arg u "$(date -u -v-1H +%FT%TZ)" '.cooldowns[$b] = $u' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+check "status leaves out a cooldown that's over" sh -c "! '$REPO/relay.sh' status | grep -q 'out of usage until'"
+mv "$T/s.keep" "$D/state.json"
 check "the cut-off session is reopened" wait_for "grep -q 'session=session-2' '$H/links.log'" 20
 check "the mod's entry is stamped with the account switched to" jq -e --arg a "$A" '.resume[] | select(.sessionId == "session-2") | .account == $a' "$D/handoff.json"
 check "the shared folder is alice's again" test -d "$P/claude-code-sessions/$A/$OA" -a ! -L "$P/claude-code-sessions/$A/$OA" -a -f "$P/claude-code-sessions/$A/$OA/local_app-$B.json"

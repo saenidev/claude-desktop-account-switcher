@@ -935,7 +935,7 @@ cmd_status() {
   echo "terminal claude: on $(account_field "$(cli_account)" name)"
   echo "accounts:"
   local id; for id in $(account_ids); do
-    local until; until=$(jq -r --arg a "$id" '.cooldowns[$a] // empty' "$STATE")
+    local until; until=$(jq -r --arg a "$id" '.cooldowns[$a] // empty | select(fromdateiso8601 > now)' "$STATE")
     echo "  $(account_field "$id" name)  $(account_field "$id" email)  $(signin_state "$id")${until:+  (out of usage until $until)}"
     echo "      usage: $(usage_line "$id")"
   done
