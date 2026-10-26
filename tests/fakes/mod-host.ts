@@ -59,7 +59,7 @@ const $ = {
     },
   },
   clock: { now: async () => Date.now(), after: (ms: number, f: () => void) => void setTimeout(f, ms) },
-  ui: { toast: (text: string) => out('toast', text), resolve: () => ({}) },
+  ui: { toast: (text: string) => out('toast', text), resolve: () => ({}), invalidate: (event: string) => out('invalidate', event) },
   prompt: { submit: async ({ text }: { text: string }) => out('prompt', text) },
   session: {
     id: async () => session,

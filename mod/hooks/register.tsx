@@ -293,6 +293,9 @@ const step = atom({ plugin: 'desktop-account-switcher', key: 'step' } as const, 
 // Bumped when something the row shows may have changed, so it draws again.
 const redraw = atom({ plugin: 'desktop-account-switcher', key: 'redraw' } as const, 0)
 const shown = atom({ plugin: 'desktop-account-switcher', key: 'shown' } as const, null as boolean | null)
+// Draw the row again now. A write to a value the row read should redraw it by itself, but
+// /account's first write in a session showed nothing until the next turn.
+const drawNow = ($: Host) => $.ui.invalidate('ui.render')
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 function when(iso: string) {
@@ -424,6 +427,7 @@ function registerRow(on: Parameters<Register>[0]) {
     const { visible } = await rowState($)
     await update($, shown, () => !visible)
     await update($, step, (): Step => ({ kind: 'idle' }))
+    drawNow($)
     return { text: visible ? 'Account row hidden.' : 'Account row shown above the prompt.' }
   })
 
@@ -456,7 +460,7 @@ function registerRow(on: Parameters<Register>[0]) {
           <Text>
             {accounts.length === 0 ? 'The account switcher isn\'t set up yet: run ./relay.sh setup <name> in its repo.' : `Only ${accounts[0]?.name} is set up. Add another account with /account add <name>.`}
           </Text>
-          <Button key="hide" role="dismiss" dimColor label="Hide" onPress={() => update($, shown, () => false)} />
+          <Button key="hide" role="dismiss" dimColor label="Hide" onPress={() => update($, shown, () => false).then(() => drawNow($))} />
         </Box>
       )
     }
@@ -506,6 +510,7 @@ function registerRow(on: Parameters<Register>[0]) {
             onPress={async () => {
               const at = Date.now()
               await update($, step, (): Step => ({ kind: 'switching', to: s.to, action: s.action, at }))
+              drawNow($)
               const sessionId = await $.session.id()
               const ran = await $.process.run(['/bin/bash', p.relay, s.action, s.to, '--resume', sessionId]).catch(() => undefined)
               if (ran === undefined || ran.exitCode !== 0) {
@@ -517,7 +522,7 @@ function registerRow(on: Parameters<Register>[0]) {
               $.clock.after(SWITCH_TIMEOUT_MS, () => void switchTimedOut($, at))
             }}
           />
-          <Button key="cancel" label="Cancel" onPress={() => update($, step, (): Step => ({ kind: 'idle' }))} />
+          <Button key="cancel" label="Cancel" onPress={() => update($, step, (): Step => ({ kind: 'idle' })).then(() => drawNow($))} />
         </Box>
       )
     }
@@ -536,13 +541,13 @@ function registerRow(on: Parameters<Register>[0]) {
               return (
                 <Box gap={1}>
                   <Text>{a.name} is signed out</Text>
-                  <Button key={`signin-${a.name}`} label={`Sign in ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name, action: 'signin' }))} />
+                  <Button key={`signin-${a.name}`} label={`Sign in ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name, action: 'signin' })).then(() => drawNow($))} />
                 </Box>
               )
             }
             return (
               <Box gap={1}>
-                <Button key={`to-${a.name}`} label={`Switch to ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name, action: 'use' }))} />
+                <Button key={`to-${a.name}`} label={`Switch to ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name, action: 'use' })).then(() => drawNow($))} />
                 <Text dimColor>{out ? `out until ${out}` : lastKnown(snapshots[a.accountUuid], now)}</Text>
                 {exp - now < WARN_DAYS * DAY ? <Text>sign-in expires {when(new Date(exp).toISOString())}</Text> : null}
               </Box>
@@ -559,7 +564,7 @@ function registerRow(on: Parameters<Register>[0]) {
             await update($, redraw, n => n + 1)
           }}
         />
-        <Button key="hide" role="dismiss" dimColor label="Hide" onPress={() => update($, shown, () => false)} />
+        <Button key="hide" role="dismiss" dimColor label="Hide" onPress={() => update($, shown, () => false).then(() => drawNow($))} />
       </Box>
     )
   })
