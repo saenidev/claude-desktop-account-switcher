@@ -13,5 +13,17 @@ case "$1 $2" in
     printf 'add-generic-password -U -s "Claude Code-credentials" -a "%s" -X %s\n' "$USER" "$(printf 'fresh-token-for-%s' "$who" | xxd -p | tr -d '\n')" | security -i
     [ -f "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
     jq --arg u "$who" '.oauthAccount = {accountUuid: $u}' "$HOME/.claude.json" > "$HOME/.claude.json.tmp" && mv "$HOME/.claude.json.tmp" "$HOME/.claude.json" ;;
+  -p*)
+    # A prompt in a home holding its login as a file (cli-renew's throwaway home, where there's
+    # no Keychain): like the real one, it renews an access token that has run out, rotating the
+    # refresh token, unless the login was revoked.
+    f="$HOME/.claude/.credentials.json"; [ -f "$f" ] || exit 1
+    now=$(( $(date +%s) * 1000 ))
+    if [ "$(jq -r '.claudeAiOauth.expiresAt' "$f")" -lt $(( now + 300000 )) ]; then
+      jq -e '.claudeAiOauth.refreshToken | test("revoked")' "$f" >/dev/null && { echo "Failed to authenticate: OAuth token revoked. Please log in again." >&2; exit 1; }
+      jq -e '.claudeAiOauth.refreshToken | test("offline")' "$f" >/dev/null && { echo "API Error: Connection error." >&2; exit 1; }
+      jq -c --argjson e $(( now + 28800000 )) '.claudeAiOauth |= (.refreshToken += "+" | .accessToken += "+" | .expiresAt = $e)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    fi
+    echo ok ;;
   *) exit 1 ;;
 esac

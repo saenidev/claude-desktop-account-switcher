@@ -259,6 +259,36 @@ check "terminal claude is on alice again, like the app" test "$(cat "$H/keychain
 check "doctor is happy with carol's terminal login" sh -c "'$REPO/relay.sh' doctor | grep -q 'carol has a parked terminal login'"
 rm -f "$H/cli-login-as"
 
+section "a parked terminal login whose token ran out is renewed by claude in a throwaway home"
+BCLI="$H/keychain/desktop-account-switcher-cli/$B"; cp "$BCLI" "$T/bob.cli"
+cli_login_json() { jq -nc --arg r "$1" --argjson e "$2" '{claudeAiOauth: {accessToken: "at-\($r)", refreshToken: $r, expiresAt: $e, scopes: ["user:inference"]}}'; }
+cli_login_json rt-bob $(( ($(date +%s) - 3600) * 1000 )) > "$BCLI"
+check "doctor says how to renew it" sh -c "'$REPO/relay.sh' doctor | grep -q 'bob usage.*expired.*relay.sh cli-renew'"
+mark; check "cli-renew renews bob's" sh -c "'$REPO/relay.sh' cli-renew bob | grep -q '^bob: renewed'"
+check "the renewed login is parked" jq -e '.claudeAiOauth.refreshToken == "rt-bob+" and .claudeAiOauth.expiresAt > (now * 1000)' "$BCLI"
+check "it's logged" wait_log "renewed bob's parked terminal login" 5
+check "the live terminal login is untouched" test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "token-for-alice:$A"
+check "the throwaway home is gone" test ! -e "$D/cli-renew"
+check "one still good isn't renewed again" sh -c "'$REPO/relay.sh' cli-renew bob | grep -q '^bob: good until'"
+cli_login_json rt-bob-offline $(( ($(date +%s) - 3600) * 1000 )) > "$BCLI"
+check "one claude can't reach Anthropic to renew isn't" sh -c "'$REPO/relay.sh' cli-renew bob --force | grep -q '^bob: not renewed'"
+check "and stays parked as it was" jq -e '.claudeAiOauth.refreshToken == "rt-bob-offline"' "$BCLI"
+check "it isn't tried again within the hour" sh -c "'$REPO/relay.sh' cli-renew bob | grep -q '^bob: tried in the last hour'"
+cli_login_json rt-bob-revoked $(( ($(date +%s) - 3600) * 1000 )) > "$BCLI"
+mark; check "one that was revoked (its refresh token used elsewhere) is found dead" sh -c "'$REPO/relay.sh' cli-renew bob --force | grep -q '^bob: its parked terminal login no longer works'"
+check "you're told to sign it in again" grep -q "bob's terminal login no longer works. Run relay.sh cli-login bob" "$H/notifications.log"
+check "doctor flags it" sh -c "'$REPO/relay.sh' doctor | grep -q \"^!!  bob's parked terminal login no longer works.*relay.sh cli-login bob\""
+check "terminal claude won't move to it" sh -c "! '$REPO/relay.sh' cli-use bob 2>/dev/null"
+check "and stays on alice" test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "token-for-alice:$A"
+check "it isn't tried again" sh -c "'$REPO/relay.sh' cli-renew bob | grep -q 'no longer works: relay.sh cli-login bob'"
+echo "$B" > "$H/cli-login-as"
+check "cli-login bob parks a new one" relay cli-login bob
+check "and bob's is good again" sh -c "'$REPO/relay.sh' doctor | grep -q 'ok  bob has a parked terminal login'"
+rm -f "$H/cli-login-as"
+check "the terminal's own login is left to claude" sh -c "'$REPO/relay.sh' cli-renew alice | grep -q '^alice: terminal claude is on it'"
+check "a login that isn't claude.ai's is left alone" sh -c "'$REPO/relay.sh' cli-renew carol | grep -q \"^carol: its parked terminal login isn't a claude.ai login\""
+mv "$T/bob.cli" "$BCLI"; jq 'del(.cliRenewTriedAt)' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+
 # Back to alice after a section that switched away, for the sections after it.
 back_to_alice() {
   wait_for "[ -z \"\$(job_pid)\" ]" 40; mark; relay use alice >/dev/null; wait_log "swap: .* -> alice" 40

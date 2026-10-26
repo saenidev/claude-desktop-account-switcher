@@ -43,6 +43,15 @@ notify() { osascript -e 'on run argv' -e 'display notification (item 1 of argv) 
 die() { log "ERROR $*"; notify "$*"; echo "$*" >&2; exit 1; }
 # Fixed waits (letting a turn finish, letting the app load). ACCOUNT_SWITCHER_FAST shortens them for tests.
 pause() { if [ -n "${ACCOUNT_SWITCHER_FAST:-}" ]; then sleep 1; else sleep "$1"; fi; }
+# run_for <seconds> <command...>: run it, killing it if it's still going after <seconds>.
+run_for() {
+  local secs="$1" pid dog rc; shift
+  "$@" & pid=$!
+  ( sleep "$secs" & wait $!; kill "$pid" 2>/dev/null ) 2>/dev/null & dog=$!
+  wait "$pid"; rc=$?
+  pkill -P "$dog" sleep 2>/dev/null; kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null
+  return $rc
+}
 
 # Put the finished temp file $2 in place of $1, with $1's mode. Some of the files rewritten are
 # private (claude_desktop_config.json is 0600 and can hold secrets), so temp files are made
@@ -403,6 +412,7 @@ cmd_keepalive() {
       [ "$left" -le 3 ] && notify "$name's sign-in expires in $left days and couldn't be renewed. Run relay.sh signin $name."
     fi
   done
+  cli_renew_all   # and the parked terminal logins
 }
 
 # Returns 2 when it didn't run because a switch or sign-in holds the lock.
@@ -588,6 +598,8 @@ cli_park() {       # save the live terminal login as <uuid>'s parked one
   done
   security find-generic-password -s "$CLI_SVC" -a "$USER" -w 2>/dev/null | keychain_put "$CLI_PARK_SVC" "$id" || return 1
   mkdir -p "$PARK/$id"; jq '.oauthAccount' "$HOME/.claude.json" > "$PARK/$id/oauthAccount.json"
+  cli_dead "$id" && jq_write "$STATE" --arg a "$id" 'del(.cliDead[$a])'
+  return 0
 }
 cli_restore() {    # make <uuid>'s parked login the live terminal login
   local id="$1" tmp
@@ -605,6 +617,7 @@ swap_cli_now() {
   local target="$1" cur; cur=$(cli_account)
   [ "$cur" = "$target" ] && return 0
   if ! cli_parked "$target"; then log "terminal: no parked terminal login for $(account_field "$target" name); terminal stays on $(account_field "$cur" name)"; return 1; fi
+  if cli_dead "$target"; then log "terminal: $(account_field "$target" name)'s parked terminal login no longer works (relay.sh cli-login $(account_field "$target" name)); terminal stays on $(account_field "$cur" name)"; return 1; fi
   # With no live login there's nothing to save first (logged out, or the item was deleted).
   if [ -n "$cur" ] && security find-generic-password -s "$CLI_SVC" -a "$USER" >/dev/null 2>&1 && ! cli_park "$cur"; then
     log "terminal: couldn't save $(account_field "$cur" name)'s terminal login; not swapping"; return 1
@@ -692,7 +705,7 @@ cmd_cli_switch() {
   jq_write "$STATE" --arg a "$from" --arg u "$until" '.cooldowns[$a] = $u'
   # Only accounts with a parked terminal login: the terminal can't move to any other.
   local id ready="" target
-  for id in $(account_ids); do cli_parked "$id" && ready+="$id"$'\n'; done
+  for id in $(account_ids); do cli_parked "$id" && ! cli_dead "$id" && ready+="$id"$'\n'; done
   [ -n "$ready" ] && target=$(pick_target "$from" "" "$ready")
   [ -n "${target:-}" ] || { log "terminal: $(account_field "$from" name) is out, and no other account with a parked terminal login has usage"; notify "Terminal: every account with a terminal login is out of usage."; return 1; }
   swap_cli "$target"
@@ -712,6 +725,95 @@ cmd_run() {
   fi
   return "$rc"
 }
+
+# A parked terminal login isn't used, so its access token (good for about 8 hours) runs out:
+# its account's usage can't be read live after that, and a login left unused long enough may
+# stop working. To renew one (after caam's keepalive), the real claude runs one tiny prompt in a
+# throwaway home holding only that login, as a file: with HOME there, claude finds no login
+# Keychain, keeps its login in ~/.claude/.credentials.json and renews it in that file, never
+# touching the live terminal login. Whatever it leaves is parked again, renewed or not, so the
+# parked copy stays the newest (renewing rotates the refresh token). Under cli.lock, so no
+# terminal move puts the parked copy live halfway. The prompt is a few tokens of Haiku on that
+# account; one at a limit is renewed all the same, as claude renews before it asks.
+RENEW_HOME="$DIR/cli-renew"
+RENEW_EVERY=3600   # seconds between tries for one account, renewed or not
+cli_expires() {    # cli_expires <uuid>: its parked terminal login's access token expiry (epoch), or nothing
+  security find-generic-password -s "$CLI_PARK_SVC" -a "$1" -w 2>/dev/null | jq -r '(.claudeAiOauth.expiresAt // empty) / 1000 | floor' 2>/dev/null
+}
+# Due: parked, not the live one (claude renews that itself), expired or within 30 minutes of
+# it, and not tried in the last hour.
+cli_renew_due() {
+  local exp; [ "$(cli_account)" != "$1" ] && cli_parked "$1" && ! cli_dead "$1" || return 1
+  exp=$(cli_expires "$1"); [ -n "$exp" ] && [ "$exp" -lt $(( $(date +%s) + 1800 )) ] || return 1
+  [ $(( $(date +%s) - $(jq -r --arg a "$1" '.cliRenewTriedAt[$a] // 0' "$STATE") )) -ge "$RENEW_EVERY" ]
+}
+# A parked login claude couldn't renew because it no longer works: its refresh token was used
+# by something else after it was parked (a claude still running on that account when the
+# terminal moved, or another tool holding a copy), which revokes the copy here. Marked in
+# state.json (cliDead) so no terminal move puts it live, until cli-login parks a new one.
+cli_dead() { jq -e --arg a "$1" '.cliDead[$a] // empty' "$STATE" >/dev/null 2>&1; }
+# cli_renew <uuid>: 0 renewed, 1 not renewed, 2 nothing to renew.
+cli_renew() { locked "$DIR/cli.lock" cli_renew_now "$@"; }
+cli_renew_now() {
+  local id="$1" name before after h="$RENEW_HOME" f="$RENEW_HOME/.claude/.credentials.json"
+  name=$(account_field "$id" name)
+  [ "$(cli_account)" != "$id" ] && cli_parked "$id" || return 2
+  before=$(cli_expires "$id")
+  [ -n "$before" ] || { log "terminal: $name's parked terminal login isn't a claude.ai login; not renewing it"; return 2; }
+  jq_write "$STATE" --arg a "$id" --argjson t "$(date +%s)" '.cliRenewTriedAt[$a] = $t'
+  rm -rf "$h"; mkdir -p "$h/.claude" "$h/work"; chmod 700 "$h"
+  ( umask 077; security find-generic-password -s "$CLI_PARK_SVC" -a "$id" -w > "$f" 2>/dev/null )
+  local out; out=$(cd "$h/work" && run_for 120 env -i HOME="$h" USER="$USER" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG=en_US.UTF-8 \
+      claude -p "Reply with the word ok." --model haiku --max-turns 1 --tools "" --strict-mcp-config --no-session-persistence 2>&1)
+  # What claude left is the newest copy: park it if it changed and is still a login.
+  local tok='.claudeAiOauth | "\(.refreshToken) \(.expiresAt)"'
+  if jq -e '.claudeAiOauth.refreshToken' "$f" >/dev/null 2>&1 \
+    && [ "$(jq -r "$tok" "$f" | shasum)" != "$(security find-generic-password -s "$CLI_PARK_SVC" -a "$id" -w 2>/dev/null | jq -r "$tok" 2>/dev/null | shasum)" ]; then
+    keychain_put "$CLI_PARK_SVC" "$id" < "$f" || log "terminal: couldn't park $name's renewed terminal login"
+  fi
+  rm -rf "$h"
+  after=$(cli_expires "$id")
+  if [ "${after:-0}" -gt "$before" ]; then jq_write "$STATE" --arg a "$id" 'del(.cliDead[$a])'; log "terminal: renewed $name's parked terminal login, good until $(date -u -r "$after" '+%F %T') UTC"; return 0; fi
+  out=$(printf '%s' "$out" | tr -s '\n' ' ' | cut -c1-200)
+  if printf '%s' "$out" | grep -qiE 'revoked|invalid_grant|invalid.*(refresh|token)|log ?in again|/login'; then
+    jq_write "$STATE" --arg a "$id" --argjson t "$(date +%s)" '.cliDead[$a] = $t'
+    log "terminal: $name's parked terminal login no longer works ($out); terminal claude won't move to it until relay.sh cli-login $name"
+    notify "$name's terminal login no longer works. Run relay.sh cli-login $name in a terminal."
+    return 1
+  fi
+  log "terminal: $name's parked terminal login wasn't renewed (it ran out $(date -u -r "$before" '+%F %T') UTC): $out"; return 1
+}
+# relay.sh cli-renew [<name>...] [--force]: renew parked terminal logins that are due (all
+# parked ones but the live one, or the ones named); --force ignores when each was last tried.
+cmd_cli_renew() {
+  local force="" names=() a id ids=""
+  for a in "$@"; do case "$a" in --force) force=1 ;; *) names+=("$a") ;; esac; done
+  if [ ${#names[@]} -gt 0 ]; then
+    for a in "${names[@]}"; do id=$(account_by_name "$a"); [ -n "$id" ] || die "cli-renew: no account named $a"; ids+="$id "; done
+  else ids=$(account_ids); fi
+  for id in $ids; do
+    local name; name=$(account_field "$id" name)
+    if [ "$(cli_account)" = "$id" ]; then echo "$name: terminal claude is on it; claude renews it itself"; continue; fi
+    cli_parked "$id" || { echo "$name: no parked terminal login (relay.sh cli-login $name)"; continue; }
+    if cli_dead "$id" && [ -z "$force" ]; then echo "$name: its parked terminal login no longer works: relay.sh cli-login $name (or --force to try again)"; continue; fi
+    [ -n "$force" ] && jq_write "$STATE" --arg a "$id" 'del(.cliRenewTriedAt[$a])'
+    local exp; exp=$(cli_expires "$id")
+    [ -n "$exp" ] || { echo "$name: its parked terminal login isn't a claude.ai login"; continue; }
+    if [ -z "$force" ] && ! cli_renew_due "$id"; then
+      if [ "$exp" -ge $(( $(date +%s) + 1800 )) ]; then echo "$name: good until $(date -u -r "$exp" '+%F %T') UTC"
+      else echo "$name: tried in the last hour; --force to try again"; fi
+      continue
+    fi
+    cli_renew "$id"
+    case $? in
+      0) echo "$name: renewed, good until $(date -u -r "$(cli_expires "$id")" '+%F %T') UTC" ;;
+      1) if cli_dead "$id"; then echo "$name: its parked terminal login no longer works: relay.sh cli-login $name"; else echo "$name: not renewed; see $LOG"; fi ;;
+      *) echo "$name: nothing to renew" ;;
+    esac
+  done
+}
+# Renew every parked terminal login that's due (from usage --renew and the daily keep-alive).
+cli_renew_all() { local id; for id in $(account_ids); do cli_renew_due "$id" && cli_renew "$id"; done; return 0; }
 
 # ---- Looking at it -----------------------------------------------------------------------------
 
@@ -767,8 +869,9 @@ cmd_doctor() {
     [ -n "$(account_field "$tcur" name)" ] && ok "terminal claude is on $(account_field "$tcur" name)" || fail "terminal claude is on $tcur, not an account in accounts.json"
     for id in $(account_ids); do
       [ "$id" = "$tcur" ] && continue
-      cli_parked "$id" && ok "$(account_field "$id" name) has a parked terminal login" \
-        || warn "$(account_field "$id" name) has no parked terminal login, so terminal claude stays put when the app moves to it: relay.sh cli-login $(account_field "$id" name)"
+      if cli_dead "$id"; then fail "$(account_field "$id" name)'s parked terminal login no longer works (used or revoked elsewhere after it was parked), so terminal claude stays put when the app moves to it: relay.sh cli-login $(account_field "$id" name)"
+      elif cli_parked "$id"; then ok "$(account_field "$id" name) has a parked terminal login"
+      else warn "$(account_field "$id" name) has no parked terminal login, so terminal claude stays put when the app moves to it: relay.sh cli-login $(account_field "$id" name)"; fi
     done
   fi
   local lost; lost=$(check_sessions)
@@ -847,15 +950,17 @@ fetch_usage() {
 usage_reach() {
   local exp; exp=$(cli_login "$1" | jq -r '(.claudeAiOauth.expiresAt // 0) / 1000 | floor' 2>/dev/null)
   if [ -z "$exp" ]; then echo "not read live: no terminal login (relay.sh cli-save)"
-  elif [ "$exp" -le "$(date +%s)" ]; then echo "not read live: its parked terminal login's token expired $(( ($(date +%s) - exp) / 3600 ))h ago"
+  elif [ "$(cli_account)" != "$1" ] && cli_dead "$1"; then echo "not read live: its parked terminal login no longer works (relay.sh cli-login $(account_field "$1" name))"
+  elif [ "$exp" -le "$(date +%s)" ]; then echo "not read live: its parked terminal login's token expired $(( ($(date +%s) - exp) / 3600 ))h ago (relay.sh cli-renew)"
   else echo "read live from Anthropic"; fi
 }
 
-# relay.sh usage [--force]: read every account's usage from Anthropic into usage.json (at most
-# every 10 minutes unless --force; after a 429, not before the wait is over), then print it.
+# relay.sh usage [--force] [--renew]: read every account's usage from Anthropic into usage.json (at
+# most every 10 minutes unless --force; after a 429, not before the wait is over), then print it.
+# --renew (the mod's background check) first renews parked terminal logins that are due.
 cmd_usage() {
-  local force="" quiet="" a
-  for a in "$@"; do case "$a" in --force) force=1 ;; --quiet) quiet=1 ;; esac; done
+  local force="" quiet="" renew="" a
+  for a in "$@"; do case "$a" in --force) force=1 ;; --quiet) quiet=1 ;; --renew) renew=1 ;; esac; done
   local now last until; now=$(date -u +%s)
   last=$(jq -r '.usageCheckedAt // 0' "$STATE"); until=$(jq -r '.usageWaitUntil // 0' "$STATE")
   # A check takes 30 seconds at most; a lock older than 2 minutes is left from one that was killed.
@@ -863,6 +968,7 @@ cmd_usage() {
   if [ "$now" -lt "$until" ]; then :
   elif { [ -n "$force" ] || [ $((now - last)) -ge $USAGE_EVERY ]; } && mkdir "$USAGE_LOCK" 2>/dev/null; then
     local id windows rc
+    [ -n "$renew" ] && cli_renew_all
     for id in $(account_ids); do
       windows=$(fetch_usage "$id"); rc=$?
       case $rc in
@@ -1589,6 +1695,7 @@ Terminal claude
   cli-login <name>          sign terminal claude in as <name> once, so it follows the app there
   cli-save                  park the current terminal login as its account's
   cli-use <name>            move terminal claude to <name>'s parked login
+  cli-renew [<name>...] [--force]   renew parked terminal logins whose token ran out
   run -- <claude args>      run claude, retrying once on the next account after a usage limit
 
 Upkeep
@@ -1637,6 +1744,7 @@ case "$cmd" in
   install-keepalive) cmd_install_keepalive ;;
   cli-save) cmd_cli_save ;;
   cli-use) cmd_cli_use "$@" ;;
+  cli-renew) cmd_cli_renew "$@" ;;
   cli-login) cmd_cli_login "$@" ;;
   cli-switch) cmd_cli_switch "$@" ;;
   run) cmd_run "$@" ;;

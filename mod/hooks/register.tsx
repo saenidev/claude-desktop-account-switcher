@@ -438,7 +438,7 @@ function registerRow(on: Parameters<Register>[0]) {
       await saveSnapshot($).catch(() => undefined)
       // Every account's figures from Anthropic; relay.sh asks at most every 10 minutes. Detached.
       const p = await paths($)
-      await $.process.run(['/bin/sh', '-c', 'nohup /bin/bash "$1" usage --quiet >/dev/null 2>&1 &', 'sh', p.relay]).catch(() => undefined)
+      await $.process.run(['/bin/sh', '-c', 'nohup /bin/bash "$1" usage --quiet --renew >/dev/null 2>&1 &', 'sh', p.relay]).catch(() => undefined)
     }
     await update($, redraw, n => n + 1)
     return r
@@ -463,9 +463,13 @@ function registerRow(on: Parameters<Register>[0]) {
     const cooldowns = (await readJson<{ cooldowns?: Record<string, string> }>($, `${p.dir}/state.json`, {})).cooldowns ?? {}
     const armed = (await readJson<{ armed?: boolean }>($, p.config, {})).armed === true
     const me = accounts.find(a => a.accountUuid === current)
+    // Out: cooling down, or its last reading has a window used up that hasn't reset (the
+    // same rule an automatic switch uses to skip it). Until the latest of those.
     const outUntil = (a: Account) => {
-      const t = cooldowns[a.accountUuid]
-      return t !== undefined && Date.parse(t) > now ? when(t) : undefined
+      const ends = [cooldowns[a.accountUuid], ...(snapshots[a.accountUuid]?.windows ?? []).filter(w => w.percentUsed >= 100).map(w => w.resetsAt)]
+        .map(t => (t ? Date.parse(t) : NaN))
+        .filter(t => t > now)
+      return ends.length > 0 ? when(new Date(Math.max(...ends)).toISOString()) : undefined
     }
     // A switch past its time (its timer lost, say to a reload of the mod) shows as over.
     const saved = await read($, step)
