@@ -88,6 +88,8 @@ handoff_read() { locked "$HANDOFF.lock" jq "$@" "$HANDOFF"; }
 account_field() { jq -r --arg u "$1" --arg f "$2" '.accounts[] | select(.accountUuid == $u) | .[$f] // empty' "$ACCOUNTS"; }
 account_by_name() { jq -r --arg n "$1" '.accounts[] | select(.name == $n) | .accountUuid // empty' "$ACCOUNTS"; }
 account_ids() { jq -r '.accounts[].accountUuid // empty' "$ACCOUNTS"; }
+# A benched account stays set up but no automatic switch goes to it (relay.sh bench <name>).
+benched() { jq -e --arg u "$1" 'any(.accounts[]; .accountUuid == $u and .benched == true)' "$ACCOUNTS" >/dev/null 2>&1; }
 
 # The account the app in $1 last signed in as, from its own config.json (an id, not a secret).
 folder_account() { jq -r '.lastKnownAccountUuid // empty' "$1/config.json" 2>/dev/null; }
@@ -336,11 +338,11 @@ parse_args() {
   done
 }
 
-# The first other account whose cooldown has passed and whose last usage reading has no
-# window used up, in accounts.json order after $1. A used-up window that hasn't reset yet is
-# still used up however old the reading is: usage only goes down at a reset. Windows counted:
-# 5-hour and weekly, and the model's own weekly limit named in $2 (say "Fable weekly") when
-# that is what ran out. $3, if given, lists the only accounts to consider (one id a line).
+# The first other account that isn't benched, whose cooldown has passed and whose last usage
+# reading has no window used up, in accounts.json order after $1. A used-up window that hasn't
+# reset yet is still used up however old the reading is: usage only goes down at a reset.
+# Windows counted: 5-hour and weekly, and the model's own weekly limit named in $2 (say "Fable
+# weekly") when that is what ran out. $3, if given, lists the only accounts to consider (one id a line).
 # If usage.json can't be read (a bad file, a time jq can't parse), the switch still happens:
 # it's logged, and the pick is made again without the usage figures.
 pick_target() {
@@ -352,9 +354,11 @@ pick_target() {
       | select(.percentUsed >= 100 and ((.resetsAt // "") != "") and ((.resetsAt | epoch) > $now))] | length > 0;
     ($only | split("\n") | map(select(. != ""))) as $only
     | (.accounts | map(.accountUuid // empty)) as $ids
+    | [.accounts[] | select(.benched == true) | .accountUuid] as $benched
     | ($ids | index($from) // -1) as $i
     | [range(1; ($ids | length) + 1)] | map($ids[($i + .) % ($ids | length)])
     | map(select(. != $from))
+    | map(select(. as $a | $benched | index($a) | not))
     | map(select(($only | length) == 0 or (. as $a | $only | index($a))))
     | map(select((($st[0].cooldowns[.] // "1970-01-01T00:00:00Z") | epoch) <= $now))
     | map(select(spent(.) | not))
@@ -707,7 +711,7 @@ cmd_cli_switch() {
   local id ready="" target
   for id in $(account_ids); do cli_parked "$id" && ! cli_dead "$id" && ready+="$id"$'\n'; done
   [ -n "$ready" ] && target=$(pick_target "$from" "" "$ready")
-  [ -n "${target:-}" ] || { log "terminal: $(account_field "$from" name) is out, and no other account with a parked terminal login has usage"; notify "Terminal: every account with a terminal login is out of usage."; return 1; }
+  [ -n "${target:-}" ] || { log "terminal: $(account_field "$from" name) is out, and no other account with a parked terminal login has usage and isn't benched"; notify "Terminal: every account with a terminal login is out of usage or benched."; return 1; }
   swap_cli "$target"
 }
 
@@ -838,6 +842,8 @@ cmd_doctor() {
   local cur; cur=$(folder_account "$DEFAULT_DIR")
   [ -n "$(account_field "$cur" name)" ] && ok "Claude is signed in as $(account_field "$cur" name)" || fail "Claude is signed in as ${cur:-nobody}, which isn't in accounts.json"
   local id now; now=$(date -u +%s)
+  for id in $(account_ids); do benched "$id" && ok "$(account_field "$id" name) is benched: automatic switches skip it (relay.sh unbench $(account_field "$id" name))"; done
+  [ "$n" -ge 2 ] && [ -n "$(bench_note)" ] && warn "$(bench_note)"
   for id in $(account_ids); do
     [ "$id" = "$cur" ] && continue
     local exp; exp=$(signin_expires_epoch "$id")
@@ -892,7 +898,7 @@ cmd_doctor() {
 
 # Recent switches and sign-in events, newest last (after caam's history).
 cmd_history() {
-  grep -E 'swap: [^ ]+ -> |switch: .* is out|signin: |keepalive: .*(renewed|not renewed)|launched relay away|not switching|removed ' "$LOG" | tail -n "${1:-20}"
+  grep -E 'swap: [^ ]+ -> |switch: .* is out|signin: |keepalive: .*(renewed|not renewed)|launched relay away|not switching|removed |bench: ' "$LOG" | tail -n "${1:-20}"
 }
 
 # An account's last usage reading: from Anthropic (relay.sh usage), or saved by the mod while
@@ -1042,7 +1048,8 @@ cmd_status() {
   echo "accounts:"
   local id; for id in $(account_ids); do
     local until; until=$(jq -r --arg a "$id" '.cooldowns[$a] // empty | select(fromdateiso8601 > now)' "$STATE")
-    echo "  $(account_field "$id" name)  $(account_field "$id" email)  $(signin_state "$id")${until:+  (out of usage until $until)}"
+    local bench=""; benched "$id" && bench="  (benched: automatic switches skip it)"
+    echo "  $(account_field "$id" name)  $(account_field "$id" email)  $(signin_state "$id")${until:+  (out of usage until $until)}$bench"
     echo "      usage: $(usage_line "$id")"
   done
   echo "pending resumes:"; jq -r '.resume[] | "  \(.sessionId)  (\(.reason))"' "$HANDOFF"
@@ -1053,7 +1060,7 @@ cmd_plan() {
   local ready target=""; ready=$(switch_ready)
   [ -n "$ready" ] && target=$(pick_target "$FROM" "$LIMIT" "$ready")
   echo "from:   $(account_field "$FROM" name) ($FROM): $(signin_state "$FROM")${LIMIT:+, out of $LIMIT}"
-  if [ -z "$target" ]; then echo "to:     nobody: every other account is cooling down, used up or signed out"; return; fi
+  if [ -z "$target" ]; then echo "to:     nobody: every other account is cooling down, used up, signed out or benched"; return; fi
   echo "to:     $(account_field "$target" name) ($target): $(signin_state "$target")"
   echo "resume: $(jq -r '[.resume[].sessionId] | join(", ")' "$HANDOFF")"
 }
@@ -1248,7 +1255,7 @@ cmd_switch() {
       notify "$(account_field "$FROM" name) is out of usage, and no other account's sign-in came up. Run relay.sh doctor."
       die "switch: no other account's sign-in came up; stayed on $(account_field "$FROM" name)"
     fi
-    notify "$(account_field "$FROM" name) is out of usage, and every other account is too (or signed out)."
+    notify "$(account_field "$FROM" name) is out of usage, and every other account is too (or signed out, or benched)."
     die "switch: no account to switch to"
   fi
   jq_write "$STATE" --arg f "$FROM" --arg t "$target" --argjson at "$(date -u +%s)" '.switches += [{from: $f, to: $t, at: $at}] | .switches |= .[-20:]'
@@ -1593,6 +1600,37 @@ signin_undo() {
 # which must not be in accounts.json yet (to sign an account in again: relay.sh signin <name>).
 cmd_add() { ADDING=1 cmd_signin "$@"; }
 
+# Bench an account, or put it back (after CLIProxyAPI's "disabled"): a benched account stays set
+# up, its parked sign-ins are kept alive and its usage is read, and use <name> still switches
+# to it; only the automatic switches (the app's and the terminal's) skip it. Nothing is moved,
+# so it doesn't need the lock.
+#   relay.sh bench <name> / relay.sh unbench <name>
+cmd_bench() {   # cmd_bench <true|false> <name>
+  local verb; [ "$1" = true ] && verb=bench || verb=unbench
+  local name="${2:-}" id; [ -n "$name" ] || die "$verb: which account? relay.sh $verb <name>"
+  id=$(account_by_name "$name"); [ -n "$id" ] || die "$verb: no account named $name"
+  jq_write "$ACCOUNTS" --arg u "$id" --argjson b "$1" '(.accounts[] | select(.accountUuid == $u)) |= (if $b then .benched = true else del(.benched) end)' \
+    || die "$verb: couldn't write $ACCOUNTS"
+  if [ "$1" = true ]; then
+    log "bench: $name benched; automatic switches skip it"
+    echo "Benched $name: automatic switches skip it. Its sign-ins are kept alive, and relay.sh use $name still switches to it."
+  else
+    log "bench: $name is back in automatic switching"
+    echo "$name is back in automatic switching."
+  fi
+  [ "$(account_ids | grep -c .)" -ge 2 ] && [ -n "$(bench_note)" ] && echo "Note: $(bench_note)."
+  return 0
+}
+# What automatic switching can't do with the benched accounts left out (with two or more
+# accounts set up); nothing while two or more aren't benched.
+bench_note() {
+  local free; free=$(jq -r '.accounts[] | select(.benched != true) | .name' "$ACCOUNTS")
+  case $(printf '%s' "$free" | grep -c .) in
+    0) echo "every account is benched, so automatic switching never moves Claude" ;;
+    1) echo "every account but $free is benched, so when $free runs out there's no account to switch to" ;;
+  esac
+}
+
 # Take an account out: its parked sign-in moves to backups/ (still signed in there until you
 # delete it), its parked terminal login is deleted, and it's dropped from accounts.json.
 cmd_remove() {
@@ -1687,6 +1725,8 @@ Using it
   status                    accounts, usage, cooldowns, sessions waiting to reopen
   usage [--force]           every account's usage from Anthropic (at most every 10 minutes unless --force)
   use <name>                switch Claude to <name> now (restarts Claude)
+  bench <name>              leave <name> out of automatic switches (use <name> still works)
+  unbench <name>            put <name> back in automatic switches
   restart                   restart Claude on the same account, fixing anything that needs it closed
   history [<n>]             the last switches and sign-ins
   plan --from <accountUuid> what an out-of-usage switch would do, changing nothing
@@ -1732,6 +1772,8 @@ case "$cmd" in
   use|swap|swap-later) [ -n "$(account_by_name "${1:-}")" ] || die "$cmd: no account named ${1:-}"; now_or_job swap "$@" ;;
   restart|restart-later) now_or_job restart "$@" ;;
   remove) cmd_remove "$@" ;;
+  bench)  cmd_bench true "$@" ;;
+  unbench) cmd_bench false "$@" ;;
   doctor) cmd_doctor ;;
   status) cmd_status ;;
   usage)  cmd_usage "$@" ;;

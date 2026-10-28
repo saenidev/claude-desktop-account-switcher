@@ -17,7 +17,8 @@ import type { Step } from '../types'
 // report, like a model's own weekly limit).
 
 type Host = EngineInterface
-type Account = { name: string; accountUuid: string }
+// benched: automatic switches skip it (relay.sh bench <name>).
+type Account = { name: string; accountUuid: string; benched?: boolean }
 
 const NEAR_FULL = 95
 const BUSY_FRESH_MS = 6 * 60 * 60 * 1000
@@ -138,6 +139,12 @@ async function relay($: Host, sessionId: string, cwd: string, reason: string, re
   if (!armed) {
     await log($, `auto-switch is off: not switching away from ${account} (${reason}); ${resume.size} session(s) would have reopened`)
     return 'This account is out of usage. Auto-switch is off: use /account to switch.'
+  }
+  // Every other account benched: no switch could go anywhere, so none starts.
+  const others = (await readJson<{ accounts: Account[] }>($, `${p.dir}/accounts.json`, { accounts: [] })).accounts.filter(a => a.accountUuid !== account)
+  if (others.length > 0 && others.every(a => a.benched)) {
+    await log($, `every other account is benched: not switching away from ${account} (${reason}); ${resume.size} session(s) would have reopened`)
+    return 'This account is out of usage, and every other account is benched: use /account to switch by hand, or /account unbench <name>.'
   }
   // The entries this adds (sessions not listed already), to take back if no switch comes.
   const added = await withLock($, p.handoff, async () => {
@@ -404,8 +411,8 @@ function registerRow(on: Parameters<Register>[0]) {
     if (!(await isDesktop($))) return r
     await $.command.register({
       name: 'account',
-      description: 'Show or hide the account row: switch Claude accounts, turn auto-switch on or off; add <name> adds an account',
-      argumentHint: '[add <name>]',
+      description: 'Show or hide the account row: switch Claude accounts, turn auto-switch on or off; add <name> adds an account, bench/unbench <name> leaves one out of automatic switches or puts it back',
+      argumentHint: '[add|bench|unbench <name>]',
     })
     return r
   })
@@ -423,7 +430,15 @@ function registerRow(on: Parameters<Register>[0]) {
       if (ran === undefined || ran.exitCode !== 0) return { text: `Couldn't start adding ${name}${ran?.stderr.trim() ? `: ${ran.stderr.trim()}` : ''}. See ${p.log}.` }
       return { text: `Claude closes in a few seconds and opens signed out. Sign in to the account to add as ${name} and wait for the Code tab; then Claude comes back on this account and reopens this session.` }
     }
-    if (verb) return { text: 'Usage: /account (show or hide the row), or /account add <name>.' }
+    if (verb === 'bench' || verb === 'unbench') {
+      if (!name) return { text: `Usage: /account ${verb} <name>.` }
+      const p = await paths($)
+      const ran = await $.process.run(['/bin/bash', p.relay, verb, name]).catch(() => undefined)
+      await update($, redraw, n => n + 1)
+      if (ran === undefined || ran.exitCode !== 0) return { text: `Couldn't ${verb} ${name}${ran?.stderr.trim() ? `: ${ran.stderr.trim()}` : ''}.` }
+      return { text: ran.stdout.trim() }
+    }
+    if (verb) return { text: 'Usage: /account (show or hide the row), /account add <name>, or /account bench|unbench <name>.' }
     const { visible } = await rowState($)
     await update($, shown, () => !visible)
     await update($, step, (): Step => ({ kind: 'idle' }))
@@ -531,6 +546,7 @@ function registerRow(on: Parameters<Register>[0]) {
     return (
       <Box gap={1}>
         <Text weight="semibold">{me?.name ?? 'Unknown account'}</Text>
+        {me?.benched ? <Text dimColor>benched</Text> : null}
         {used ? <Text dimColor={near.length === 0}>{used}</Text> : null}
         {accounts
           .filter(a => a.accountUuid !== current)
@@ -542,12 +558,14 @@ function registerRow(on: Parameters<Register>[0]) {
                 <Box gap={1}>
                   <Text>{a.name} is signed out</Text>
                   <Button key={`signin-${a.name}`} label={`Sign in ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name, action: 'signin' })).then(() => drawNow($))} />
+                  {a.benched ? <Text dimColor>benched</Text> : null}
                 </Box>
               )
             }
             return (
               <Box gap={1}>
                 <Button key={`to-${a.name}`} label={`Switch to ${a.name}`} onPress={() => update($, step, (): Step => ({ kind: 'confirm', to: a.name, action: 'use' })).then(() => drawNow($))} />
+                {a.benched ? <Text dimColor>benched</Text> : null}
                 <Text dimColor>{out ? `out until ${out}` : lastKnown(snapshots[a.accountUuid], now)}</Text>
                 {exp - now < WARN_DAYS * DAY ? <Text>sign-in expires {when(new Date(exp).toISOString())}</Text> : null}
               </Box>

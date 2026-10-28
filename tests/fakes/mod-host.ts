@@ -1,7 +1,8 @@
 // Stand-in for the Claude Code host the mod runs in: one session's process, running the mod's
 // real hooks (mod/hooks/register.tsx) for one event, as Claude Code would. Files, processes
 // (relay.sh) and the clock are real; what the host would show (toasts, a submitted prompt, a
-// registered command) goes to $HOME/mod-host.log as JSON lines instead.
+// registered command, a command's reply, the row's text) goes to $HOME/mod-host.log as JSON
+// lines instead.
 //   bun tests/fakes/mod-host.ts <event> '<payload JSON>'
 // The session is described by the environment: CLAUDE_CODE_ENTRYPOINT and
 // CLAUDE_CODE_ACCOUNT_UUID (set by the app), MOD_SESSION (its id), MOD_IDENTITY (its login's
@@ -30,7 +31,17 @@ const host = {
     state.set(a.id, f(state.has(a.id) ? state.get(a.id) : a.init))
   },
 }
-const jsx = { jsx: () => null, jsxs: () => null, jsxDEV: () => null, Fragment: 'Fragment' }
+// The row as a tree of { type, props }, read back as text: a Button as [its label].
+type Node = { type: unknown; props: { children?: unknown; label?: string } }
+const element = (type: unknown, props: Node['props']): Node => ({ type, props })
+const jsx = { jsx: element, jsxs: element, jsxDEV: element, Fragment: 'Fragment' }
+const textOf = (n: unknown): string => {
+  if (n === null || n === undefined || n === false) return ''
+  if (typeof n === 'string' || typeof n === 'number') return String(n)
+  if (Array.isArray(n)) return n.map(textOf).filter(Boolean).join(' ')
+  const { type, props } = n as Node
+  return [type === 'Button' ? `[${props.label}]` : '', textOf(props.children)].filter(Boolean).join(' ')
+}
 plugin({
   name: 'claude-code host',
   setup(build) {
@@ -59,7 +70,7 @@ const $ = {
     },
   },
   clock: { now: async () => Date.now(), after: (ms: number, f: () => void) => void setTimeout(f, ms) },
-  ui: { toast: (text: string) => out('toast', text), resolve: () => ({}), invalidate: (event: string) => out('invalidate', event) },
+  ui: { toast: (text: string) => out('toast', text), resolve: () => ({ Box: 'Box', Button: 'Button', Text: 'Text' }), invalidate: (event: string) => out('invalidate', event) },
   prompt: { submit: async ({ text }: { text: string }) => out('prompt', text) },
   session: {
     id: async () => session,
@@ -100,4 +111,6 @@ const step = async (i: number, e: unknown): Promise<unknown> => {
     return h.onError($, e, next)
   }
 }
-await step(0, payload)
+const result = await step(0, payload)
+if (event === 'command.run') out('reply', (result as { text?: string } | undefined)?.text ?? '')
+if (event === 'ui.render') out('row', textOf(result))

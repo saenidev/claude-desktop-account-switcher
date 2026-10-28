@@ -334,6 +334,33 @@ wait_log "switch: done" 20
 mv "$T/bob.cookies" "$D/park/$B/Cookies"
 back_to_alice
 
+section "bench an account"
+benched_in_file() { jq -e --arg u "$1" 'any(.accounts[]; .accountUuid == $u and .benched == true)' "$D/accounts.json" >/dev/null; }
+check "bench bob" sh -c "'$REPO/relay.sh' bench bob | grep -q 'Benched bob: automatic switches skip it'"
+check "bob is benched in accounts.json" benched_in_file "$B"
+check "status says so" sh -c "'$REPO/relay.sh' status | grep -q 'bob .*(benched: automatic switches skip it)'"
+check "doctor says so" sh -c "'$REPO/relay.sh' doctor | grep -q '^ok  bob is benched: automatic switches skip it (relay.sh unbench bob)'"
+check "it's in history" sh -c "'$REPO/relay.sh' history | grep -q 'bench: bob benched'"
+check "a limit switch from alice goes past bob to carol" sh -c "'$REPO/relay.sh' plan --from $A | grep -q '^to: *carol'"
+check "benching carol too says nothing is left to switch to" sh -c "'$REPO/relay.sh' bench carol | grep -q \"every account but alice is benched, so when alice runs out there's no account to switch to\""
+check "a limit switch from alice finds nobody" sh -c "'$REPO/relay.sh' plan --from $A | grep -q 'nobody: .*benched'"
+check "doctor warns" sh -c "'$REPO/relay.sh' doctor | grep -q '^~~  every account but alice is benched'"
+check "a terminal limit doesn't move to a benched account" sh -c "! '$REPO/relay.sh' cli-switch 2>/dev/null"
+check "terminal claude stays on alice" test "$(cat "$H/keychain/Claude Code-credentials/$USER")" = token-for-alice
+jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+mark; check "the keep-alive runs" relay keepalive --force
+check "and still looks after benched bob's parked sign-in" wait_log "keepalive: bob .*renewed" 5
+check "and benched carol's" wait_log "keepalive: carol .*renewed" 5
+mark; check "use carol by hand while she's benched" relay use carol
+check "switches all the same" wait_log "swap: alice -> carol" 40
+check "unbench carol" relay unbench carol
+back_to_alice
+check "unbench bob" sh -c "'$REPO/relay.sh' unbench bob | grep -q 'bob is back in automatic switching'"
+check "bob isn't benched any more" sh -c "! jq -e --arg b '$B' 'any(.accounts[]; .accountUuid == \$b and has(\"benched\"))' '$D/accounts.json'"
+check "a limit switch from alice picks bob again" sh -c "'$REPO/relay.sh' plan --from $A | grep -q '^to: *bob'"
+check "bench with no such account fails" sh -c "! '$REPO/relay.sh' bench zed 2>'$T/err' && grep -q 'bench: no account named zed' '$T/err'"
+check "bench with no name asks for one" sh -c "! '$REPO/relay.sh' bench 2>'$T/err' && grep -q 'relay.sh bench <name>' '$T/err'"
+
 section "a limit switch waits for the keep-alive instead of being dropped"
 sleep 60 & holder=$!
 mkdir "$D/switch.lock"; echo "$holder" > "$D/switch.lock/pid"; echo keepalive > "$D/switch.lock/what"
@@ -554,6 +581,21 @@ check "a rate limit with usage left doesn't switch" sh -c "! jq -e 'any(.resume[
 CLAUDE_CODE_ENTRYPOINT=cli MOD_SESSION=m-term MOD_IDENTITY=api-key MOD_USAGE="$FULL" bun "$REPO/tests/fakes/mod-host.ts" classic.StopFailure '{"session_id":"m-term","cwd":"/tmp","error":"rate_limit"}'
 check "a terminal claude's limit on an API key lists nothing" sh -c "! jq -e 'any(.resume[]; .sessionId == \"m-term\")' '$D/handoff.json'"
 check "and moves nothing" test "$(signed_in_as "$P/Cookies")" = "$B"
+
+section "the mod: /account bench, the row, and a limit with every other account benched"
+mod_event "$B" m-bench command.run '{"command":"account","args":"bench alice"}'
+check "/account bench alice benches her" benched_in_file "$A"
+check "and says what that means" shown m-bench reply "Benched alice: automatic switches skip it"
+MOD_USAGE="$FULL" mod_event "$B" m-row ui.render '{"component":"AbovePrompt","props":{}}'
+check "the row shows alice benched, still with her Switch button" shown m-row row "[Switch to alice] benched"
+mark; MOD_USAGE="$FULL" mod_event "$B" m-benched classic.StopFailure '{"session_id":"m-benched","cwd":"/tmp","error":"rate_limit"}'
+check "a limit with every other account benched says so" shown m-benched toast "every other account is benched"
+check "and lists nothing to reopen" sh -c "! jq -e 'any(.resume[]; .sessionId == \"m-benched\")' '$D/handoff.json'"
+check "and starts no switch" sh -c "tail -n +$((MARK + 1)) '$D/relay.log' | grep -q 'every other account is benched: not switching away' && ! tail -n +$((MARK + 1)) '$D/relay.log' | grep -q 'launched relay away'"
+check "Claude stays on bob" test "$(signed_in_as "$P/Cookies")" = "$B"
+mod_event "$B" m-unbench command.run '{"command":"account","args":"unbench alice"}'
+check "/account unbench alice puts her back" shown m-unbench reply "alice is back in automatic switching"
+check "alice isn't benched any more" sh -c "! jq -e --arg a '$A' 'any(.accounts[]; .accountUuid == \$a and has(\"benched\"))' '$D/accounts.json'"
 
 section "the mod in Claude Code's own engine (claude plugin test)"
 # The engine applies Claude Code's own rules: how hooks may be registered, what each event
