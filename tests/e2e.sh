@@ -426,6 +426,10 @@ check "her sign-in is kept in backups" sh -c "ls '$D'/backups/*-removed-carol/pa
 check "no parked sign-in is left for her" test ! -e "$D/park/$C"
 
 section "a switch whose new sign-in doesn't come up goes back"
+# The sign-ins to another account than the one asked for, above, leave save errors of their own
+# (the app on an account whose list is a link): count only this switch's.
+app_errors() { cat "$H/app-errors.log" 2>/dev/null | wc -l | tr -d ' '; }
+errs=$(app_errors)
 cp "$D/park/$B/Cookies" "$T/bob.cookies"
 dud_signin "$D/park/$B/Cookies"
 mark; check "use bob is queued" relay use bob
@@ -434,7 +438,7 @@ check "the switch fails" wait_log "ERROR switch to bob failed" 20
 check "Claude is on alice again" test "$(signed_in_as "$P/Cookies")" = "$A"
 check "Claude is running" running
 check "and the shared folder is alice's again" test -d "$P/claude-code-sessions/$A/$OA" -a ! -L "$P/claude-code-sessions/$A/$OA"
-check "with nothing left unsaved" test ! -s "$H/app-errors.log"
+check "with nothing left unsaved" test "$(app_errors)" = "$errs"
 mv "$T/bob.cookies" "$D/park/$B/Cookies"
 
 section "a second command never kills one that's running"
