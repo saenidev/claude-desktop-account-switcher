@@ -513,7 +513,7 @@ finish_swap() {
   local from to was="${1:-}" src dst b="" n=0; read -r from to < "$SWAPPING"
   if [ -n "$to" ] && ! grep -qx back "$SWAPPING" && [ "$(folder_account "$DEFAULT_DIR")" = "$to" ]; then
     log "recover: the cut-off switch to $(account_field "$to" name) had worked"
-    rm -f "$SWAPPING"; swap_cli "$to"; return 0
+    rm -f "$SWAPPING"; cli_follow "$to"; return 0
   fi
   [ -n "$(default_pids)" ] && { quit_default; was=1; }
   # No moves noted: none made, or the file is from a relay that didn't note them. Then how far
@@ -628,6 +628,42 @@ swap_cli_now() {
   fi
   cli_restore "$target" && log "terminal: $(account_field "$cur" name) -> $(account_field "$target" name)" \
     && swap_rc_pointers "$cur" "$target"
+}
+# After the app moved: terminal claude follows, and with it everything that runs the real claude
+# on this login (Sesame Link, LearnHarness, ...), running sessions included: claude reads the
+# login again on its next request. With no parked login, say how to make one. With one that no
+# longer works, only a new sign-in can move the terminal, so open one.
+cli_follow() {
+  local id="$1" name; name=$(account_field "$id" name)
+  swap_cli "$id" && return 0
+  if cli_dead "$id"; then
+    notify "Terminal claude stayed on $(account_field "$(cli_account)" name): $name's terminal login no longer works. Sign in from the Terminal window that just opened."
+    cli_signin_window "$id"
+  elif ! cli_parked "$id"; then
+    notify "Terminal claude stayed on $(account_field "$(cli_account)" name). Run relay.sh cli-login $name once so it follows the app."
+  fi
+  return 0
+}
+# A Terminal window on cli-login, which needs one click in the browser and leaves the terminal on
+# the app's account.
+cli_signin_window() {
+  local name f="$DIR/cli-login.command"; name=$(account_field "$1" name)
+  printf '#!/bin/bash\nexec /bin/bash %q cli-login %q\n' "$DIR/relay.sh" "$name" > "$f"; chmod +x "$f"
+  log "terminal: opening a sign-in window for $name's terminal login"
+  open "$f" || log "terminal: couldn't open the sign-in window; run relay.sh cli-login $name"
+}
+# Keep the live login's parked copy current, so a `/login` by hand, which replaces the live login
+# without parking it, can't lose the outgoing account's newest copy. A login being written has
+# its token in the Keychain a moment before ~/.claude.json names its account, so both must hold
+# still across a few seconds before anything is parked.
+cli_keep_parked() {
+  local id live; id=$(cli_account); [ -n "$(account_field "$id" name)" ] || return 0
+  live=$(keychain_digest "$CLI_SVC" "$USER")
+  [ "$live" != "$(printf '' | shasum -a 256 | cut -d' ' -f1)" ] || return 0
+  [ "$live" != "$(keychain_digest "$CLI_PARK_SVC" "$id")" ] || return 0
+  pause 3
+  [ "$(cli_account)" = "$id" ] && [ "$(keychain_digest "$CLI_SVC" "$USER")" = "$live" ] || return 0
+  locked "$DIR/cli.lock" cli_park "$id"
 }
 # Terminal `claude rc` keeps, per project folder, the session it reattaches on its next start
 # (~/.claude/projects/<folder>/bridge-pointer.json). That session is the terminal account's;
@@ -783,6 +819,7 @@ cli_renew_now() {
     jq_write "$STATE" --arg a "$id" --argjson t "$(date +%s)" '.cliDead[$a] = $t'
     log "terminal: $name's parked terminal login no longer works ($out); terminal claude won't move to it until relay.sh cli-login $name"
     notify "$name's terminal login no longer works. Run relay.sh cli-login $name in a terminal."
+    CLI_SIGNIN_DUE+=" $id"
     return 1
   fi
   log "terminal: $name's parked terminal login wasn't renewed (it ran out $(date -u -r "$before" '+%F %T') UTC): $out"; return 1
@@ -816,8 +853,39 @@ cmd_cli_renew() {
     esac
   done
 }
-# Renew every parked terminal login that's due (from usage --renew and the daily keep-alive).
-cli_renew_all() { local id; for id in $(account_ids); do cli_renew_due "$id" && cli_renew "$id"; done; return 0; }
+# Renew every parked terminal login that's due (from usage --renew and the daily keep-alive), and
+# ask for a new sign-in as soon as one is found dead, so it's ready before the next switch needs it.
+CLI_SIGNIN_DUE=""
+cli_renew_all() {
+  local id
+  cli_keep_parked
+  for id in $(account_ids); do cli_renew_due "$id" && cli_renew "$id"; done
+  for id in $CLI_SIGNIN_DUE; do cli_signin_window "$id"; done
+  return 0
+}
+# What else uses the terminal login. Anything that runs the real claude on it follows a move by
+# itself. Two kinds don't: a process given its own login (CLAUDE_CODE_OAUTH_TOKEN,
+# CLAUDE_CONFIG_DIR) stays on that account, and an app that keeps its own copy of the login can
+# renew that copy after the terminal moved, which spends the parked one and revokes it. Prints
+# one "ok|~~|!! text" line each. Environment values never leave this function: names only.
+cli_consumers() {
+  local c="$HOME/.config/codexbar/config.json" src pid env pinned=""
+  if [ -f "$c" ]; then
+    src=$(jq -r '.providers[]? | select(.id == "claude") | if .enabled == false then "off" else (.source // "auto") end' "$c" 2>/dev/null)
+    case "$src" in
+      oauth|auto) echo "!! CodexBar keeps its own copy of the terminal login (Claude source: $src), which revokes parked logins: set its Claude source to CLI" ;;
+      "") ;;
+      *) echo "ok CodexBar holds no copy of the terminal login (Claude source: $src)" ;;
+    esac
+  fi
+  for pid in $(pgrep -x claude 2>/dev/null); do
+    env=$(ps -E -p "$pid" -o command= 2>/dev/null | tr ' ' '\n' | grep -oE '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CONFIG_DIR|CLAUDE_CODE_ENTRYPOINT=claude-desktop)' | tr '\n' ' ')
+    case "$env" in *claude-desktop*) continue ;; *CLAUDE_*) pinned+=" $pid" ;; esac
+  done
+  [ -z "$pinned" ] || echo "~~ claude process(es)$pinned have a login of their own and won't follow a switch"
+  [ -f "$CLI_MIRROR" ] && echo "ok running terminal claude follows a move on its next request" \
+    || echo "~~ no $CLI_MIRROR: running terminal claude takes up to a minute to follow a move"
+}
 
 # ---- Looking at it -----------------------------------------------------------------------------
 
@@ -879,6 +947,10 @@ cmd_doctor() {
       elif cli_parked "$id"; then ok "$(account_field "$id" name) has a parked terminal login"
       else warn "$(account_field "$id" name) has no parked terminal login, so terminal claude stays put when the app moves to it: relay.sh cli-login $(account_field "$id" name)"; fi
     done
+    local line
+    while IFS= read -r line; do
+      case "$line" in "ok "*) ok "${line#ok }" ;; "~~ "*) warn "${line#\~\~ }" ;; *) fail "${line#!! }" ;; esac
+    done < <(cli_consumers)
   fi
   local lost; lost=$(check_sessions)
   [ -z "$lost" ] && ok "no sessions lost from the shared list since the last check" \
@@ -1133,9 +1205,7 @@ swap_to() {
   if [ "$(folder_account "$DEFAULT_DIR")" = "$target" ]; then
     rm -f "$SWAPPING"; UNDO=""
     log "swap: $(account_field "$cur" name) -> $(account_field "$target" name)"
-    # Terminal claude follows, when a parked terminal login exists; without one, say how to make it.
-    swap_cli "$target" || cli_parked "$target" \
-      || notify "Terminal claude stayed on $(account_field "$(cli_account)" name). Run relay.sh cli-login $(account_field "$target" name) once so it follows the app."
+    cli_follow "$target"
     return 0
   fi
   log "swap: $(account_field "$target" name)'s sign-in did not come up; going back to $(account_field "$cur" name)"

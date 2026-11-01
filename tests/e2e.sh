@@ -295,6 +295,87 @@ back_to_alice() {
   wait_for "[ -z \"\$(job_pid)\" ]" 40; jq '.cooldowns = {}' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
 }
 
+section "a switch to an account whose parked terminal login no longer works"
+cp "$BCLI" "$T/bob.cli"; jq --arg b "$B" '.cliDead[$b] = 1' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+rm -f "$H/windows.log"; : > "$H/notifications.log"
+mark; relay use bob >/dev/null; check "the app switches to bob" wait_log "swap: alice -> bob" 40
+wait_for "[ -z \"\$(job_pid)\" ]" 40
+check "terminal claude stays on alice" test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "token-for-alice:$A"
+check "you're told, naming both accounts" grep -q "Terminal claude stayed on alice: bob's terminal login no longer works" "$H/notifications.log"
+check "a sign-in window opens" test "$(cat "$H/windows.log")" = "$D/cli-login.command"
+echo "$B" > "$H/cli-login-as"
+check "signing in from that window works" "$D/cli-login.command"
+rm -f "$H/cli-login-as"
+check "and terminal claude is on bob, like the app" test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "fresh-token-for-$B:$B"
+check "alice's terminal login was saved first" test "$(cat "$H/keychain/desktop-account-switcher-cli/$A")" = token-for-alice
+check "bob's isn't marked dead any more" sh -c "! jq -e --arg b '$B' '.cliDead[\$b]' '$D/state.json' >/dev/null"
+: > "$H/windows.log"; back_to_alice
+check "the next switch moves the terminal with no window" test ! -s "$H/windows.log"
+check "terminal claude followed back to alice" test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "token-for-alice:$A"
+mv "$T/bob.cli" "$BCLI"
+
+section "a claude already running follows a terminal move (real claude, stand-in API)"
+# What Sesame Link, LearnHarness and the like rely on: they run the real claude on this login and
+# do nothing at a switch. If a Claude Code update stops a running claude reading the login again,
+# this fails. It uses the Keychain stand-in and tests/fakes/api-answers.ts: no real account.
+ALIVE="$H/keychain/Claude Code-credentials/$USER"; cp "$ALIVE" "$T/alice.live"; cp "$BCLI" "$T/bob.cli"
+cli_login_json stand-in-alice $(( ($(date +%s) + 7*3600) * 1000 )) | sed 's/at-stand-in-alice/stand-in-alice/' > "$ALIVE"
+cli_login_json stand-in-bob $(( ($(date +%s) + 7*3600) * 1000 )) | sed 's/at-stand-in-bob/stand-in-bob/' > "$BCLI"
+cp "$ALIVE" "$H/.claude/.credentials.json"
+mkdir -p "$T/running"; RUNDIR=$(cd "$T/running" && pwd -P)
+jq --arg w "$RUNDIR" '.hasCompletedOnboarding = true | .projects[$w].hasTrustDialogAccepted = true' "$H/.claude.json" > "$T/cj" && mv "$T/cj" "$H/.claude.json"
+bun "$REPO/tests/fakes/api-answers.ts" "$T/answers.log" > "$T/answers.port" & ANSWERS=$!
+wait_for "[ -s '$T/answers.port' ]" 10
+RUNTMUX="cdas-e2e-$$"
+/opt/homebrew/bin/tmux -L "$RUNTMUX" new-session -d -x 110 -y 30 -c "$RUNDIR" "env -i HOME='$H' USER='$USER' PATH='$H/.local/bin:$REAL_PATH' TERM=xterm-256color LANG=en_US.UTF-8 ANTHROPIC_BASE_URL=http://127.0.0.1:$(cat "$T/answers.port") CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 '$REAL_CLAUDE' --model haiku"
+say_running() { /opt/homebrew/bin/tmux -L "$RUNTMUX" send-keys -t 0 -l "$1"; sleep 1; /opt/homebrew/bin/tmux -L "$RUNTMUX" send-keys -t 0 Enter; }
+sleep 8; say_running one
+check "the running claude is on alice" wait_for "[ \"\$(tail -1 '$T/answers.log' 2>/dev/null)\" = stand-in-alice ]" 40
+sleep 3
+check "the relay moves the terminal to bob" relay cli-use bob
+say_running two
+check "its next message goes out as bob, with no restart" wait_for "[ \"\$(wc -l < '$T/answers.log' | tr -d ' ')\" -ge 2 ] && [ \"\$(tail -1 '$T/answers.log')\" = stand-in-bob ]" 40
+/opt/homebrew/bin/tmux -L "$RUNTMUX" kill-server 2>/dev/null; kill "$ANSWERS" 2>/dev/null; wait "$ANSWERS" 2>/dev/null
+check "and the relay moves it back" relay cli-use alice
+rm -f "$H/.claude/.credentials.json"; cp "$T/alice.live" "$ALIVE"; mv "$T/bob.cli" "$BCLI"
+jq --arg u "$A" '.oauthAccount.accountUuid = $u' "$H/.claude.json" > "$T/cj" && mv "$T/cj" "$H/.claude.json"
+
+section "what else uses the terminal login"
+mkdir -p "$H/.config/codexbar"; CB="$H/.config/codexbar/config.json"
+echo '{"providers":[{"id":"claude","enabled":true,"source":"oauth"}]}' > "$CB"
+check "doctor fails an app keeping its own copy" sh -c "'$REPO/relay.sh' doctor | grep -q '^!!  CodexBar keeps its own copy'"
+echo '{"providers":[{"id":"claude","enabled":true}]}' > "$CB"
+check "its default source counts too" sh -c "'$REPO/relay.sh' doctor | grep -q '^!!  CodexBar keeps its own copy'"
+echo '{"providers":[{"id":"claude","enabled":true,"source":"cli"}]}' > "$CB"
+check "doctor is happy with its CLI source" sh -c "'$REPO/relay.sh' doctor | grep -q '^ok  CodexBar holds no copy'"
+echo '{"providers":[{"id":"claude","enabled":false,"source":"oauth"}]}' > "$CB"
+check "or with Claude off in it" sh -c "'$REPO/relay.sh' doctor | grep -q '^ok  CodexBar holds no copy'"
+rm -rf "$H/.config/codexbar"
+
+section "the live login's parked copy stays current, so /login by hand can't lose it"
+cp "$H/keychain/desktop-account-switcher-cli/$A" "$T/alice.parked"; cp "$H/keychain/desktop-account-switcher-cli/$C" "$T/carol.parked"; cp "$ALIVE" "$T/alice.live"
+printf 'token-for-alice-rotated' > "$ALIVE"
+check "a background check saves the rotated login" relay usage --quiet --renew --force
+check "alice's parked copy is the rotated one" test "$(cat "$H/keychain/desktop-account-switcher-cli/$A")" = token-for-alice-rotated
+printf 'token-for-alice-after-login' > "$ALIVE"
+jq --arg u "$C" '.oauthAccount.accountUuid = $u' "$H/.claude.json" > "$T/cj" && mv "$T/cj" "$H/.claude.json"
+jq 'del(.usageCheckedAt)' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+cp "$H/keychain/desktop-account-switcher-cli/$A" "$T/a.before"
+relay usage --quiet --renew --force
+check "a /login to another account never lands in the old account's park" cmp -s "$T/a.before" "$H/keychain/desktop-account-switcher-cli/$A"
+check "it's parked as the account it signed in to" test "$(cat "$H/keychain/desktop-account-switcher-cli/$C")" = token-for-alice-after-login
+cp "$T/alice.parked" "$H/keychain/desktop-account-switcher-cli/$A"; cp "$T/carol.parked" "$H/keychain/desktop-account-switcher-cli/$C"; cp "$T/alice.live" "$ALIVE"
+jq --arg u "$A" '.oauthAccount.accountUuid = $u' "$H/.claude.json" > "$T/cj" && mv "$T/cj" "$H/.claude.json"
+
+section "a parked login found dead asks for a new sign-in right away"
+cp "$BCLI" "$T/bob.cli"; cli_login_json rt-bob-revoked $(( ($(date +%s) - 3600) * 1000 )) > "$BCLI"
+jq 'del(.cliRenewTriedAt, .cliDead)' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+: > "$H/windows.log"
+relay usage --quiet --renew --force
+check "a sign-in window opens for it, before any switch" test "$(cat "$H/windows.log")" = "$D/cli-login.command"
+check "for bob" grep -q "cli-login bob" "$D/cli-login.command"
+mv "$T/bob.cli" "$BCLI"; jq 'del(.cliRenewTriedAt, .cliDead)' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
+
 section "a limit switch skips an account whose parked sign-in has run out"
 cp "$D/park/$B/Cookies" "$T/bob.cookies"; expire_signin "$D/park/$B/Cookies"
 check "status says bob's sign-in ran out" sh -c "'$REPO/relay.sh' status | grep -q 'bob .*ran out'"

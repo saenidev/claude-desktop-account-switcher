@@ -1,6 +1,7 @@
 #!/bin/bash
 # Stand-in for macOS open(1): starts the stand-in Claude app, or records a claude:// link
-# it was asked to open (in $HOME/links.log).
+# it was asked to open (in $HOME/links.log), or a .command file (in $HOME/windows.log), which
+# the real one would run in a Terminal window.
 app="" url="" args=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -8,6 +9,7 @@ while [ $# -gt 0 ]; do
     -n|-g) shift ;;
     --args) shift; args=("$@"); break ;;
     claude://*) url="$1"; shift ;;
+    *.command) echo "$1" >> "$HOME/windows.log"; exit 0 ;;
     *) shift ;;
   esac
 done
