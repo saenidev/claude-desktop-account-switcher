@@ -726,7 +726,7 @@ cmd_cli_login() {
   if [ "$got" != "$id" ]; then
     local who; who=$(account_field "$got" name); who=${who:-${got:-nobody}}
     cli_put_back "$cur" "$id"
-    die "cli-login: that sign-in was $who, not $name; terminal claude is on $(account_field "$(cli_account)" name)"
+    die "cli-login: that sign-in was $who, not $name; terminal claude is on $(account_field "$(cli_account)" name). Your browser approves whichever account it's signed in to: switch it to $name at claude.ai (or copy the sign-in link into a browser signed in as $name), then run this again."
   fi
   locked "$DIR/cli.lock" cli_park "$id" || die "cli-login: signed in as $name, but couldn't park that login"
   log "terminal: parked $name's terminal login"
