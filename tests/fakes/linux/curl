@@ -1,0 +1,12 @@
+#!/bin/bash
+# Stand-in for curl, for the one request the switcher makes: an account's usage from Anthropic
+# (api/oauth/usage), with the login's access token given on stdin (-K -). The stand-in tokens
+# are "at-<name>..." (or "stand-in-<name>", for a real claude): the answer is
+# $HOME/api/usage/<name>.json, with status 200; 401 with no such file; 429 for everyone while
+# $HOME/api/limited exists. Each request is noted in $HOME/api/calls.log, by name only.
+case "$*" in *api/oauth/usage*) ;; *) echo "stand-in curl: not a usage request: $*" >&2; exit 2 ;; esac
+token=$(sed -n 's/.*Bearer \([^"]*\)".*/\1/p'); name=${token#at-}; name=${name#stand-in-}; name=${name%%[-+]*}
+mkdir -p "$HOME/api"; echo "$name" >> "$HOME/api/calls.log"
+if [ -e "$HOME/api/limited" ]; then printf '{}\n429'
+elif [ -f "$HOME/api/usage/$name.json" ]; then cat "$HOME/api/usage/$name.json"; printf '\n200'
+else printf '{}\n401'; fi

@@ -2,7 +2,7 @@
 
 Use two or more Claude subscriptions in Claude Desktop as if they were one. When the account you're on runs out of usage, the app switches to the next account with usage left by itself and reopens the conversation you were in. Your sessions, projects, settings and config stay exactly the same; only the subscription changes. You can also switch by hand.
 
-macOS only. Built against Claude Desktop 3.1623 / Claude Code 2.1.30x.
+The desktop app part is macOS only, built against Claude Desktop 3.1623 / Claude Code 2.1.32x. On a Linux server, where there is no desktop app, it does the same for terminal `claude` and everything that runs on its login: see [On a Linux server](#on-a-linux-server).
 
 ## Before you install
 
@@ -56,7 +56,7 @@ Finally, if you use `claude` in a terminal, run `relay.sh cli-login <name>` once
 - **Everything that runs the real `claude` follows with the terminal.** Sesame Link, LearnHarness and any other tool that starts `claude` on this login need nothing of their own: a running `claude` reads the login again on its next request, with no restart (`tests/e2e.sh` runs this against the real `claude`). Two kinds don't follow, and `doctor` names both: a process given its own login (`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`), and an app that keeps its own copy of the login. Set CodexBar's Claude source to CLI, since its OAuth source is that second kind.
 - **Terminal `claude rc` starts fresh on the new account.** `claude rc` remembers, per folder, the session to reattach next time, but that session belongs to the account it was made on, and on another account rc would come up with no session at all. When the terminal moves, each folder's record is put aside for the old account and the new account's comes back. A folder with none keeps its Remote Control environment and gets a new session the next time you run `claude rc`. A folder that `claude rc` is serving at that moment is left alone; restart it after a switch.
 - **Remote Control on a Code tab session starts a new link after a switch.** A session remembers the Remote Control link it last had, and turning Remote Control on tries that link again. A link made on the other account can't be reattached, so the switch failed once ("Previous session is unavailable") and worked on the second try. While Claude is closed for a switch, the relay forgets those links, so the first try makes a new one on the new account. The old links stay in the other account's claude.ai list.
-- **A limit in a terminal session moves only the terminal.** A terminal `claude`, or one run from a Code tab session's shell, signs in with the terminal login. When it hits a limit (and auto-switch is on), the mod cools that account down and moves only the terminal login; the app is left alone. New `claude` processes pick up the swapped login; whether one that's already open does isn't tested yet.
+- **A limit in a terminal session moves only the terminal.** A terminal `claude`, or one run from a Code tab session's shell, signs in with the terminal login. When it hits a usage limit (and auto-switch is on), the mod starts `relay.sh cli-switch`, which reads that account's usage from Anthropic, and if it is out, cools it down and moves only the terminal login; the app is left alone. An account that reads as having usage left is not switched away from (several sessions hit a limit together, and the first has already moved the login). A session with a login of its own (an API key, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`) moves nothing. A `claude` that's already open uses the new login on its next message. Before 2026-11-12 this never fired: the mod asked Claude Code which login the session had, and Claude Code refuses a mod that.
 - **Scripted runs retry:** `relay.sh run -- -p "…" [claude args]` runs `claude`, and on a usage limit moves the terminal login and runs it once more.
 - **Don't use another account switcher alongside this**: two tools writing the app's sign-in files fight each other.
 
@@ -96,6 +96,40 @@ Day to day, everything is in the `/account` row. `~/.claude/desktop-account-swit
 
 `add`, `signin`, `use` and `restart` close Claude, so they run as a launchd job and return at once; they work from inside Claude too. They take `--resume <sessionId>` to reopen a session afterwards. One runs at a time: while a switch, sign-in or restart (or the keep-alive) is running, another (and `remove`) is turned away with "a switch or sign-in is running; try again when it's done". An automatic switch that comes while the keep-alive runs waits for it instead. How it all works is in [docs/how-it-works.md](docs/how-it-works.md).
 
+## On a Linux server
+
+A server has no desktop app. What signs in there is terminal `claude`'s login, the file `~/.claude/.credentials.json`, and everything that runs the real `claude` or reads that file uses it: T3 Code, a proxy, your scripts. The switcher swaps that one file for another account's, so all of them move together and no session or setting changes. A `claude` that's already running uses the new login on its next request, with no restart.
+
+You need `claude` signed in, `jq`, `curl`, `git` and systemd.
+
+```bash
+git clone https://github.com/saenidev/claude-desktop-account-switcher.git
+cd claude-desktop-account-switcher
+./relay.sh setup <name>
+~/.claude/desktop-account-switcher/relay.sh add <other name> [<its email>]
+```
+
+`setup` records the account `claude` is signed in to as `<name>`, installs the mod, turns auto-switch on and starts a systemd user timer. `add` signs the other account in without touching the one in use (after [T3 Code's guide to separate Claude accounts](https://github.com/pingdotgg/t3code/blob/main/docs/user/providers-claude.md)): it runs `claude auth login` with `CLAUDE_CONFIG_DIR` set to a throwaway folder, so the new login lands there and is parked from there. `claude` prints a link. Open it in a browser signed in to that account at claude.ai (the browser approves whichever account it's signed in to, so use a private window if yours is on another), and paste the code it shows back into the terminal. A sign-in that turns out to be a different account is refused. That is the only time you sign in; `relay.sh signin <name>` does it again if a login ever stops working.
+
+Then it runs by itself. Every two minutes the timer runs `relay.sh tick`, which:
+
+- **Reads every account's usage from Anthropic** (at most every 10 minutes; the account in use every round once it's within 10 points of the mark below).
+- **Moves on before the account runs out.** At 95% of the 5-hour or weekly window (`"switchAt"` in `config.json`), terminal `claude` moves to the next account that is under 95%, so sessions that are running never meet the limit. With no such account it stays and uses the rest. Once a window is used up it moves to any account that isn't, and the spent one cools down until its reset. When a model's own weekly limit is used up (Fable weekly), it moves to an account with nothing used up.
+- **Renews parked logins** whose access token ran out, with `claude` in a throwaway home, as on a Mac. One that was revoked is marked, never put live, and you're told to run `signin`.
+- **Updates itself.** Once an hour it pulls this repo (`git pull --ff-only`) if the checkout has no changes of its own, and runs the new `setup`. `relay.sh` and the mod are links into the checkout, so the new version is in use from the next round. `"autoUpdate": false` in `config.json` turns it off; `relay.sh self-update` does it now.
+
+The mod covers the gap between rounds: a session that hits a usage limit starts the same switch at once.
+
+- **`relay.sh use <name>`** moves terminal `claude` by hand. The timer leaves an account you chose alone until it is out.
+- **`bench`, `unbench`, `remove`, `status`, `usage`, `history`, `doctor`, `run`** work as on a Mac. `relay.sh help` lists them. Commands for the desktop app (`restart`, `keepalive`) say Linux has none.
+- **Parked logins are files**, `park/<accountUuid>/credentials.json`, readable only by you (0600 in a 0700 folder), the same as the live `~/.claude/.credentials.json`. Linux has no Keychain to put them in.
+- **Notifications:** a server has nowhere to show one. Everything is in `relay.log`; if you put a program at `~/.claude/desktop-account-switcher/notify`, it is run with each message as its one argument.
+- **Six switches in an hour stop the timer's switching** for the rest of that hour, and say so.
+- **The timer needs linger** to run while you're logged out: `sudo loginctl enable-linger $USER` (`doctor` checks).
+- **What follows a switch:** anything that reads `~/.claude/.credentials.json` each time it needs a token. A process with its own login (`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`) stays where it is, and `doctor` names it. Something that copies the login and renews its copy by itself would revoke the parked one, as on a Mac.
+
+To uninstall: `systemctl --user disable --now desktop-account-switcher.timer`, delete the two `desktop-account-switcher.*` units in `~/.config/systemd/user`, uninstall the plugin as below, and remove `~/.claude/desktop-account-switcher` (that deletes the parked logins).
+
 ## Rules that keep it safe
 
 - **One Claude window at a time.** The app has no single-instance lock; two windows on one folder share a sign-in (signing out in one signs out both) and fight over files. Open Claude from the Dock as usual; don't start a second copy.
@@ -124,4 +158,4 @@ Day to day, everything is in the `/account` row. `~/.claude/desktop-account-swit
 
 ## Developing
 
-`tests/e2e.sh` runs every flow end to end against a stand-in Claude app in a throwaway home folder, and the mod's hooks in a stand-in Claude Code host, in Claude Code's own engine (every order of a session's events, and of two sessions' interleaved, at any length), and in a real `claude` session hitting a usage limit against a stand-in API (needs `bun` and `claude`; about ten minutes; `E2E_FAILFAST=1` stops at the first failure). `tests/sweep.sh` runs two parts in every state they can be in: a switch cut off at each of its moves, and the account a limit switch picks (about 45 minutes). `tests/host/live.sh` runs the mod in a real `claude -p` session, as the app starts one, in a throwaway home folder (about a minute; it uses a few cents of the signed-in account's usage, so it's run by hand). See [docs/how-it-works.md](docs/how-it-works.md#testing).
+`tests/e2e.sh` runs every flow end to end against a stand-in Claude app in a throwaway home folder, and the mod's hooks in a stand-in Claude Code host, in Claude Code's own engine (every order of a session's events, and of two sessions' interleaved, at any length), and in a real `claude` session hitting a usage limit against a stand-in API (needs `bun` and `claude`; about ten minutes; `E2E_FAILFAST=1` stops at the first failure). `tests/sweep.sh` runs two parts in every state they can be in: a switch cut off at each of its moves, and the account a limit switch picks (about 45 minutes). `tests/linux.sh` is the same for Linux, run on a Linux machine (about a minute): setup, a sign-in that never touches the live login, every switch the timer makes, renewals, self-update against a throwaway git remote, then the real `claude` following a move and hitting a usage limit, both against a stand-in API. `tests/host/live.sh` runs the mod in a real `claude -p` session, as the app starts one, in a throwaway home folder (about a minute; it uses a few cents of the signed-in account's usage, so it's run by hand). See [docs/how-it-works.md](docs/how-it-works.md#testing).

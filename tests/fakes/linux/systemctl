@@ -1,0 +1,12 @@
+#!/bin/bash
+# Stand-in for systemctl --user, as much as the switcher uses: it remembers which units are
+# enabled and active in $HOME/systemd.active, and notes each call in $HOME/systemd.log. It
+# starts nothing: the tests run `relay.sh tick` themselves, as the timer would.
+[ "$1" = --user ] && shift
+echo "$*" >> "$HOME/systemd.log"; touch "$HOME/systemd.active"
+case "$1" in
+  daemon-reload) ;;
+  enable|restart) for u in "$@"; do case "$u" in *.timer) grep -qxF "$u" "$HOME/systemd.active" || echo "$u" >> "$HOME/systemd.active" ;; esac; done ;;
+  is-active) for u in "$@"; do case "$u" in *.timer|*.service) grep -qxF "$u" "$HOME/systemd.active" || exit 3 ;; esac; done ;;
+  *) exit 1 ;;
+esac

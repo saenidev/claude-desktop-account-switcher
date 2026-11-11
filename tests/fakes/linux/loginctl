@@ -1,0 +1,4 @@
+#!/bin/bash
+# Stand-in for loginctl: says whether the user's services keep running after logout (linger),
+# from $HOME/linger ("yes" unless the file says otherwise).
+case "$1" in show-user) cat "$HOME/linger" 2>/dev/null || echo yes ;; *) exit 1 ;; esac
