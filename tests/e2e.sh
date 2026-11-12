@@ -342,53 +342,6 @@ check "the next switch moves the terminal with no window" test ! -s "$H/windows.
 check "terminal claude followed back to alice" test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "token-for-alice:$A"
 mv "$T/bob.cli" "$BCLI"
 
-section "the terminal timer moves terminal claude before its account runs out, and leaves the app alone"
-TICK_PLIST="$H/Library/LaunchAgents/local.desktop-account-switcher.tick.plist"
-term_is() { test "$(cat "$H/keychain/Claude Code-credentials/$USER"):$(jq -r .oauthAccount.accountUuid "$H/.claude.json")" = "$1"; }
-# What the last reading from Anthropic says <uuid> has used: reading <uuid> <5-hour %> [<weekly %>]
-reading() {
-  jq --arg a "$1" --argjson f "$2" --argjson w "${3:-10}" --argjson at "$(date +%s)000" --arg r "$(date -u -v+2H +%FT%TZ)" --arg wr "$(date -u -v+3d +%FT%TZ)" \
-    '.[$a] = {at: $at, source: "anthropic", windows: [{kind: "five_hour", percentUsed: $f, resetsAt: $r}, {kind: "seven_day", percentUsed: $w, resetsAt: $wr}]}' "$D/usage.json" > "$T/u" && mv "$T/u" "$D/usage.json"
-}
-# One round, as launchd runs it, with the usage figures above taken as fresh.
-tick() { jq --argjson t "$(date +%s)" '.usageCheckedAt = $t' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"; relay tick; }
-check "setup installed the timer, a round every two minutes" sh -c "plutil -extract StartInterval raw '$TICK_PLIST' | grep -qx 120 && plutil -extract ProgramArguments.2 raw '$TICK_PLIST' | grep -qx tick"
-check "and loaded it" launchctl print "gui/$(id -u)/local.desktop-account-switcher.tick"
-relay setup >/dev/null 2>&1
-check "setup again leaves it as it is" test "$(grep -c 'terminal timer installed' "$D/relay.log")" = 1
-cp "$D/config.json" "$T/config.saved"; cp "$D/usage.json" "$T/usage.saved"
-relay bench carol >/dev/null   # alice and bob only, here
-jq '.armed = false' "$D/config.json" > "$T/c" && mv "$T/c" "$D/config.json"
-check "with the app's auto-switch off, the terminal's is off too" sh -c "'$REPO/relay.sh' cli-auto | grep -qx 'terminal auto-switch: off'"
-reading "$A" 96; reading "$B" 5
-mark; tick
-check "so a round with alice at 96% moves nothing" term_is "token-for-alice:$A"
-check "cli-auto on turns it on alone" sh -c "'$REPO/relay.sh' cli-auto on | grep -qx 'terminal auto-switch: on' && jq -e '.armed == false' '$D/config.json'"
-check "status says so" sh -c "'$REPO/relay.sh' status | grep -qx 'terminal auto-switch: on, timer every two minutes'"
-check "doctor too" sh -c "'$REPO/relay.sh' doctor | grep -q '^ok  terminal timer runs every two minutes; terminal claude moves on at 95%'"
-mark; tick
-check "a round with alice at 96% moves terminal claude to bob" term_is "token-for-bob:$B"
-check "alice's terminal login was parked first" test "$(cat "$H/keychain/desktop-account-switcher-cli/$A")" = token-for-alice
-check "it's logged with why" wait_log "watch: alice is nearly out (5-hour 96%); terminal claude moved to bob" 5
-check "the app stays on alice" test "$(signed_in_as "$P/Cookies")" = "$A"
-check "and isn't closed or switched" sh -c "[ -n \"\$(pgrep -f '^$APPDIR/Contents/MacOS/Claude')\" ] && ! tail -n +$((MARK + 1)) '$D/relay.log' | grep -q 'swap'"
-check "alice isn't cooling down: she has usage left" sh -c "! jq -e --arg a $A '.cooldowns[\$a]' '$D/state.json'"
-reading "$B" 100; mark; tick
-check "bob out of usage moves it back to alice, who isn't" term_is "token-for-alice:$A"
-check "and bob cools down" jq -e --arg b "$B" '.cooldowns[$b]' "$D/state.json"
-jq '.cooldowns = {} | del(.pinned, .watchSaid, .watchMoves)' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
-reading "$A" 5; reading "$B" 96
-relay cli-use bob >/dev/null; mark; tick
-check "an account chosen with cli-use isn't left early" term_is "token-for-bob:$B"
-check "a limit in a terminal session moves it with the app's auto-switch off" sh -c "'$REPO/relay.sh' cli-switch && [ \"\$(jq -r .oauthAccount.accountUuid '$H/.claude.json')\" = '$A' ]"
-relay cli-auto off >/dev/null; relay cli-use bob >/dev/null; jq 'del(.pinned)' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
-mark; tick
-check "cli-auto off: a round moves nothing" term_is "token-for-bob:$B"
-check "and cli-switch neither" sh -c "'$REPO/relay.sh' cli-switch; [ \"\$(jq -r .oauthAccount.accountUuid '$H/.claude.json')\" = '$B' ]"
-relay cli-use alice >/dev/null; relay unbench carol >/dev/null
-mv "$T/config.saved" "$D/config.json"; mv "$T/usage.saved" "$D/usage.json"
-jq '.cooldowns = {} | del(.pinned, .watchSaid, .watchMoves)' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
-
 section "a claude already running follows a terminal move (real claude, stand-in API)"
 # What Sesame Link, LearnHarness and the like rely on: they run the real claude on this login and
 # do nothing at a switch. If a Claude Code update stops a running claude reading the login again,

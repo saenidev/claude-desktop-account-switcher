@@ -373,7 +373,7 @@ parse_args() {
 # weekly") when that is what ran out. $3, if given, lists the only accounts to consider (one id a line).
 # If usage.json can't be read (a bad file, a time jq can't parse), the switch still happens:
 # it's logged, and the pick is made again without the usage figures.
-# $4 and $5 are for the timer's switches (watch): $4 is the percent that rules an account
+# $4 and $5 are for the Linux timer's switches (watch): $4 is the percent that rules an account
 # out (default 100: only a used-up window does), and $5, when set, makes every window count,
 # each model's own weekly limit too.
 pick_target() {
@@ -594,45 +594,6 @@ EOF
   launchctl bootstrap "gui/$uid" "$plist" && log "keepalive: daily check installed (04:30)"
 }
 
-# The terminal timer, as on Linux: every two minutes `relay.sh tick` reads usage, moves terminal
-# claude's login before its account runs out, and renews parked terminal logins. Everything
-# that runs the real claude on that login follows (T3 Code, scripts, a terminal), while the app
-# stays where it is. Written and loaded again only when it differs or isn't loaded.
-TICK_LABEL="$LABEL.tick"
-install_tick_job() {
-  local agents="$HOME/Library/LaunchAgents" uid plist; uid=$(id -u); mkdir -p "$agents"
-  plist="$agents/$TICK_LABEL.plist"
-  cat > "$plist.new" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>$TICK_LABEL</string>
-  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$DIR/relay.sh</string><string>tick</string></array>
-  <key>StartInterval</key><integer>120</integer>
-  <key>ProcessType</key><string>Background</string>
-  <key>LowPriorityIO</key><true/>
-</dict></plist>
-EOF
-  if cmp -s "$plist.new" "$plist" && launchctl print "gui/$uid/$TICK_LABEL" >/dev/null 2>&1; then rm -f "$plist.new"; return 0; fi
-  mv -f "$plist.new" "$plist"
-  launchctl bootout "gui/$uid/$TICK_LABEL" 2>/dev/null
-  launchctl bootstrap "gui/$uid" "$plist" && log "timer: terminal timer installed (every two minutes)"
-}
-tick_job_loaded() { launchctl print "gui/$(id -u)/$TICK_LABEL" >/dev/null 2>&1; }
-
-# relay.sh cli-auto [on|off]: whether the terminal login moves by itself, apart from the app's
-# auto-switch (which closes Claude). With no argument, says which.
-cmd_cli_auto() {
-  case "${1:-}" in
-    on|off) jq_write "$DIR/config.json" --argjson v "$([ "$1" = on ] && echo true || echo false)" '.terminalAutoSwitch = $v' \
-              && log "config: terminal auto-switch $1" ;;
-    "") ;;
-    *) die "cli-auto: on or off" ;;
-  esac
-  if terminal_armed; then echo "terminal auto-switch: on"; else echo "terminal auto-switch: off"; fi
-  tick_job_loaded || echo "the terminal timer isn't installed: relay.sh install-timer"
-}
-
 # ---- Terminal claude -----------------------------------------------------------------------
 #
 # Terminal `claude` follows the app. Its login is the Keychain item "Claude Code-credentials"
@@ -799,8 +760,6 @@ cmd_cli_save() {
 cmd_cli_use() {
   local id; id=$(account_by_name "${1:-}"); [ -n "$id" ] || die "cli-use: no account named ${1:-}"
   swap_cli "$id" || { echo "terminal claude stays on $(account_field "$(cli_account)" name): see $LOG" >&2; return 1; }
-  # Chosen by hand: the timer leaves it there until it is out, as after `use` on Linux.
-  jq_write "$STATE" --arg a "$id" '.pinned = $a | del(.watchSaid)'
   echo "terminal claude is on $(account_field "$(cli_account)" name)"
 }
 # Give <name> a parked terminal login: save the live one, run `claude auth login` for <name>,
@@ -1080,9 +1039,6 @@ cmd_doctor() {
   cmd_usage --quiet
   for id in $(account_ids); do ok "$(account_field "$id" name) usage: $(usage_line "$id") ($(usage_reach "$id"))"; done
   launchctl print "gui/$(id -u)/$LABEL.keepalive" >/dev/null 2>&1 && ok "daily keep-alive installed" || fail "daily keep-alive not installed (relay.sh install-keepalive)"
-  if ! tick_job_loaded; then fail "terminal timer not installed, so terminal claude only moves on a limit or with the app (relay.sh install-timer)"
-  elif terminal_armed; then ok "terminal timer runs every two minutes; terminal claude moves on at $(jq -r '.switchAt // 95' "$DIR/config.json")%"
-  else warn "terminal timer runs, but terminal auto-switch is off (relay.sh cli-auto on)"; fi
   if lock_held; then ok "a switch, sign-in or keep-alive is running now ($(lock_owner))"
   else
     [ -d "$LOCK" ] && warn "a lock is left from a run that was cut off ($(lock_owner)); the next switch takes it over" || ok "no switch running"
@@ -1246,7 +1202,6 @@ cmd_status() {
   if update_waiting || shipit_running; then echo "update: downloaded; installs the next time Claude quits (a switch or restart lets it finish first)"; fi
   echo "auto-switch: $(jq -r 'if .armed then "on" else "off" end' "$DIR/config.json" 2>/dev/null || echo off)"
   echo "terminal claude: on $(account_field "$(cli_account)" name)"
-  echo "terminal auto-switch: $(terminal_armed && echo on || echo off)$(tick_job_loaded && echo ", timer every two minutes" || echo ", timer not installed (relay.sh install-timer)")"
   echo "accounts:"
   local id; for id in $(account_ids); do
     local until; until=$(jq -r --arg a "$id" '.cooldowns[$a] // empty | select(fromdateiso8601 > now)' "$STATE")
@@ -1987,7 +1942,6 @@ cmd_setup() {
   [ -f "$DIR/config.json" ] || { echo '{ "armed": true }' > "$DIR/config.json"; echo "ok  auto-switch on"; }
   install_mod
   launchctl print "gui/$(id -u)/$LABEL.keepalive" >/dev/null 2>&1 || { cmd_install_keepalive; echo "ok  daily keep-alive installed"; }
-  install_tick_job && echo "ok  terminal timer running (every two minutes; relay.sh cli-auto on|off)"
   log "setup: done ($repo)"
   echo
   if [ "$(account_ids | grep -c .)" -lt 2 ]; then
@@ -2013,14 +1967,6 @@ UNIT="desktop-account-switcher"
 LOCK_WAIT=150; [ -n "${ACCOUNT_SWITCHER_FAST:-}" ] && LOCK_WAIT=4
 [ -n "$LINUX" ] && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"   # systemctl --user needs it
 armed() { jq -e '.armed == true' "$DIR/config.json" >/dev/null 2>&1; }
-# Whether terminal claude's login moves by itself: the timer's rounds and a session's limit
-# (cli-switch). On a Mac this can be on while the app's auto-switch is off, since it never closes
-# the app: "terminalAutoSwitch" in config.json, which follows "armed" until it's set. On Linux the
-# terminal is all there is, so it's "armed".
-terminal_armed() {
-  [ -n "$LINUX" ] && { armed; return; }
-  jq -e 'if has("terminalAutoSwitch") then .terminalAutoSwitch == true else .armed == true end' "$DIR/config.json" >/dev/null 2>&1
-}
 # On unless config.json says "autoUpdate": false.
 auto_update() { ! jq -e '.autoUpdate == false' "$DIR/config.json" >/dev/null 2>&1; }
 
@@ -2215,7 +2161,7 @@ said() {
 # for the rest of that hour: something is wrong, and logins shouldn't be shuffled over it.
 WATCH_MAX=6
 watch() {
-  terminal_armed || return 0
+  armed || return 0
   local live name near kind a b target="" why ready now; now=$(date -u +%s)
   live=$(cli_account); name=$(account_field "$live" name)
   if [ -z "$name" ]; then said "unknown:$live" "terminal claude is on ${live:-no account}, which isn't set up here, so nothing is switched (relay.sh doctor)"; return 0; fi
@@ -2260,19 +2206,13 @@ watch() {
 }
 
 # One round of the timer. Skipped while a sign-in or a switch by hand holds the lock.
-# On a Mac the lock belongs to the app's switches, sign-ins and the keep-alive, and a round
-# doesn't take it: a limit switch must never be turned away by a round. It only stays out of
-# their way, and terminal moves are one at a time under cli.lock anyway. A Mac's checkout is
-# updated by hand, so a round there doesn't pull.
 UPDATE_EVERY=3600
 cmd_tick() {
-  if [ -n "$LINUX" ]; then lock_take tick || exit 0
-  else lock_held && exit 0; fi
+  lock_take tick || exit 0
   jq_write "$STATE" --argjson t "$(date +%s)" '.tickAt = $t'
   cmd_usage --quiet --renew
-  [ -z "$LINUX" ] && lock_held && return 0
   watch
-  if [ -n "$LINUX" ] && auto_update \
+  if auto_update \
     && [ $(( $(date +%s) - $(jq -r '.updateCheckedAt // 0' "$STATE") )) -ge "$UPDATE_EVERY" ]; then
     cmd_self_update >/dev/null 2>&1
   fi
@@ -2429,16 +2369,11 @@ Terminal claude
   cli-save                  park the current terminal login as its account's
   cli-use <name>            move terminal claude to <name>'s parked login
   cli-renew [<name>...] [--force]   renew parked terminal logins whose token ran out
-  cli-auto [on|off]         whether terminal claude moves by itself (the timer, and a limit),
-                            apart from the app's auto-switch
   run -- <claude args>      run claude, retrying once on the next account after a usage limit
 
 Upkeep
   keepalive [<days>] [--force]   renew parked sign-ins with fewer than <days> left
   install-keepalive              install the daily 04:30 keep-alive job
-  install-timer                  install the terminal timer (setup does it)
-  tick                           one round of the terminal timer: read usage, move terminal
-                                 claude before its account runs out, renew parked terminal logins
   resume                         reopen sessions still waiting from a switch
 
 Commands that restart Claude (add, signin, use, restart) run as a launchd job, so they
@@ -2478,7 +2413,7 @@ if [ -n "$LINUX" ]; then
     self-update) cmd_self_update ;;
     cli-save) cmd_cli_save ;;
     cli-renew) lock_wait cli-renew "$LOCK_WAIT" || die "cli-renew: a switch or sign-in is running; try again when it's done"; cmd_cli_renew "$@" ;;
-    cli-switch) lock_wait cli-switch "$LOCK_WAIT" || die "cli-switch: a switch or sign-in is running"; terminal_armed || exit 0; cmd_cli_switch "$@" ;;
+    cli-switch) lock_wait cli-switch "$LOCK_WAIT" || die "cli-switch: a switch or sign-in is running"; armed || exit 0; cmd_cli_switch "$@" ;;
     run) cmd_run "$@" ;;
     help|-h|--help) usage_linux ;;
     restart|resume|keepalive|install-keepalive|launch|switch|plan)
@@ -2514,10 +2449,7 @@ case "$cmd" in
   cli-use) cmd_cli_use "$@" ;;
   cli-renew) cmd_cli_renew "$@" ;;
   cli-login) cmd_cli_login "$@" ;;
-  cli-switch) terminal_armed || exit 0; cmd_cli_switch "$@" ;;
-  cli-auto) cmd_cli_auto "$@" ;;
-  tick) cmd_tick ;;
-  install-timer) install_tick_job || die "install-timer: launchctl couldn't load $TICK_LABEL"; echo "terminal timer installed (every two minutes)" ;;
+  cli-switch) armed || exit 0; cmd_cli_switch "$@" ;;
   run) cmd_run "$@" ;;
   self-update) cmd_self_update ;;
   help|-h|--help) usage ;;
