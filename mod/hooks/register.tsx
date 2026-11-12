@@ -11,10 +11,6 @@ import type { Step } from '../types'
 // /account shows a row above the prompt to switch by hand and to turn automatic
 // switching on or off; the row also shows by itself while usage is above 95%.
 //
-// In any other session (a terminal claude on a Mac, every session on a Linux server, where
-// there is no desktop app), a usage limit moves only terminal claude's login: relay.sh
-// cli-switch. Nothing is reopened there; the session's next message goes out on the new login.
-//
 // Nothing here reads a token: the account comes from the app's own
 // CLAUDE_CODE_ACCOUNT_UUID, the usage from the session's rate-limit windows and from
 // usage.json, which relay.sh usage fills from Anthropic (with windows the session doesn't
@@ -81,7 +77,7 @@ async function readJson<T>($: Host, path: string, fallback: T): Promise<T> {
 // handoff.json and usage.json are changed by the relay and by every session's mod, often at the
 // same moment; each change reads, changes and writes the file under <file>.lock, the folder
 // lock relay.sh takes too (LOCK_SH there). After 10 seconds without it the change goes ahead anyway.
-const LOCK_SH = 'i=0; until mkdir "$1" 2>/dev/null; do i=$((i+1)); [ $i -ge 100 ] && exit 1; [ $(( $(date +%s) - $(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || date +%s) )) -gt 10 ] && rmdir "$1" 2>/dev/null; sleep 0.1; done'
+const LOCK_SH = 'i=0; until mkdir "$1" 2>/dev/null; do i=$((i+1)); [ $i -ge 100 ] && exit 1; [ $(( $(date +%s) - $(stat -f %m "$1" 2>/dev/null || date +%s) )) -gt 10 ] && rmdir "$1" 2>/dev/null; sleep 0.1; done'
 async function withLock<T>($: Host, file: string, change: () => Promise<T>): Promise<T> {
   const lock = `${file}.lock`
   const got = (await $.process.run(['/bin/sh', '-c', LOCK_SH, 'sh', lock]).catch(() => undefined))?.exitCode === 0
@@ -186,48 +182,6 @@ function live(h: Handoff, entry: Handoff['resume'][number], now: number) {
 // that went back to the old account (its new sign-in didn't come up) reopens nothing.
 const onAccount = (entry: Handoff['resume'][number], account: string) => !entry.account || entry.account === account
 
-// What a usage limit's error says ("You've hit your limit · resets 11am", usage_limit_reached),
-// as against a rate limit that isn't about usage.
-const LIMIT_WORDS = /usage[ _]limit|weekly limit|5-hour limit|hit your limit|limit reached|out of (extra )?usage/i
-
-// Variables that give a session a login of its own (an API key, a token, another config
-// folder, a cloud provider): it isn't on the terminal login, so its limit moves nothing.
-// ($.env.get takes each name written out: the host reads them from the source.)
-async function hasOwnLogin($: Host) {
-  return !!(
-    (await $.env.get('ANTHROPIC_API_KEY')) ||
-    (await $.env.get('ANTHROPIC_AUTH_TOKEN')) ||
-    (await $.env.get('CLAUDE_CODE_OAUTH_TOKEN')) ||
-    (await $.env.get('CLAUDE_CONFIG_DIR')) ||
-    (await $.env.get('CLAUDE_CODE_USE_BEDROCK')) ||
-    (await $.env.get('CLAUDE_CODE_USE_VERTEX')) ||
-    (await $.env.get('CLAUDE_CODE_USE_FOUNDRY'))
-  )
-}
-
-// A usage limit in a session on the terminal login: relay.sh cli-switch moves that login to
-// the next account, after reading the account's usage from Anthropic to check it is the one
-// that ran out (several sessions hit a limit together; the first moves the login). The host
-// doesn't tell a mod which login a session has ($.session.identity is refused), so a usage
-// limit is told by what the session does report: a 5-hour or weekly window nearly full, or
-// the error's own words.
-async function terminalLimit<R>($: Host, e: { session_id: string; error_details?: string }, r: R): Promise<R> {
-  if (await hasOwnLogin($)) return r
-  const p = await paths($)
-  const windows: Window[] = (await $.session.usage().catch(() => ({ rateLimits: [] }))).rateLimits
-  const full = windows.filter(w => w.kind in WINDOW && w.percentUsed >= NEAR_FULL)
-  // A `claude -p` exits as its turn ends, and a session shutting down reports no windows. So
-  // the relay is started detached, to outlive the session, and told when this couldn't tell
-  // (--unsure): it then moves the login only if Anthropic says the account is out. The relay
-  // also checks auto-switch is on, and logs what it did.
-  const sure = full.length > 0 || LIMIT_WORDS.test(e.error_details ?? '')
-  const resetsAt = full.filter(w => w.resetsAt).map(w => isoZ(w.resetsAt as string)).sort().at(-1)
-  const args = [...(sure ? [] : ['--unsure']), ...(resetsAt ? [resetsAt] : [])]
-  await $.process.run(['/bin/sh', '-c', 'relay="$1"; shift; nohup /bin/bash "$relay" cli-switch "$@" >/dev/null 2>&1 &', 'sh', p.relay, ...args]).catch(() => undefined)
-  if (sure) $.ui.toast('Out of usage on this account. Terminal claude moves to the next account that has some: send that again in a moment.', { timeoutMs: 10_000 })
-  return r
-}
-
 export const register: Register = on => {
   // A session reopened by the relay: say once that it should carry on.
   on('classic.SessionStart', async ($, e, next) => {
@@ -277,14 +231,27 @@ export const register: Register = on => {
   on('classic.StopFailure', async ($, e, next) => {
     const r = await next(e)
     if (e.error !== 'rate_limit') return r
-    // Any session but the app's own (a terminal `claude`, one nested in a Code tab session,
-    // every session on a Linux server) signs in with the terminal login. A limit there moves
+    // A terminal `claude`, or a nested one started from a Code tab session (it inherits the
+    // session's environment), signs in with the terminal (Keychain) login. A limit there moves
     // only the terminal login (relay.sh cli-switch), never the app. Only a limit on the token
     // the app hands its sessions says the app's account is out.
-    if (!(await isDesktop($))) return terminalLimit($, e, r)
-    // The host refuses a mod the session's identity unless managed settings allow it; it's
-    // only wanted for the log.
     const identity = await $.session.identity().catch(() => undefined)
+    const kind = identity?.kind ?? ''
+    if (kind === 'claude.ai' || !(await isDesktop($))) {
+      if (kind !== 'claude.ai') return r // an API key or a cloud provider: nothing to switch
+      const p = await paths($)
+      const { armed } = await readJson($, p.config, { armed: false })
+      const windows = (await $.session.usage().catch(() => ({ rateLimits: [] }))).rateLimits
+      const resetsAt = windows.filter(w => w.percentUsed >= NEAR_FULL && w.resetsAt).map(w => isoZ(w.resetsAt as string)).sort().at(-1)
+      if (!armed) {
+        await log($, `terminal: rate_limit in ${e.session_id} on the terminal login; switching is off`)
+        return r
+      }
+      const ran = await $.process.run(['/bin/bash', p.relay, 'cli-switch', ...(resetsAt ? [resetsAt] : [])]).catch(() => undefined)
+      await log($, `terminal: rate_limit in ${e.session_id}; cli-switch exit ${ran?.exitCode ?? 'failed'}`)
+      $.ui.toast(ran?.exitCode === 0 ? 'Terminal login moved to the other account; run the command again.' : 'Terminal login is out of usage, and no other account is ready.', { timeoutMs: 10_000 })
+      return r
+    }
     // Anything here that throws would otherwise vanish into the .catch below: say what failed.
     const failed = async (what: string, err: unknown) => {
       await log($, `limit in ${e.session_id}: ${what} failed: ${String(err)}`)
@@ -310,7 +277,7 @@ export const register: Register = on => {
         full.push(...scoped)
         limit = scoped[0]?.label
       }
-      const saysLimit = LIMIT_WORDS.test(e.error_details ?? '')
+      const saysLimit = /usage limit|weekly limit|5-hour limit|limit reached|out of (extra )?usage/i.test(e.error_details ?? '')
       if (full.length === 0 && !saysLimit) {
         await log($, `rate_limit in ${e.session_id} but no window near full (${rateLimits.map(w => `${w.kind} ${w.percentUsed}%`).join(', ') || 'no reading'}); not switching`)
         return r

@@ -8,32 +8,8 @@
 # one token used is a terminal login's, sent to Anthropic for usage (`relay.sh usage`), never
 # printed or logged. See README.md, and `relay.sh help` for the commands.
 
-#
-# On Linux there is no desktop app, so only the terminal half runs: terminal claude's login
-# (~/.claude/.credentials.json) is swapped for another account's parked one when usage runs
-# out, by a systemd timer (`relay.sh tick`) and by the mod. See "Linux" below.
-
 set -u
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-: "${USER:=$(id -un)}"
-
-# What differs between a Mac's tools and Linux's.
-LINUX=""; [ "$(uname)" = Linux ] && LINUX=1
-if [ -n "$LINUX" ]; then
-  mtime() { stat -c %Y "$1" 2>/dev/null; }
-  file_mode() { stat -c %a "$1" 2>/dev/null; }
-  in_5h() { date -u -d '+5 hours' +%FT%TZ; }
-  utc_at() { date -u -d "@$1" '+%F %T'; }            # an epoch as a UTC date and time
-  lstart_epoch() { date -d "$1" +%s 2>/dev/null; }   # ps's lstart as an epoch
-else
-  mtime() { stat -f %m "$1" 2>/dev/null; }
-  file_mode() { stat -f %Lp "$1" 2>/dev/null; }
-  in_5h() { date -u -v+5H +%FT%TZ; }
-  utc_at() { date -u -r "$1" '+%F %T'; }
-  lstart_epoch() { LC_ALL=C date -j -f '%a %b %d %T %Y' "$1" +%s 2>/dev/null; }
-fi
-# A fingerprint of stdin, to tell two secrets apart without printing either.
-if command -v shasum >/dev/null 2>&1; then sha() { shasum -a 256 | cut -d' ' -f1; }; else sha() { sha256sum | cut -d' ' -f1; }; fi
 
 DIR="$HOME/.claude/desktop-account-switcher"
 ACCOUNTS="$DIR/accounts.json"
@@ -63,12 +39,7 @@ REPO() { local s="${BASH_SOURCE[0]}"; while [ -L "$s" ]; do s=$(readlink "$s"); 
 log() { [ -d "$DIR" ] && printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; return 0; }
 # The text goes to osascript as an argument, never inside the script, so a name with quotes
 # or & shows as it is.
-# A Linux server has nowhere to show one: there the text goes to the program $DIR/notify, if
-# you put one there (to send it to your phone, say). What happened is in the log either way.
-notify() {
-  if [ -n "$LINUX" ]; then [ -x "$DIR/notify" ] && "$DIR/notify" "$1" >/dev/null 2>&1 </dev/null; return 0; fi
-  osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "Claude account switcher"' -e 'end run' "$1" >/dev/null 2>&1 || true
-}
+notify() { osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "Claude account switcher"' -e 'end run' "$1" >/dev/null 2>&1 || true; }
 die() { log "ERROR $*"; notify "$*"; echo "$*" >&2; exit 1; }
 # Fixed waits (letting a turn finish, letting the app load). ACCOUNT_SWITCHER_FAST shortens them for tests.
 pause() { if [ -n "${ACCOUNT_SWITCHER_FAST:-}" ]; then sleep 1; else sleep "$1"; fi; }
@@ -85,13 +56,13 @@ run_for() {
 # Put the finished temp file $2 in place of $1, with $1's mode. Some of the files rewritten are
 # private (claude_desktop_config.json is 0600 and can hold secrets), so temp files are made
 # under umask 077 and only then given the original's mode.
-replace_file() { local mode; mode=$(file_mode "$1") && chmod "$mode" "$2"; mv "$2" "$1"; }
+replace_file() { local mode; mode=$(stat -f %Lp "$1" 2>/dev/null) && chmod "$mode" "$2"; mv "$2" "$1"; }
 # A folder lock (mkdir is atomic) around a read, change and write of one file, for changes that
 # can come at the same moment: the relay's own (a switch and the usage check started after
 # every turn both write state.json) and the mod's in every session (handoff.json, usage.json).
 # The mod takes the same lock (LOCK_SH there). One older than 10 seconds was left by a process
 # that was killed. After 10 seconds without it the change goes ahead anyway rather than not at all.
-LOCK_SH='i=0; until mkdir "$1" 2>/dev/null; do i=$((i+1)); [ $i -ge 100 ] && exit 1; [ $(( $(date +%s) - $(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || date +%s) )) -gt 10 ] && rmdir "$1" 2>/dev/null; sleep 0.1; done'
+LOCK_SH='i=0; until mkdir "$1" 2>/dev/null; do i=$((i+1)); [ $i -ge 100 ] && exit 1; [ $(( $(date +%s) - $(stat -f %m "$1" 2>/dev/null || date +%s) )) -gt 10 ] && rmdir "$1" 2>/dev/null; sleep 0.1; done'
 locked() {   # locked <lock folder> <command...>
   local l="$1" got="" rc; shift
   /bin/sh -c "$LOCK_SH" sh "$l" && got=1
@@ -157,6 +128,7 @@ signin_cookies() {
 # reused, say after a restart of the Mac). A live owner keeps it however long it runs (a
 # sign-in waits up to 10 minutes, on top of quitting and opening Claude twice).
 HAVE_LOCK=""
+mtime() { stat -f %m "$1" 2>/dev/null; }
 lock_stale() {
   local pid made started; made=$(mtime "$LOCK") || return 1
   pid=$(cat "$LOCK/pid" 2>/dev/null)
@@ -164,7 +136,7 @@ lock_stale() {
   if [ -z "$pid" ]; then [ $(( $(date +%s) - made )) -gt 60 ]; return; fi
   kill -0 "$pid" 2>/dev/null || return 0
   started=$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ')
-  started=$(lstart_epoch "$started") || return 1
+  started=$(LC_ALL=C date -j -f '%a %b %d %T %Y' "$started" +%s 2>/dev/null) || return 1
   [ "$started" -gt "$made" ]
 }
 lock_held() { [ -d "$LOCK" ] && ! lock_stale; }
@@ -373,16 +345,13 @@ parse_args() {
 # weekly") when that is what ran out. $3, if given, lists the only accounts to consider (one id a line).
 # If usage.json can't be read (a bad file, a time jq can't parse), the switch still happens:
 # it's logged, and the pick is made again without the usage figures.
-# $4 and $5 are for the Linux timer's switches (watch): $4 is the percent that rules an account
-# out (default 100: only a used-up window does), and $5, when set, makes every window count,
-# each model's own weekly limit too.
 pick_target() {
-  local from="$1" label="${2:-}" only="${3:-}" full="${4:-100}" all="${5:-}" now out err; now=$(date -u +%s)
+  local from="$1" label="${2:-}" only="${3:-}" now out err; now=$(date -u +%s)
   local prog='
     def epoch: sub("\\.[0-9]+";"") | sub("[+]00:00$";"Z") | fromdateiso8601;
     def spent($a): [($u[0][$a].windows // [])[]
-      | select($all != "" or .kind == "five_hour" or .kind == "seven_day" or ($label != "" and .label == $label))
-      | select(.percentUsed >= $full and ((.resetsAt // "") != "") and ((.resetsAt | epoch) > $now))] | length > 0;
+      | select(.kind == "five_hour" or .kind == "seven_day" or ($label != "" and .label == $label))
+      | select(.percentUsed >= 100 and ((.resetsAt // "") != "") and ((.resetsAt | epoch) > $now))] | length > 0;
     ($only | split("\n") | map(select(. != ""))) as $only
     | (.accounts | map(.accountUuid // empty)) as $ids
     | [.accounts[] | select(.benched == true) | .accountUuid] as $benched
@@ -394,7 +363,7 @@ pick_target() {
     | map(select((($st[0].cooldowns[.] // "1970-01-01T00:00:00Z") | epoch) <= $now))
     | map(select(spent(.) | not))
     | .[0] // empty'
-  local args=(-r --arg from "$from" --arg label "$label" --arg only "$only" --argjson full "$full" --arg all "$all" --argjson now "$now" --slurpfile st "$STATE")
+  local args=(-r --arg from "$from" --arg label "$label" --arg only "$only" --argjson now "$now" --slurpfile st "$STATE")
   if out=$(jq "${args[@]}" --slurpfile u "$USAGE" "$prog" "$ACCOUNTS" 2>&1); then printf '%s\n' "$out" | grep .; return 0; fi
   err=$(printf '%s' "$out" | head -1)
   log "switch: couldn't read the usage figures ($err); picking without them"
@@ -441,9 +410,9 @@ cmd_keepalive() {
     [ $? -eq 2 ] && continue   # a switch or sign-in was running: skipped, not a failed renewal
     local after; after=$(signin_expires_epoch "$id")
     if [ "$after" -gt "$exp" ]; then
-      log "keepalive: $name renewed, now good until $(utc_at "$after") UTC"
+      log "keepalive: $name renewed, now good until $(date -u -r "$after" '+%F %T') UTC"
     else
-      log "keepalive: $name not renewed; expires $(utc_at "$exp") UTC"
+      log "keepalive: $name not renewed; expires $(date -u -r "$exp" '+%F %T') UTC"
       [ "$left" -le 3 ] && notify "$name's sign-in expires in $left days and couldn't be renewed. Run relay.sh signin $name."
     fi
   done
@@ -608,65 +577,40 @@ CLI_SVC="Claude Code-credentials"
 CLI_PARK_SVC="desktop-account-switcher-cli"
 CLI_MIRROR="$HOME/.claude/.credentials.json"
 cli_account() { jq -r '.oauthAccount.accountUuid // empty' "$HOME/.claude.json" 2>/dev/null; }
+cli_parked() { security find-generic-password -s "$CLI_PARK_SVC" -a "$1" >/dev/null 2>&1; }
 keychain_put() {   # keychain_put <service> <account>, the secret on stdin
   local v hex; v=$(cat)   # $(...) drops the newline `security -w` adds after the value
   [ -n "$v" ] || return 1
   hex=$(printf '%s' "$v" | xxd -p | tr -d '\n'); v=""
   printf 'add-generic-password -U -s "%s" -a "%s" -X %s\n' "$1" "$2" "$hex" | security -i >/dev/null 2>&1
 }
-# Write the secret on stdin to the file $1, which only you can read, in one move, so nothing
-# reading it (a running claude) ever sees half of it. An empty secret is never written.
-secret_file() {
-  local tmp="$1.tmp.$$"
-  if ( umask 077; cat > "$tmp" ) && [ -s "$tmp" ]; then mv -f "$tmp" "$1"; else rm -f "$tmp"; return 1; fi
-}
-# Where the logins are. On a Mac the Keychain, as above. Linux has none: the live login is the
-# file ~/.claude/.credentials.json (0600), and an account's parked one is
-# park/<uuid>/credentials.json, 0600 like the live one beside it. Each prints a login on
-# stdout or takes one on stdin; nothing else ever sees one.
-if [ -n "$LINUX" ]; then
-  live_login() { cat "$CLI_MIRROR" 2>/dev/null; }
-  live_has() { [ -s "$CLI_MIRROR" ]; }
-  live_store() { mkdir -p "$(dirname "$CLI_MIRROR")"; secret_file "$CLI_MIRROR"; }
-  parked_login() { cat "$PARK/$1/credentials.json" 2>/dev/null; }
-  cli_parked() { [ -s "$PARK/$1/credentials.json" ]; }
-  parked_store() { mkdir -p "$PARK/$1"; chmod 700 "$PARK" "$PARK/$1"; secret_file "$PARK/$1/credentials.json"; }
-  parked_drop() { rm -f "$PARK/$1/credentials.json"; }
-else
-  live_login() { security find-generic-password -s "$CLI_SVC" -a "$USER" -w 2>/dev/null; }
-  live_has() { security find-generic-password -s "$CLI_SVC" -a "$USER" >/dev/null 2>&1; }
-  live_store() {   # the Keychain item, and its mirror file where claude keeps one
-    local v; v=$(cat); [ -n "$v" ] || return 1
-    printf '%s' "$v" | keychain_put "$CLI_SVC" "$USER" || return 1
-    [ -f "$CLI_MIRROR" ] && printf '%s\n' "$v" | secret_file "$CLI_MIRROR"
-    return 0
-  }
-  parked_login() { security find-generic-password -s "$CLI_PARK_SVC" -a "$1" -w 2>/dev/null; }
-  cli_parked() { security find-generic-password -s "$CLI_PARK_SVC" -a "$1" >/dev/null 2>&1; }
-  parked_store() { keychain_put "$CLI_PARK_SVC" "$1"; }
-  parked_drop() { security delete-generic-password -s "$CLI_PARK_SVC" -a "$1" >/dev/null 2>&1; }
-fi
+# A fingerprint of a Keychain item's secret (service $1, account $2), to tell two apart
+# without either being printed: the secret goes from security to shasum through a pipe.
+keychain_digest() { security find-generic-password -s "$1" -a "$2" -w 2>/dev/null | shasum -a 256 | cut -d' ' -f1; }
 cli_park() {       # save the live terminal login as <uuid>'s parked one
   local id="$1" other live
   # The live login byte for byte the same as another account's parked one means the live
-  # login is that account's token while ~/.claude.json says <uuid>: parking it would put
+  # item holds that account's token while ~/.claude.json says <uuid>: parking it would put
   # the wrong account's login under <uuid>.
-  live=$(live_login | sha)
+  live=$(keychain_digest "$CLI_SVC" "$USER")
   for other in $(account_ids); do
     [ "$other" = "$id" ] && continue
-    if cli_parked "$other" && [ "$(parked_login "$other" | sha)" = "$live" ]; then
+    if cli_parked "$other" && [ "$(keychain_digest "$CLI_PARK_SVC" "$other")" = "$live" ]; then
       log "terminal: the live terminal login is the same as $(account_field "$other" name)'s parked one, not $(account_field "$id" name)'s; not parking it as $(account_field "$id" name)"
       return 1
     fi
   done
-  live_login | parked_store "$id" || return 1
+  security find-generic-password -s "$CLI_SVC" -a "$USER" -w 2>/dev/null | keychain_put "$CLI_PARK_SVC" "$id" || return 1
   mkdir -p "$PARK/$id"; jq '.oauthAccount' "$HOME/.claude.json" > "$PARK/$id/oauthAccount.json"
   cli_dead "$id" && jq_write "$STATE" --arg a "$id" 'del(.cliDead[$a])'
   return 0
 }
 cli_restore() {    # make <uuid>'s parked login the live terminal login
-  local id="$1"
-  parked_login "$id" | live_store || return 1
+  local id="$1" tmp
+  security find-generic-password -s "$CLI_PARK_SVC" -a "$id" -w 2>/dev/null | keychain_put "$CLI_SVC" "$USER" || return 1
+  if [ -f "$CLI_MIRROR" ]; then
+    tmp="$CLI_MIRROR.tmp.$$"; ( umask 077; security find-generic-password -s "$CLI_PARK_SVC" -a "$id" -w > "$tmp" 2>/dev/null ) && mv "$tmp" "$CLI_MIRROR"
+  fi
   [ -f "$PARK/$id/oauthAccount.json" ] && jq_write "$HOME/.claude.json" --slurpfile o "$PARK/$id/oauthAccount.json" '.oauthAccount = $o[0]'
 }
 # Move terminal claude to <uuid> if a parked login exists for it; otherwise leave it alone
@@ -679,7 +623,7 @@ swap_cli_now() {
   if ! cli_parked "$target"; then log "terminal: no parked terminal login for $(account_field "$target" name); terminal stays on $(account_field "$cur" name)"; return 1; fi
   if cli_dead "$target"; then log "terminal: $(account_field "$target" name)'s parked terminal login no longer works (relay.sh cli-login $(account_field "$target" name)); terminal stays on $(account_field "$cur" name)"; return 1; fi
   # With no live login there's nothing to save first (logged out, or the item was deleted).
-  if [ -n "$cur" ] && live_has && ! cli_park "$cur"; then
+  if [ -n "$cur" ] && security find-generic-password -s "$CLI_SVC" -a "$USER" >/dev/null 2>&1 && ! cli_park "$cur"; then
     log "terminal: couldn't save $(account_field "$cur" name)'s terminal login; not swapping"; return 1
   fi
   cli_restore "$target" && log "terminal: $(account_field "$cur" name) -> $(account_field "$target" name)" \
@@ -703,7 +647,6 @@ cli_follow() {
 # A Terminal window on cli-login, which needs one click in the browser and leaves the terminal on
 # the app's account.
 cli_signin_window() {
-  [ -n "$LINUX" ] && return 0   # no windows on a server: the notification says what to run
   local name f="$DIR/cli-login.command"; name=$(account_field "$1" name)
   printf '#!/bin/bash\nexec /bin/bash %q cli-login %q\n' "$DIR/relay.sh" "$name" > "$f"; chmod +x "$f"
   log "terminal: opening a sign-in window for $name's terminal login"
@@ -715,11 +658,11 @@ cli_signin_window() {
 # still across a few seconds before anything is parked.
 cli_keep_parked() {
   local id live; id=$(cli_account); [ -n "$(account_field "$id" name)" ] || return 0
-  live=$(live_login | sha)
-  [ "$live" != "$(printf '' | sha)" ] || return 0
-  [ "$live" != "$(parked_login "$id" | sha)" ] || return 0
+  live=$(keychain_digest "$CLI_SVC" "$USER")
+  [ "$live" != "$(printf '' | shasum -a 256 | cut -d' ' -f1)" ] || return 0
+  [ "$live" != "$(keychain_digest "$CLI_PARK_SVC" "$id")" ] || return 0
   pause 3
-  [ "$(cli_account)" = "$id" ] && [ "$(live_login | sha)" = "$live" ] || return 0
+  [ "$(cli_account)" = "$id" ] && [ "$(keychain_digest "$CLI_SVC" "$USER")" = "$live" ] || return 0
   locked "$DIR/cli.lock" cli_park "$id"
 }
 # Terminal `claude rc` keeps, per project folder, the session it reattaches on its next start
@@ -769,7 +712,7 @@ cmd_cli_use() {
 cmd_cli_login() {
   local id name email cur got app; id=$(account_by_name "${1:-}"); [ -n "$id" ] || die "cli-login: no account named ${1:-}"
   name=$(account_field "$id" name); email=$(account_field "$id" email); cur=$(cli_account)
-  if [ -n "$cur" ] && live_has; then
+  if [ -n "$cur" ] && security find-generic-password -s "$CLI_SVC" -a "$USER" >/dev/null 2>&1; then
     [ -n "$(account_field "$cur" name)" ] || die "cli-login: terminal claude is logged in as $cur, not an account in accounts.json; signing in would lose that login"
     [ "$cur" = "$id" ] || locked "$DIR/cli.lock" cli_park "$cur" || die "cli-login: couldn't save $(account_field "$cur" name)'s terminal login; not signing in"
   fi
@@ -798,32 +741,12 @@ cli_put_back() { [ -n "$1" ] && [ "$1" != "$2" ] && cli_parked "$1" && locked "$
 # A terminal run hit the limit: cool that account down and move only the terminal login.
 cmd_cli_switch() {
   local from; from=$(cli_account); [ -n "$from" ] || die "cli-switch: terminal isn't logged in"
-  # A limit a session hit shows in its account's usage. If the terminal's account reads as
-  # having usage left, it isn't the one that ran out: another session's limit already moved the
-  # terminal off that account (several hit it together), or the failure wasn't a usage limit.
-  # Cooling it down and moving on would spend the next account for nothing. Where usage can't
-  # be read, the session is taken at its word.
-  # --unsure (from the mod): the session couldn't tell whether its failure was a usage limit,
-  # so nothing moves unless the reading says so.
-  local kind="" label="" unsure=""
-  [ "${1:-}" = --unsure ] && { unsure=1; shift; }
-  if usage_read "$from"; then
-    IFS=$'\t' read -r kind label _ <<< "$(watch_state "$from" 95)"
-    case "$kind" in out|scoped|near) ;; *)
-      log "terminal: a session hit a limit, but $(account_field "$from" name), which terminal claude is on now, has usage left; not switching"; return 0 ;;
-    esac
-  elif [ -n "$unsure" ]; then
-    log "terminal: a session's request was refused, maybe for a usage limit, and $(account_field "$from" name)'s usage can't be read; not switching"; return 0
-  fi
-  # Cooling down until the reset the session reported, else the one the reading gives.
-  local until="${1:-}"
-  [ -z "$until" ] && [ "$kind" = out ] && until="$label"
-  [ -n "$until" ] || until=$(in_5h)
-  [ "$kind" = scoped ] || label=""
-  jq_write "$STATE" --arg a "$from" --arg u "$until" '.cooldowns[$a] = $u | del(.pinned)'
+  local until="${1:-$(date -u -v+5H +%FT%TZ)}"
+  jq_write "$STATE" --arg a "$from" --arg u "$until" '.cooldowns[$a] = $u'
   # Only accounts with a parked terminal login: the terminal can't move to any other.
-  local ready target=""; ready=$(cli_ready)
-  [ -n "$ready" ] && target=$(pick_target "$from" "$label" "$ready")
+  local id ready="" target
+  for id in $(account_ids); do cli_parked "$id" && ! cli_dead "$id" && ready+="$id"$'\n'; done
+  [ -n "$ready" ] && target=$(pick_target "$from" "" "$ready")
   [ -n "${target:-}" ] || { log "terminal: $(account_field "$from" name) is out, and no other account with a parked terminal login has usage and isn't benched"; notify "Terminal: every account with a terminal login is out of usage or benched."; return 1; }
   swap_cli "$target"
 }
@@ -833,15 +756,12 @@ cmd_cli_switch() {
 #   relay.sh run -- -p "prompt" [claude args...]
 cmd_run() {
   [ "${1:-}" = "--" ] && shift
-  local rc; RUN_OUT=$(mktemp "${TMPDIR:-/tmp}/relay-run.XXXXXX")   # on_exit removes it, however this ends
+  local rc; RUN_OUT=$(mktemp -t relay-run)   # on_exit removes it, however this ends
   # stdout and stderr each stay where they were, and both are copied to the file for the check.
   claude "$@" 2> >(tee -a "$RUN_OUT" >&2) | tee -a "$RUN_OUT"; rc=${PIPESTATUS[0]}
-  if [ "$rc" -ne 0 ] && grep -qiE "hit your( weekly| 5-hour)? limit|usage[ _]limit[ _]reached|out of (extra )?usage" "$RUN_OUT"; then
+  if [ "$rc" -ne 0 ] && grep -qiE "hit your (weekly|5-hour) limit|usage limit reached|out of (extra )?usage" "$RUN_OUT"; then
     log "run: claude hit a limit on $(account_field "$(cli_account)" name)'s terminal login; switching and retrying once"
-    local moved=""
-    if [ -n "$LINUX" ]; then lock_wait run "$LOCK_WAIT" && { cmd_cli_switch && moved=1; lock_release; }
-    else cmd_cli_switch && moved=1; fi
-    if [ -n "$moved" ]; then claude "$@"; rc=$?; fi
+    if cmd_cli_switch; then claude "$@"; rc=$?; fi
   fi
   return "$rc"
 }
@@ -858,7 +778,7 @@ cmd_run() {
 RENEW_HOME="$DIR/cli-renew"
 RENEW_EVERY=3600   # seconds between tries for one account, renewed or not
 cli_expires() {    # cli_expires <uuid>: its parked terminal login's access token expiry (epoch), or nothing
-  parked_login "$1" | jq -r '(.claudeAiOauth.expiresAt // empty) / 1000 | floor' 2>/dev/null
+  security find-generic-password -s "$CLI_PARK_SVC" -a "$1" -w 2>/dev/null | jq -r '(.claudeAiOauth.expiresAt // empty) / 1000 | floor' 2>/dev/null
 }
 # Due: parked, not the live one (claude renews that itself), expired or within 30 minutes of
 # it, and not tried in the last hour.
@@ -882,18 +802,18 @@ cli_renew_now() {
   [ -n "$before" ] || { log "terminal: $name's parked terminal login isn't a claude.ai login; not renewing it"; return 2; }
   jq_write "$STATE" --arg a "$id" --argjson t "$(date +%s)" '.cliRenewTriedAt[$a] = $t'
   rm -rf "$h"; mkdir -p "$h/.claude" "$h/work"; chmod 700 "$h"
-  ( umask 077; parked_login "$id" > "$f" )
+  ( umask 077; security find-generic-password -s "$CLI_PARK_SVC" -a "$id" -w > "$f" 2>/dev/null )
   local out; out=$(cd "$h/work" && run_for 120 env -i HOME="$h" USER="$USER" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG=en_US.UTF-8 \
       claude -p "Reply with the word ok." --model haiku --max-turns 1 --tools "" --strict-mcp-config --no-session-persistence 2>&1)
   # What claude left is the newest copy: park it if it changed and is still a login.
   local tok='.claudeAiOauth | "\(.refreshToken) \(.expiresAt)"'
   if jq -e '.claudeAiOauth.refreshToken' "$f" >/dev/null 2>&1 \
-    && [ "$(jq -r "$tok" "$f" | sha)" != "$(parked_login "$id" | jq -r "$tok" 2>/dev/null | sha)" ]; then
-    parked_store "$id" < "$f" || log "terminal: couldn't park $name's renewed terminal login"
+    && [ "$(jq -r "$tok" "$f" | shasum)" != "$(security find-generic-password -s "$CLI_PARK_SVC" -a "$id" -w 2>/dev/null | jq -r "$tok" 2>/dev/null | shasum)" ]; then
+    keychain_put "$CLI_PARK_SVC" "$id" < "$f" || log "terminal: couldn't park $name's renewed terminal login"
   fi
   rm -rf "$h"
   after=$(cli_expires "$id")
-  if [ "${after:-0}" -gt "$before" ]; then jq_write "$STATE" --arg a "$id" 'del(.cliDead[$a])'; log "terminal: renewed $name's parked terminal login, good until $(utc_at "$after") UTC"; return 0; fi
+  if [ "${after:-0}" -gt "$before" ]; then jq_write "$STATE" --arg a "$id" 'del(.cliDead[$a])'; log "terminal: renewed $name's parked terminal login, good until $(date -u -r "$after" '+%F %T') UTC"; return 0; fi
   out=$(printf '%s' "$out" | tr -s '\n' ' ' | cut -c1-200)
   if printf '%s' "$out" | grep -qiE 'revoked|invalid_grant|invalid.*(refresh|token)|log ?in again|/login'; then
     jq_write "$STATE" --arg a "$id" --argjson t "$(date +%s)" '.cliDead[$a] = $t'
@@ -902,7 +822,7 @@ cli_renew_now() {
     CLI_SIGNIN_DUE+=" $id"
     return 1
   fi
-  log "terminal: $name's parked terminal login wasn't renewed (it ran out $(utc_at "$before") UTC): $out"; return 1
+  log "terminal: $name's parked terminal login wasn't renewed (it ran out $(date -u -r "$before" '+%F %T') UTC): $out"; return 1
 }
 # relay.sh cli-renew [<name>...] [--force]: renew parked terminal logins that are due (all
 # parked ones but the live one, or the ones named); --force ignores when each was last tried.
@@ -921,13 +841,13 @@ cmd_cli_renew() {
     local exp; exp=$(cli_expires "$id")
     [ -n "$exp" ] || { echo "$name: its parked terminal login isn't a claude.ai login"; continue; }
     if [ -z "$force" ] && ! cli_renew_due "$id"; then
-      if [ "$exp" -ge $(( $(date +%s) + 1800 )) ]; then echo "$name: good until $(utc_at "$exp") UTC"
+      if [ "$exp" -ge $(( $(date +%s) + 1800 )) ]; then echo "$name: good until $(date -u -r "$exp" '+%F %T') UTC"
       else echo "$name: tried in the last hour; --force to try again"; fi
       continue
     fi
     cli_renew "$id"
     case $? in
-      0) echo "$name: renewed, good until $(utc_at "$(cli_expires "$id")") UTC" ;;
+      0) echo "$name: renewed, good until $(date -u -r "$(cli_expires "$id")" '+%F %T') UTC" ;;
       1) if cli_dead "$id"; then echo "$name: its parked terminal login no longer works: relay.sh cli-login $name"; else echo "$name: not renewed; see $LOG"; fi ;;
       *) echo "$name: nothing to renew" ;;
     esac
@@ -959,8 +879,7 @@ cli_consumers() {
     esac
   fi
   for pid in $(pgrep -x claude 2>/dev/null); do
-    if [ -n "$LINUX" ]; then env=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null); else env=$(ps -E -p "$pid" -o command= 2>/dev/null | tr ' ' '\n'); fi
-    env=$(printf '%s\n' "$env" | grep -oE '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CONFIG_DIR|CLAUDE_CODE_ENTRYPOINT=claude-desktop)' | tr '\n' ' ')
+    env=$(ps -E -p "$pid" -o command= 2>/dev/null | tr ' ' '\n' | grep -oE '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CONFIG_DIR|CLAUDE_CODE_ENTRYPOINT=claude-desktop)' | tr '\n' ' ')
     case "$env" in *claude-desktop*) continue ;; *CLAUDE_*) pinned+=" $pid" ;; esac
   done
   [ -z "$pinned" ] || echo "~~ claude process(es)$pinned have a login of their own and won't follow a switch"
@@ -1051,7 +970,7 @@ cmd_doctor() {
 
 # Recent switches and sign-in events, newest last (after caam's history).
 cmd_history() {
-  grep -E 'swap: [^ ]+ -> |switch: .* is out|signin: |add: |keepalive: .*(renewed|not renewed)|launched relay away|not switching|removed |bench: |terminal: [^ ]+ -> |watch: |update: [0-9a-f]+ -> ' "$LOG" | tail -n "${1:-20}"
+  grep -E 'swap: [^ ]+ -> |switch: .* is out|signin: |keepalive: .*(renewed|not renewed)|launched relay away|not switching|removed |bench: ' "$LOG" | tail -n "${1:-20}"
 }
 
 # An account's last usage reading: from Anthropic (relay.sh usage), or saved by the mod while
@@ -1081,7 +1000,8 @@ USAGE_LOCK="$DIR/usage.lock"
 
 # The terminal login of account $1 (JSON on stdout), live or parked.
 cli_login() {
-  if [ "$(cli_account)" = "$1" ]; then live_login; else parked_login "$1"; fi
+  if [ "$(cli_account)" = "$1" ]; then security find-generic-password -s "$CLI_SVC" -a "$USER" -w 2>/dev/null
+  else security find-generic-password -s "$CLI_PARK_SVC" -a "$1" -w 2>/dev/null; fi
 }
 
 # Account $1's windows as usage.json holds them, on stdout. Returns 1 when it has no usable
@@ -1102,19 +1022,6 @@ fetch_usage() {
       (.seven_day // empty | {kind: "seven_day", percentUsed: .utilization, resetsAt: (.resets_at // "" | z)}),
       (.limits[]? | select(.kind == "weekly_scoped")
         | {kind: "weekly_scoped", label: "\(.scope.model.display_name // "scoped") weekly", percentUsed: .percent, resetsAt: (.resets_at // "" | z)}) ]' || return 3
-}
-
-# Read account $1's usage from Anthropic into usage.json. Returns what fetch_usage returned;
-# on 2, Anthropic is rate-limiting these checks and none is made for 15 minutes.
-usage_read() {
-  local windows rc; windows=$(fetch_usage "$1"); rc=$?
-  case $rc in
-    0) jq_write "$USAGE" --arg a "$1" --argjson w "$windows" --argjson at "$(date +%s)000" '.[$a] = {at: $at, source: "anthropic", windows: $w}' ;;
-    2) jq_write "$STATE" --argjson t $(( $(date -u +%s) + 900 )) '.usageWaitUntil = $t'
-       log "usage: Anthropic is rate-limiting usage checks; next try in 15 minutes" ;;
-    3) log "usage: couldn't read $(account_field "$1" name)'s usage from Anthropic" ;;
-  esac
-  return $rc
 }
 
 # Whether account $1's usage can be read from Anthropic now, and if not, why.
@@ -1138,9 +1045,17 @@ cmd_usage() {
   [ -n "$(find "$USAGE_LOCK" -maxdepth 0 -mmin +2 2>/dev/null)" ] && rmdir "$USAGE_LOCK"
   if [ "$now" -lt "$until" ]; then :
   elif { [ -n "$force" ] || [ $((now - last)) -ge $USAGE_EVERY ]; } && mkdir "$USAGE_LOCK" 2>/dev/null; then
-    local id
+    local id windows rc
     [ -n "$renew" ] && cli_renew_all
-    for id in $(account_ids); do usage_read "$id"; [ $? -eq 2 ] && break; done
+    for id in $(account_ids); do
+      windows=$(fetch_usage "$id"); rc=$?
+      case $rc in
+        0) jq_write "$USAGE" --arg a "$id" --argjson w "$windows" --argjson at "$(date +%s)000" '.[$a] = {at: $at, source: "anthropic", windows: $w}' ;;
+        2) jq_write "$STATE" --argjson t $((now + 900)) '.usageWaitUntil = $t'
+           log "usage: Anthropic is rate-limiting usage checks; next try in 15 minutes"; break ;;
+        3) log "usage: couldn't read $(account_field "$id" name)'s usage from Anthropic" ;;
+      esac
+    done
     jq_write "$STATE" --argjson t "$now" '.usageCheckedAt = $t'
     rmdir "$USAGE_LOCK"
   fi
@@ -1355,7 +1270,7 @@ cmd_launch() {
     # Several sessions hit the limit together, or a switch was already going: the one
     # running reopens the sessions the mod listed, so this is fine, not a failure.
     # The account is still out: its cooldown is kept, so whatever comes next doesn't pick it.
-    2) jq_write "$STATE" --arg a "$FROM" --arg u "${RESETS_AT:-$(in_5h)}" '.cooldowns[$a] = $u'
+    2) jq_write "$STATE" --arg a "$FROM" --arg u "${RESETS_AT:-$(date -u -v+5H +%FT%TZ)}" '.cooldowns[$a] = $u'
        log "launch: a switch is already under way; not starting another ($(account_field "$FROM" name) cools down until $(jq -r --arg a "$FROM" '.cooldowns[$a]' "$STATE"))" ;;
     *) die "launch: couldn't start the switch under launchd" ;;
   esac
@@ -1373,7 +1288,7 @@ cmd_switch() {
   lock_wait switch 600 || { log "switch: the lock stayed held ($(lock_owner)); not switching"; drop_limit_hand_offs "$since"; exit 1; }
   recover_signin
 
-  local until="${RESETS_AT:-$(in_5h)}"
+  local until="${RESETS_AT:-$(date -u -v+5H +%FT%TZ)}"
   jq_write "$STATE" --arg a "$FROM" --arg u "$until" '.cooldowns[$a] = $u'
   log "switch: $(account_field "$FROM" name) is out${LIMIT:+ ($LIMIT)}; cooling down until $until"
 
@@ -1871,19 +1786,14 @@ cmd_remove() {
   local name="${1:-}" id; id=$(account_by_name "$name"); [ -n "$id" ] || die "remove: no account named $name"
   # Not while a switch, sign-in or keep-alive may be moving this account's sign-in.
   lock_or_die remove
-  if [ -n "$LINUX" ]; then
-    [ "$id" = "$(cli_account)" ] && die "remove: terminal claude is on $name now; move to another account first (relay.sh use <name>)"
-  else
-    recover_signin
-    [ "$id" = "$(folder_account "$DEFAULT_DIR")" ] && die "remove: Claude is on $name now; switch to another account first (relay.sh use <name>)"
-  fi
+  recover_signin
+  [ "$id" = "$(folder_account "$DEFAULT_DIR")" ] && die "remove: Claude is on $name now; switch to another account first (relay.sh use <name>)"
   local b; b=$(backup_dir "removed-$name")
   jq --arg u "$id" '.accounts[] | select(.accountUuid == $u)' "$ACCOUNTS" > "$b/account.json"
-  cli_parked "$id" && parked_drop "$id"
   [ -d "$PARK/$id" ] && mv "$PARK/$id" "$b/park"
+  cli_parked "$id" && security delete-generic-password -s "$CLI_PARK_SVC" -a "$id" >/dev/null 2>&1
   jq_write "$ACCOUNTS" --arg u "$id" 'del(.accounts[] | select(.accountUuid == $u))'
   jq_write "$STATE" --arg u "$id" 'del(.cooldowns[$u])'
-  if [ -n "$LINUX" ]; then log "accounts: removed $name ($id); its parked login is deleted"; echo "Removed $name, and deleted its parked login."; return 0; fi
   log "accounts: removed $name ($id); its parked sign-in is in $b"
   echo "Removed $name. Its sign-in is kept in $b/park; delete that folder to sign it out for good."
   [ "$(cli_account)" = "$id" ] && echo "Terminal claude is still logged in as $name; use relay.sh cli-use <name> or claude /login to move it."
@@ -1904,15 +1814,6 @@ link_to() {
   fi
   [ -e "$dst" ] && die "setup: $dst exists and isn't a link; move it aside first"
   ln -s "$src" "$dst" && echo "ok  $dst -> $src"
-}
-
-# The mod, installed as a Claude Code plugin from the link in $DIR. Claude Code reads it from
-# there each time, so a newer mod in the repo needs no reinstall.
-install_mod() {
-  if jq -e --arg p "$PLUGIN" '.enabledPlugins[$p] == true' "$HOME/.claude/settings.json" >/dev/null 2>&1; then echo "ok  mod installed"; return 0; fi
-  command -v claude >/dev/null || die "setup: needs the claude CLI to install the mod (https://claude.com/claude-code)"
-  claude plugin marketplace add "$DIR/mod" >/dev/null && claude plugin install "$PLUGIN" --scope user >/dev/null || die "setup: installing the mod failed"
-  echo "ok  mod installed (new sessions pick it up)"
 }
 
 # One-time setup on a Mac, run from the cloned repo: relay.sh setup <name for the account Claude is signed in to>.
@@ -1940,7 +1841,12 @@ cmd_setup() {
   fi
   echo "ok  Claude is on $(account_field "$cur" name)"
   [ -f "$DIR/config.json" ] || { echo '{ "armed": true }' > "$DIR/config.json"; echo "ok  auto-switch on"; }
-  install_mod
+  if jq -e --arg p "$PLUGIN" '.enabledPlugins[$p] == true' "$HOME/.claude/settings.json" >/dev/null 2>&1; then echo "ok  mod installed"
+  else
+    command -v claude >/dev/null || die "setup: needs the claude CLI to install the mod (https://claude.com/claude-code)"
+    claude plugin marketplace add "$DIR/mod" >/dev/null && claude plugin install "$PLUGIN" --scope user >/dev/null || die "setup: installing the mod failed"
+    echo "ok  mod installed (new Code tab sessions pick it up)"
+  fi
   launchctl print "gui/$(id -u)/$LABEL.keepalive" >/dev/null 2>&1 || { cmd_install_keepalive; echo "ok  daily keep-alive installed"; }
   log "setup: done ($repo)"
   echo
@@ -1950,396 +1856,6 @@ cmd_setup() {
   else
     echo "Next: $DIR/relay.sh doctor"
   fi
-}
-
-# ---- Linux -----------------------------------------------------------------------------------
-#
-# A Linux server has no desktop app. What signs in there is terminal claude's login, the file
-# ~/.claude/.credentials.json, and with it everything that runs the real claude or reads that
-# file (T3 Code, a proxy, scripts). So the account in use is the terminal's, a switch is the
-# terminal move above (swap_cli), and what a Mac leaves to the app is done by a systemd timer:
-# every two minutes `relay.sh tick` reads usage, moves the login before the account runs out
-# (or when it has), renews the parked logins, and pulls a new version of this repo.
-
-UNIT="desktop-account-switcher"
-# How long a command waits for the lock: a timer round holds it for seconds, or a couple of
-# minutes while it renews a parked login (ACCOUNT_SWITCHER_FAST: 4 seconds, for the tests).
-LOCK_WAIT=150; [ -n "${ACCOUNT_SWITCHER_FAST:-}" ] && LOCK_WAIT=4
-[ -n "$LINUX" ] && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"   # systemctl --user needs it
-armed() { jq -e '.armed == true' "$DIR/config.json" >/dev/null 2>&1; }
-# On unless config.json says "autoUpdate": false.
-auto_update() { ! jq -e '.autoUpdate == false' "$DIR/config.json" >/dev/null 2>&1; }
-
-# Add the account that the config file $2 (a ~/.claude.json) is signed in to, as $1.
-account_from() {
-  jq_write "$ACCOUNTS" --arg n "$1" --slurpfile c "$2" '($c[0].oauthAccount) as $o
-    | .accounts += [{name: $n, accountUuid: $o.accountUuid, orgUuid: ($o.organizationUuid // ""), email: ($o.emailAddress // "")}]' \
-    && log "accounts: added $1 ($(jq -r '.oauthAccount.accountUuid' "$2"))"
-}
-
-# First run on a Linux machine, from the cloned repo: relay.sh setup <name for the account
-# terminal claude is signed in to>. Safe to run again; it only adds what's missing (a self-update
-# runs it, so a new version sets up whatever it added).
-cmd_setup_linux() {
-  local name="${1:-}" t repo cur; repo=$(REPO)
-  for t in jq curl git claude systemctl; do command -v "$t" >/dev/null || die "setup: needs $t"; done
-  cur=$(cli_account)
-  [ -n "$cur" ] && live_has || die "setup: terminal claude isn't signed in here; run claude auth login first"
-  mkdir -p "$DIR/backups" "$PARK"; chmod 700 "$PARK"
-  [ -f "$ACCOUNTS" ] || echo '{"accounts":[]}' > "$ACCOUNTS"
-  [ -f "$STATE" ] || echo '{"cooldowns":{},"switches":[]}' > "$STATE"
-  [ -f "$HANDOFF" ] || echo '{"resume":[]}' > "$HANDOFF"
-  [ -f "$USAGE" ] || echo "{}" > "$USAGE"
-  link_to "$repo/relay.sh" "$DIR/relay.sh"
-  link_to "$repo/mod" "$DIR/mod"
-  if [ -z "$(account_field "$cur" name)" ]; then
-    [ -n "$name" ] || die "setup: give the account terminal claude is signed in to a short name: relay.sh setup <name>"
-    [ -z "$(account_by_name "$name")" ] || die "setup: $name is already set up as another account; give the account terminal claude is signed in to another name"
-    account_from "$name" "$HOME/.claude.json" || die "setup: couldn't write $ACCOUNTS"
-  fi
-  echo "ok  terminal claude is on $(account_field "$cur" name)"
-  [ -f "$DIR/config.json" ] || { echo '{ "armed": true }' > "$DIR/config.json"; echo "ok  auto-switch on"; }
-  install_mod
-  install_timer && echo "ok  timer running (every two minutes)" || die "setup: couldn't start the timer (systemctl --user)"
-  [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" = yes ] \
-    || echo "~~  the timer stops when you log out of this machine; to keep it running: sudo loginctl enable-linger $USER"
-  log "setup: done ($repo)"
-  echo
-  if [ "$(account_ids | grep -c .)" -lt 2 ]; then
-    echo "Next: add your other account with  $DIR/relay.sh add <name>"
-    echo "(It prints a sign-in link: open it in a browser signed in to that account, and paste the code back.)"
-  else
-    echo "Next: $DIR/relay.sh doctor"
-  fi
-}
-
-# The timer and the service it starts, as systemd user units. Written again only when they
-# differ, so running setup twice (or after an update) changes nothing that's already right.
-install_timer() {
-  local d="$HOME/.config/systemd/user" f changed=""
-  mkdir -p "$d"
-  unit() {   # unit <file>, its text on stdin
-    cat > "$1.new"
-    if cmp -s "$1.new" "$1"; then rm -f "$1.new"; else mv -f "$1.new" "$1"; changed=1; fi
-  }
-  unit "$d/$UNIT.service" <<EOF
-[Unit]
-Description=Claude account switcher: read usage, move terminal claude's login, renew parked logins, update
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash "$DIR/relay.sh" tick
-TimeoutStartSec=15min
-Nice=10
-EOF
-  unit "$d/$UNIT.timer" <<EOF
-[Unit]
-Description=Claude account switcher, every two minutes
-
-[Timer]
-OnBootSec=1min
-OnUnitInactiveSec=2min
-AccuracySec=10s
-
-[Install]
-WantedBy=timers.target
-EOF
-  if [ -n "$changed" ]; then
-    systemctl --user daemon-reload || return 1
-    systemctl --user is-active --quiet "$UNIT.timer" && { systemctl --user restart "$UNIT.timer" || return 1; }
-    log "timer: units written"
-  fi
-  systemctl --user enable --now "$UNIT.timer" >/dev/null 2>&1
-}
-
-# Sign an account in without touching the live login (after T3 Code's guide to separate Claude
-# accounts): `claude auth login` runs with its config folder set to a throwaway one, so the new
-# login lands there and is parked from there. A server has no browser, so claude prints a link:
-# open it in a browser signed in to that account, and paste the code it shows back.
-#   relay.sh add <name> [<email>]    a new account, under a name not used yet
-#   relay.sh signin <name>           one already set up, whose login stopped working
-LOGIN_DIR="$DIR/login"
-cmd_login_linux() {
-  local name="${1:-}" email="${2:-}" id got who what=signin h="$LOGIN_DIR"
-  [ -n "$ADDING" ] && what=add
-  [ -n "$name" ] || die "$what: which account? relay.sh $what <name>"
-  id=$(account_by_name "$name")
-  if [ -n "$ADDING" ]; then [ -z "$id" ] || die "$name is already set up; to sign it in again use relay.sh signin $name"
-  else
-    [ -n "$id" ] || die "$what: there's no account named $name; to add one use relay.sh add $name"
-    email=$(account_field "$id" email)
-  fi
-  lock_wait "$what" "$LOCK_WAIT" || die "$what: a switch or sign-in is running; try again when it's done"
-  rm -rf "$h"; mkdir -p "$h"; chmod 700 "$h"; UNDO='rm -rf "$LOGIN_DIR"'
-  echo "Signing in $name${email:+ ($email)}. Open the link in a browser that's signed in to that account at claude.ai, and paste the code it shows back here."
-  log "$what: signing $name in"
-  CLAUDE_CONFIG_DIR="$h" claude auth login --claudeai ${email:+--email "$email"} \
-    || die "$what: the sign-in to $name didn't finish; nothing changed"
-  got=$(jq -r '.oauthAccount.accountUuid // empty' "$h/.claude.json" 2>/dev/null)
-  [ -n "$got" ] && jq -e '.claudeAiOauth.refreshToken' "$h/.credentials.json" >/dev/null 2>&1 \
-    || die "$what: claude finished, but left no login to keep; nothing changed"
-  who=$(account_field "$got" name)
-  local wrong="Your browser approves whichever account it's signed in to: open the link in a browser signed in as $name (a private window works), then run this again."
-  if [ -n "$who" ] && [ "$who" != "$name" ]; then
-    # Another account that's set up already: its new login is kept, unless it's the one in use.
-    if [ "$(cli_account)" = "$got" ]; then die "$what: that sign-in was $who, which terminal claude is on already, not $name; nothing changed. $wrong"; fi
-    keep_login "$got" "$h" && log "$what: that sign-in was $who, not $name; kept as $who's parked login"
-    die "$what: that sign-in was $who, not $name; it's kept as $who's. $wrong"
-  fi
-  if [ -z "$who" ] && [ -z "$ADDING" ]; then
-    die "$what: that sign-in was $(jq -r '.oauthAccount.emailAddress // "another account"' "$h/.claude.json"), not $name; nothing kept. $wrong"
-  fi
-  if [ -z "$who" ]; then account_from "$name" "$h/.claude.json" || die "$what: couldn't write $ACCOUNTS"; fi
-  keep_login "$got" "$h" || die "$what: signed in as $name, but couldn't keep that login"
-  rm -rf "$h"; UNDO=""
-  log "$what: $name signed in"
-  if [ "$(cli_account)" = "$got" ]; then echo "$name is signed in again; terminal claude is on it."
-  else echo "$name is signed in: its login is parked, and terminal claude moves to it when $(account_field "$(cli_account)" name) runs out (or with relay.sh use $name)."; fi
-}
-# Keep the login in the config folder $2 as account $1's: the live one if terminal claude is on
-# that account, its parked one otherwise.
-keep_login() {
-  local id="$1" h="$2"
-  if [ "$(cli_account)" = "$id" ]; then
-    live_store < "$h/.credentials.json" && jq_write "$HOME/.claude.json" --slurpfile c "$h/.claude.json" '.oauthAccount = $c[0].oauthAccount' || return 1
-  else
-    parked_store "$id" < "$h/.credentials.json" && jq '.oauthAccount' "$h/.claude.json" > "$PARK/$id/oauthAccount.json" || return 1
-  fi
-  cli_dead "$id" && jq_write "$STATE" --arg a "$id" 'del(.cliDead[$a])'
-  return 0
-}
-
-# relay.sh use <name>: move terminal claude to <name> now. It stays there until that account
-# runs out: the timer doesn't move it off early (pinned), as it would an account it chose itself.
-cmd_use_linux() {
-  local id; id=$(account_by_name "${1:-}"); [ -n "$id" ] || die "use: no account named ${1:-}"
-  lock_wait use "$LOCK_WAIT" || die "use: a switch or sign-in is running; try again when it's done"
-  swap_cli "$id" || die "use: terminal claude stays on $(account_field "$(cli_account)" name): see $LOG"
-  jq_write "$STATE" --arg a "$id" '.pinned = $a | del(.watchSaid)'
-  echo "terminal claude is on $(account_field "$(cli_account)" name); sessions already running follow on their next request"
-}
-
-# What account $1's last usage reading says, for the timer: one line, tab-separated.
-#   out <latest reset> <which>     a 5-hour or weekly window is used up
-#   scoped <label>                 a model's own weekly limit is used up
-#   near <which>                   a 5-hour or weekly window is at $2 percent or more
-#   warm                           one is within 10 points of that
-#   fine
-# A window past its reset time doesn't count: usage only goes down at a reset.
-watch_state() {
-  jq -r --arg a "$1" --argjson near "$2" --argjson now "$(date -u +%s)" '
-    def epoch: sub("\\.[0-9]+";"") | sub("[+]00:00$";"Z") | fromdateiso8601;
-    def which: map("\(if .kind == "five_hour" then "5-hour" else "weekly" end) \(.percentUsed | round)%") | join(", ");
-    [(.[$a].windows // [])[] | select(((.resetsAt // "") != "") and ((.resetsAt | epoch) > $now))] as $w
-    | [$w[] | select(.kind == "five_hour" or .kind == "seven_day")] as $main
-    | [$main[] | select(.percentUsed >= 100)] as $out
-    | [$w[] | select(.kind == "weekly_scoped" and .percentUsed >= 100)] as $scoped
-    | [$main[] | select(.percentUsed >= $near)] as $nearly
-    | if ($out | length) > 0 then "out\t\($out | map(.resetsAt) | sort | last)\t\($out | which)"
-      elif ($scoped | length) > 0 then "scoped\t\($scoped[0].label)"
-      elif ($nearly | length) > 0 then "near\t\($nearly | which)"
-      elif any($main[]; .percentUsed >= $near - 10) then "warm"
-      else "fine" end' "$USAGE" 2>/dev/null
-}
-# The accounts terminal claude can move to: a parked login that still works (one id a line).
-cli_ready() { local id; for id in $(account_ids); do cli_parked "$id" && ! cli_dead "$id" && echo "$id"; done; return 0; }
-# Log (and notify) what the timer found, once: again only when it changes. said "" forgets it.
-said() {
-  [ "$(jq -r '.watchSaid // ""' "$STATE")" = "$1" ] && return 0
-  jq_write "$STATE" --arg k "$1" '.watchSaid = $k'
-  [ -n "$1" ] && { log "watch: $2"; notify "$2"; }
-  return 0
-}
-
-# The timer's switch. With auto-switch on, terminal claude moves:
-#   when its account is out (a 5-hour or weekly window used up): to the next account that
-#     isn't, and the spent one cools down until its reset, as after a limit in a session;
-#   before that, at 95% ("switchAt" in config.json): to the next account under 95%, so sessions
-#     that are running never meet the limit. With no such account it stays, and uses the rest;
-#   when a model's own weekly limit is used up: to an account with nothing used up at all.
-# The last two never move it off an account you chose with `use`. Six moves in an hour stop it
-# for the rest of that hour: something is wrong, and logins shouldn't be shuffled over it.
-WATCH_MAX=6
-watch() {
-  armed || return 0
-  local live name near kind a b target="" why ready now; now=$(date -u +%s)
-  live=$(cli_account); name=$(account_field "$live" name)
-  if [ -z "$name" ]; then said "unknown:$live" "terminal claude is on ${live:-no account}, which isn't set up here, so nothing is switched (relay.sh doctor)"; return 0; fi
-  near=$(jq -r '.switchAt // 95' "$DIR/config.json" 2>/dev/null); case "$near" in ''|*[!0-9]*) near=95 ;; esac
-  IFS=$'\t' read -r kind a b <<< "$(watch_state "$live" "$near")"
-  # Close to a limit, the account in use is read every round, not every ten minutes.
-  if [ "${kind:-fine}" != fine ] && [ "$now" -ge "$(jq -r '.usageWaitUntil // 0' "$STATE")" ] \
-    && [ $(( now - $(jq -r --arg a "$live" '(.[$a].at // 0) / 1000 | floor' "$USAGE") )) -ge 100 ]; then
-    usage_read "$live"; IFS=$'\t' read -r kind a b <<< "$(watch_state "$live" "$near")"
-  fi
-  local pinned; pinned=$(jq -r '.pinned // ""' "$STATE")
-  ready=$(cli_ready | grep -vxF "$live")
-  case "${kind:-fine}" in
-    out)
-      jq_write "$STATE" --arg a "$live" --arg u "$a" '.cooldowns[$a] = $u | del(.pinned)'
-      why="$name is out of usage ($b)"
-      [ -n "$ready" ] && target=$(pick_target "$live" "" "$ready") ;;
-    scoped)
-      [ "$pinned" = "$live" ] && return 0
-      why="$name's $a limit is used up"
-      [ -n "$ready" ] && target=$(pick_target "$live" "$a" "$ready" 100 all) ;;
-    near)
-      [ "$pinned" = "$live" ] && return 0
-      why="$name is nearly out ($a)"
-      [ -n "$ready" ] && target=$(pick_target "$live" "" "$ready" "$near") ;;
-    *) said ""; return 0 ;;
-  esac
-  if [ -z "$target" ]; then
-    # Nearly out with nowhere better to go is nothing to say: it uses the rest of this account.
-    [ "$kind" = out ] && said "out:$live:$a" "$why, and no other account has usage left and a login that works"
-    return 0
-  fi
-  if [ "$(jq --argjson now "$now" '[(.watchMoves // [])[] | select($now - . < 3600)] | length' "$STATE")" -ge "$WATCH_MAX" ]; then
-    said "stopped" "$WATCH_MAX switches in the last hour, so the timer has stopped switching until an hour passes without one (relay.sh history)"
-    return 0
-  fi
-  if swap_cli "$target"; then
-    jq_write "$STATE" --argjson now "$now" '.watchMoves = ([(.watchMoves // [])[] | select($now - . < 3600)] + [$now]) | del(.pinned) | del(.watchSaid)'
-    log "watch: $why; terminal claude moved to $(account_field "$target" name)"
-    notify "$why. Moved to $(account_field "$target" name)."
-  else said "failed:$live:$target" "$why, but the move to $(account_field "$target" name) didn't work (relay.sh doctor)"; fi
-}
-
-# One round of the timer. Skipped while a sign-in or a switch by hand holds the lock.
-UPDATE_EVERY=3600
-cmd_tick() {
-  lock_take tick || exit 0
-  jq_write "$STATE" --argjson t "$(date +%s)" '.tickAt = $t'
-  cmd_usage --quiet --renew
-  watch
-  if auto_update \
-    && [ $(( $(date +%s) - $(jq -r '.updateCheckedAt // 0' "$STATE") )) -ge "$UPDATE_EVERY" ]; then
-    cmd_self_update >/dev/null 2>&1
-  fi
-  return 0
-}
-
-# relay.sh self-update: bring this checkout up to its branch on GitHub (the timer does it every
-# hour; "autoUpdate": false in config.json turns that off). Only ever a fast-forward of a clean
-# checkout: one with changes of its own is left alone, and says so. relay.sh and the mod are
-# links into the checkout, so the new version is in use from the next command; then the new
-# relay.sh runs setup, for anything it added.
-cmd_self_update() {
-  local repo before after; repo=$(REPO)
-  [ -f "$STATE" ] && jq_write "$STATE" --argjson t "$(date +%s)" '.updateCheckedAt = $t'
-  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "self-update: $repo isn't a git checkout" >&2; return 1; }
-  if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-    log "update: $repo has changes of its own; not updating it"; echo "self-update: $repo has changes of its own; not updating it" >&2; return 1
-  fi
-  before=$(git -C "$repo" rev-parse --short HEAD)
-  if ! run_for 120 git -C "$repo" pull --ff-only --quiet >/dev/null 2>&1; then
-    log "update: couldn't pull into $repo (no network, or its branch has moved apart from GitHub's)"; echo "self-update: couldn't pull; see $LOG" >&2; return 1
-  fi
-  after=$(git -C "$repo" rev-parse --short HEAD)
-  if [ "$before" = "$after" ]; then echo "up to date ($after)"; return 0; fi
-  log "update: $before -> $after ($(git -C "$repo" log -1 --format=%s))"
-  [ -n "$LINUX" ] && /bin/bash "$repo/relay.sh" setup >/dev/null 2>&1
-  echo "updated $before -> $after"
-}
-
-cmd_status_linux() {
-  cmd_usage --quiet
-  local cur id; cur=$(cli_account)
-  echo "terminal claude: on $(account_field "$cur" name)${cur:+ ($cur)}"
-  echo "auto-switch: $(armed && echo on || echo off)"
-  echo "accounts:"
-  for id in $(account_ids); do
-    local until bench="" where; until=$(jq -r --arg a "$id" '.cooldowns[$a] // empty | select(fromdateiso8601 > now)' "$STATE")
-    benched "$id" && bench="  (benched: automatic switches skip it)"
-    if [ "$id" = "$cur" ]; then where="in use"
-    elif cli_dead "$id"; then where="its parked login no longer works (relay.sh signin $(account_field "$id" name))"
-    elif cli_parked "$id"; then where="parked, ready to switch to"
-    else where="not signed in (relay.sh signin $(account_field "$id" name))"; fi
-    echo "  $(account_field "$id" name)  $(account_field "$id" email)  $where${until:+  (out of usage until $until)}$bench"
-    echo "      usage: $(usage_line "$id")"
-  done
-  local t; t=$(jq -r '.tickAt // 0' "$STATE")
-  if systemctl --user is-active --quiet "$UNIT.timer" 2>/dev/null; then echo "timer: running$([ "$t" -gt 0 ] && echo ", last round $(( $(date +%s) - t ))s ago")"
-  else echo "timer: not running (relay.sh setup)"; fi
-  echo "version: $(git -C "$(REPO)" log -1 --format='%h %s' 2>/dev/null || echo unknown)"
-}
-
-cmd_doctor_linux() {
-  local bad=0 id n cur line repo; repo=$(REPO)
-  ok()   { echo "ok  $*"; }
-  warn() { echo "~~  $*"; }
-  fail() { echo "!!  $*"; bad=1; }
-  command -v claude >/dev/null && ok "claude CLI: $(command -v claude)" || fail "the claude CLI isn't on the PATH this uses ($PATH)"
-  [ -L "$DIR/relay.sh" ] && [ -e "$DIR/relay.sh" ] && ok "relay.sh -> $(readlink "$DIR/relay.sh")" || fail "$DIR/relay.sh is not a working link (relay.sh setup)"
-  [ -L "$DIR/mod" ] && [ -e "$DIR/mod/hooks/hooks.json" ] && ok "mod -> $(readlink "$DIR/mod")" || fail "$DIR/mod is not a working link (relay.sh setup)"
-  jq -e --arg p "$PLUGIN" '.enabledPlugins[$p] == true' "$HOME/.claude/settings.json" >/dev/null 2>&1 && ok "mod installed and enabled" || fail "mod not enabled (relay.sh setup)"
-  n=$(jq '[.accounts[] | select(.accountUuid and .name)] | length' "$ACCOUNTS" 2>/dev/null || echo 0)
-  [ "$n" -ge 2 ] && ok "$n accounts in accounts.json" || fail "$n account(s) in accounts.json; add another with relay.sh add <name>"
-  cur=$(cli_account)
-  if [ -z "$cur" ] || ! live_has; then fail "terminal claude isn't signed in (claude auth login)"
-  elif [ -n "$(account_field "$cur" name)" ]; then ok "terminal claude is on $(account_field "$cur" name)"
-  else fail "terminal claude is on $cur, which isn't set up here (relay.sh setup <name>)"; fi
-  for id in $(account_ids); do benched "$id" && ok "$(account_field "$id" name) is benched: automatic switches skip it (relay.sh unbench $(account_field "$id" name))"; done
-  [ "$n" -ge 2 ] && [ -n "$(bench_note)" ] && warn "$(bench_note)"
-  for id in $(account_ids); do
-    [ "$id" = "$cur" ] && continue
-    if cli_dead "$id"; then fail "$(account_field "$id" name)'s parked login no longer works (used or revoked elsewhere after it was parked): relay.sh signin $(account_field "$id" name)"
-    elif cli_parked "$id"; then ok "$(account_field "$id" name) has a parked login"
-    else fail "$(account_field "$id" name) has no parked login: relay.sh signin $(account_field "$id" name)"; fi
-  done
-  while IFS= read -r line; do
-    case "$line" in "ok "*) ok "${line#ok }" ;; "~~ "*) warn "${line#\~\~ }" ;; *) fail "${line#!! }" ;; esac
-  done < <(cli_consumers)
-  cmd_usage --quiet
-  for id in $(account_ids); do ok "$(account_field "$id" name) usage: $(usage_line "$id") ($(usage_reach "$id"))"; done
-  local t; t=$(jq -r '.tickAt // 0' "$STATE")
-  if ! systemctl --user is-active --quiet "$UNIT.timer" 2>/dev/null; then fail "the timer isn't running, so nothing is switched or renewed by itself (relay.sh setup)"
-  elif [ "$t" -gt 0 ] && [ $(( $(date +%s) - t )) -gt 1200 ]; then fail "the timer is on, but its last round was $(( ($(date +%s) - t) / 60 )) minutes ago (systemctl --user status $UNIT.service)"
-  else ok "the timer is running$([ "$t" -gt 0 ] && echo " (last round $(( $(date +%s) - t ))s ago)")"; fi
-  [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" = yes ] && ok "the timer keeps running while you're logged out (linger)" \
-    || warn "the timer stops when you log out of this machine: sudo loginctl enable-linger $USER"
-  if ! auto_update; then warn "self-update is off (autoUpdate in config.json); this is $(git -C "$repo" rev-parse --short HEAD 2>/dev/null)"
-  elif ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then warn "$repo isn't a git checkout, so it doesn't update itself"
-  elif [ -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]; then warn "$repo has changes of its own, so it doesn't update itself"
-  else ok "updates itself from GitHub every hour (now at $(git -C "$repo" rev-parse --short HEAD))"; fi
-  [ -x "$DIR/notify" ] && ok "notifications go to $DIR/notify" || warn "nothing notifies you (it's all in relay.log): a program at $DIR/notify is run with each message"
-  if lock_held; then ok "a switch, sign-in or timer round is running now ($(lock_owner))"
-  else [ -d "$LOCK" ] && warn "a lock is left from a run that was cut off ($(lock_owner)); the next command takes it over" || ok "no switch running"; fi
-  echo "auto-switch: $(armed && echo on || echo off)"
-  return $bad
-}
-
-usage_linux() {
-  cat <<EOF
-Claude account switcher, on Linux: moves terminal claude's login (~/.claude/.credentials.json)
-to your next account when the one in use runs out. A timer does it; these are for you.
-
-Setting up
-  setup <name>              first run on this machine, from the cloned repo; <name> is the
-                            account terminal claude is signed in to
-  add <name> [<email>]      sign in another account and add it as <name>: prints a link to open
-                            in a browser signed in to it, and takes the code it gives back
-  signin <name>             sign an account already added in again after its login stopped working
-  remove <name>             take an account out
-  doctor                    check the whole setup
-
-Using it
-  status                    accounts, usage, cooldowns, the timer
-  usage [--force]           every account's usage from Anthropic (at most every 10 minutes unless --force)
-  use <name>                move terminal claude to <name> now; running sessions follow
-  bench <name>              leave <name> out of automatic switches (use <name> still works)
-  unbench <name>            put <name> back in automatic switches
-  history [<n>]             the last switches, sign-ins and updates
-  run -- <claude args>      run claude, retrying once on the next account after a usage limit
-
-Upkeep (the timer runs these)
-  tick                      one round: read usage, switch if needed, renew parked logins, update
-  cli-renew [<name>...] [--force]   renew parked logins whose token ran out
-  self-update               pull the newest version of this repo now
-
-Auto-switch is "armed" in $DIR/config.json; "switchAt" (default 95) is the
-percent at which the timer moves on, and "autoUpdate": false stops the hourly self-update.
-EOF
 }
 
 usage() {
@@ -2394,34 +1910,6 @@ case "${1:-help}" in
 esac
 
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
-# Linux: the terminal half only. Each command that moves or renews a login takes the lock, so
-# the timer's round, a session's limit and a command by hand never work on a login together.
-if [ -n "$LINUX" ]; then
-  case "$cmd" in
-    setup) cmd_setup_linux "$@" ;;
-    add) ADDING=1 cmd_login_linux "$@" ;;
-    signin|cli-login) cmd_login_linux "$@" ;;
-    use|cli-use) cmd_use_linux "$@" ;;
-    remove) cmd_remove "$@" ;;
-    bench)  cmd_bench true "$@" ;;
-    unbench) cmd_bench false "$@" ;;
-    doctor) cmd_doctor_linux ;;
-    status) cmd_status_linux ;;
-    usage)  cmd_usage "$@" ;;
-    history) cmd_history "$@" ;;
-    tick) cmd_tick ;;
-    self-update) cmd_self_update ;;
-    cli-save) cmd_cli_save ;;
-    cli-renew) lock_wait cli-renew "$LOCK_WAIT" || die "cli-renew: a switch or sign-in is running; try again when it's done"; cmd_cli_renew "$@" ;;
-    cli-switch) lock_wait cli-switch "$LOCK_WAIT" || die "cli-switch: a switch or sign-in is running"; armed || exit 0; cmd_cli_switch "$@" ;;
-    run) cmd_run "$@" ;;
-    help|-h|--help) usage_linux ;;
-    restart|resume|keepalive|install-keepalive|launch|switch|plan)
-      echo "$cmd is for the desktop app, and Linux has none. See relay.sh help." >&2; exit 2 ;;
-    *) usage_linux >&2; exit 2 ;;
-  esac
-  exit
-fi
 case "$cmd" in
   setup)  cmd_setup "$@" ;;
   add) [ -n "${1:-}" ] || die "add: which account? relay.sh add <name>"
@@ -2449,9 +1937,8 @@ case "$cmd" in
   cli-use) cmd_cli_use "$@" ;;
   cli-renew) cmd_cli_renew "$@" ;;
   cli-login) cmd_cli_login "$@" ;;
-  cli-switch) armed || exit 0; cmd_cli_switch "$@" ;;
+  cli-switch) cmd_cli_switch "$@" ;;
   run) cmd_run "$@" ;;
-  self-update) cmd_self_update ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

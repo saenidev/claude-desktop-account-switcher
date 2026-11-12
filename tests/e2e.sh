@@ -687,7 +687,7 @@ check "and takes its entry back" sh -c "! jq -e 'any(.resume[]; .sessionId == \"
 check "Claude stays on bob" test "$(signed_in_as "$P/Cookies")" = "$B"
 MOD_USAGE='[{"kind":"five_hour","percentUsed":40}]' mod_event "$B" m-rate classic.StopFailure '{"session_id":"m-rate","cwd":"/tmp","error":"rate_limit"}'
 check "a rate limit with usage left doesn't switch" sh -c "! jq -e 'any(.resume[]; .sessionId == \"m-rate\")' '$D/handoff.json' && grep -q 'rate_limit in m-rate but no window near full' '$D/relay.log'"
-ANTHROPIC_API_KEY=sk-stand-in CLAUDE_CODE_ENTRYPOINT=cli MOD_SESSION=m-term MOD_USAGE="$FULL" bun "$REPO/tests/fakes/mod-host.ts" classic.StopFailure '{"session_id":"m-term","cwd":"/tmp","error":"rate_limit"}'
+CLAUDE_CODE_ENTRYPOINT=cli MOD_SESSION=m-term MOD_IDENTITY=api-key MOD_USAGE="$FULL" bun "$REPO/tests/fakes/mod-host.ts" classic.StopFailure '{"session_id":"m-term","cwd":"/tmp","error":"rate_limit"}'
 check "a terminal claude's limit on an API key lists nothing" sh -c "! jq -e 'any(.resume[]; .sessionId == \"m-term\")' '$D/handoff.json'"
 check "and moves nothing" test "$(signed_in_as "$P/Cookies")" = "$B"
 
