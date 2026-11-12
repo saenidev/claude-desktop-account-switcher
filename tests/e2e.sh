@@ -135,6 +135,16 @@ mkdir -p "$H/.claude/projects/-proj-x"
 jq -cn --arg a "$A" '{type: "user", sessionId: "s-rc"}, {type: "bridge-session", sessionId: "s-rc", bridgeSessionId: "cse_alice", lastSequenceNum: 7, ownerAccountUuid: $a}' > "$H/.claude/projects/-proj-x/s-rc.jsonl"
 jq -cn '{type: "user", sessionId: "s-plain"}' > "$H/.claude/projects/-proj-x/s-plain.jsonl"
 jq -cn '{cliSessionId: "s-rc", bridgeSessionIds: ["session_alice"], title: "linked"}' > "$P/claude-code-sessions/$A/$OA/local_rc.json"   # compact, as the app writes it
+# Saved environments (the New session picker's presets), a list per account: alice and bob each
+# have one for the same folder under the same name, and a session started from alice's.
+jq -n --arg a "$A" --arg b "$B" '{byAccount: {
+  ($a): {presets: [{id: "e-goose", name: "goose", lastUsedAt: 50, target: {kind: "local", cwd: "/p/goose"}, settings: {effort: "high"}},
+                   {id: "e-map-a", name: "map", lastUsedAt: 10, target: {kind: "local", cwd: "/p/map"}}],
+         builtIns: {local: {settings: {effort: "medium"}}}, seededFromDraft: true},
+  ($b): {presets: [{id: "e-map-b", name: "map", lastUsedAt: 20, target: {kind: "local", cwd: "/p/map"}},
+                   {id: "e-bob", name: "bobs", lastUsedAt: 5, target: {kind: "local", cwd: "/p/bob"}}],
+         builtIns: {local: {settings: {effort: "low"}}}}}}' > "$P/ccd-session-presets.json"; chmod 600 "$P/ccd-session-presets.json"
+jq -n '{title: "started from map", envScopeId: "e-map-a", startedFromEnvironmentId: "e-map-a"}' > "$P/claude-code-sessions/$A/$OA/local_env.json"
 mark; check "use bob is queued" relay use bob --resume session-1
 check "the hand-off says which account the session comes back on" wait_for "jq -e --arg b '$B' '.resume[] | select(.sessionId == \"session-1\") | .account == \$b' '$D/handoff.json' >/dev/null" 10
 check "the switch finishes" wait_log "swap: alice -> bob" 40
@@ -144,6 +154,14 @@ check "the app's record of its link is cleared, the rest kept" jq -e '.bridgeSes
 check "a session never linked is left alone" test "$(wc -l < "$H/.claude/projects/-proj-x/s-plain.jsonl" | tr -d ' ')" = 1
 check "alice's per-account setting is copied to bob" jq -e --arg b "$B" '.["sidebar-" + $b].width == 300' "$P/claude_desktop_config.json"
 check "claude_desktop_config.json is still 0600" test "$(stat -f %Lp "$P/claude_desktop_config.json")" = 600
+check "bob has alice's saved environments and his own, the two for the same folder as one" jq -e --arg b "$B" '[.byAccount[$b].presets[].id] == ["e-goose", "e-map-b", "e-bob"]' "$P/ccd-session-presets.json"
+check "alice has the same list" jq -e --arg a "$A" --arg b "$B" '.byAccount[$a] == .byAccount[$b]' "$P/ccd-session-presets.json"
+check "an environment keeps its settings" jq -e --arg b "$B" '.byAccount[$b].presets[0].settings.effort == "high"' "$P/ccd-session-presets.json"
+check "the plain Local settings are the ones of the account in use" jq -e --arg b "$B" '.byAccount[$b].builtIns.local.settings.effort == "medium" and .byAccount[$b].seededFromDraft == true' "$P/ccd-session-presets.json"
+check "the session started from the one dropped points at the one kept" jq -e '.envScopeId == "e-map-b" and .startedFromEnvironmentId == "e-map-b" and .title == "started from map"' "$P/claude-code-sessions/$B/$OB/local_env.json"
+check "its record as it was is in backups" sh -c "grep -q e-map-a '$D'/backups/*-environments/local_env.json"
+check "the lists as they were are in backups" jq -e --arg b "$B" '.byAccount[$b].presets | length == 2' "$D/backups/ccd-session-presets.before-share.json"
+check "ccd-session-presets.json is still 0600" test "$(stat -f %Lp "$P/ccd-session-presets.json")" = 600
 check "Claude is signed in as bob" test "$(signed_in_as "$P/Cookies")" = "$B"
 check "the app reports bob" test "$(jq -r .lastKnownAccountUuid "$P/config.json")" = "$B"
 check "alice is parked" test "$(signed_in_as "$D/park/$A/Cookies")" = "$A"
@@ -162,10 +180,15 @@ check "doctor is happy on bob" relay doctor
 section "out of usage"
 jq '.resume = [] | del(.closedAt)' "$D/handoff.json" > "$T/h" && mv "$T/h" "$D/handoff.json"
 jq --arg at "$(date -u +%FT%TZ)" '.resume += [{sessionId: "session-2", cwd: "", reason: "limit hit", at: $at}]' "$D/handoff.json" > "$T/h" && mv "$T/h" "$D/handoff.json"
+# On bob, in the app: an environment deleted, one made, one used with other settings.
+jq --arg b "$B" '.byAccount[$b].presets |= ([{id: "e-new", name: "new", lastUsedAt: 70, target: {kind: "local", cwd: "/p/new"}}]
+  + map(select(.id != "e-bob") | if .id == "e-goose" then .lastUsedAt = 60 | .settings.effort = "max" else . end))' "$P/ccd-session-presets.json" > "$T/e" && cat "$T/e" > "$P/ccd-session-presets.json"
 mark; check "the mod's launch is queued" relay launch --from "$B" --resets-at "$(date -u -v+3H +%FT%TZ)"
 check "it switches to the next account" wait_log "swap: bob -> alice" 40
 check "Claude is signed in as alice" test "$(signed_in_as "$P/Cookies")" = "$A"
 check "bob cools down until his reset" jq -e --arg b "$B" '.cooldowns[$b] > (now | todate)' "$D/state.json"
+check "alice's environments are as bob left them: one deleted, one made, one changed" jq -e --arg a "$A" '[.byAccount[$a].presets[] | .id + ":" + (.settings.effort // "-")] == ["e-new:-", "e-goose:max", "e-map-b:-"]' "$P/ccd-session-presets.json"
+check "bob's list is untouched" jq -e --arg a "$A" --arg b "$B" '.byAccount[$a] == .byAccount[$b]' "$P/ccd-session-presets.json"
 check "status says bob is out of usage" sh -c "'$REPO/relay.sh' status | grep -q 'bob .*out of usage until'"
 cp "$D/state.json" "$T/s.keep"
 jq --arg b "$B" --arg u "$(date -u -v-1H +%FT%TZ)" '.cooldowns[$b] = $u' "$D/state.json" > "$T/s" && mv "$T/s" "$D/state.json"
@@ -230,8 +253,13 @@ plutil -replace CFBundleShortVersionString -string 3.1623.0 "$APPDIR/Contents/In
 section "a third account, with the shared list already there"
 mark; check "add carol is queued" relay add carol
 check "Claude opens signed out" wait_for "running && [ -z \"\$(signed_in_as '$P/Cookies')\" ]" 20
+# The app makes a new account a list of its own, from the folders it knows.
+jq --arg c "$C" '.byAccount[$c] = {presets: [{id: "e-map-c", name: "map", lastUsedAt: 90, target: {kind: "local", cwd: "/p/map"}},
+  {id: "e-carol", name: "carols", lastUsedAt: 91, target: {kind: "local", cwd: "/p/carol"}}], seededFromDraft: true}' "$P/ccd-session-presets.json" > "$T/e" && cat "$T/e" > "$P/ccd-session-presets.json"
 sign_in "$C"
 check "carol is added" wait_log "signin: back on alice" 60
+check "a new account's own list deletes nothing: carol's one new environment joins the shared list" jq -e --arg c "$C" '[.byAccount[$c].presets[].id] | sort == ["e-carol", "e-goose", "e-map-b", "e-new"]' "$P/ccd-session-presets.json"
+check "all three accounts have that list" jq -e --arg a "$A" --arg b "$B" --arg c "$C" '.byAccount[$a] == .byAccount[$c] and .byAccount[$b] == .byAccount[$c]' "$P/ccd-session-presets.json"
 check "carol has her ids" test "$(uuid_of carol):$(org_of carol)" = "$C:$OC"
 check "carol's list links to the same shared one" test "$(readlink "$P/claude-code-sessions/$C/$OC")" = "$P/claude-code-sessions/$A/$OA"
 check "doctor is happy with three" relay doctor

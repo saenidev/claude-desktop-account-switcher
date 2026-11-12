@@ -63,6 +63,7 @@ Finally, if you use `claude` in a terminal, run `relay.sh cli-login <name>` once
 ### What carries over in a switch
 
 - **Everything on your Mac:** the session list, every conversation's full history, project folders, worktrees, app preferences, `~/.claude` settings, hooks, mods and MCP servers. All accounts use one shared session list.
+- **Saved environments are the same on every account.** The New session picker's saved environments (a name, a folder, a model and settings) are kept by the app per account. Each time Claude is closed for a switch, sign-in or restart, the relay makes every account's list the same: one you add, change or delete on one account is added, changed or deleted on the others. The first time, the accounts' lists become one; two with the same name and folder become one, and the sessions started from either stay grouped under it. Cloud environments are on claude.ai and stay with their account.
 - **Conversations continue across accounts.** A session written on one account was continued on another and answered normally (checked 2026-10-20, 11 replies with thinking and 17 tool calls).
 
 ### What doesn't

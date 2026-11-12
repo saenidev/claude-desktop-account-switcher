@@ -1263,6 +1263,7 @@ while_closed() {
   fill_orgs
   link_sessions "${1:-}"
   apply_sessions_patch
+  share_presets
 }
 
 # Switch the one Claude window to account $1 (a uuid). Returns 1 if it didn't close Claude
@@ -1492,6 +1493,84 @@ mirror_rc() {
   cp -p "$f" "$DIR/backups/remote-control-state.before-mirror.json"
   jq_write "$f" --arg k "$tk" --arg s "$serve" '.identities[$k] = ((.identities[$k] // {folders: {}, pendingDelete: [], pendingUnarchive: []}) + {serve: $s})' \
     && log "remote control: $serve on $(account_field "$2" name), as on $(account_field "$1" name)"
+}
+
+# The New session picker's saved environments (the app's "session presets": a name, a folder
+# or SSH place, a model and settings) are kept per account, in ccd-session-presets.json under
+# byAccount[<account>]. Make every account's list the same one. $DIR/presets-shared.json is the
+# list as last shared and the accounts that were given it; what one of those accounts' lists
+# has changed since then is carried to the others: an environment added, changed (the most
+# recently used copy wins) or deleted. An account not given it yet (a new one, with the list
+# the app made for it) only adds: what it lacks was never deleted there. The first time, with
+# nothing shared yet, that makes the lists one. Two accounts' own environments with the
+# same name and place become one (the one already shared, else the most recently used), and the
+# sessions started from the other (envScopeId, startedFromEnvironmentId in their records, which
+# the sidebar groups by) are pointed at it. Only while Claude is closed: the running app
+# rewrites these files.
+PRESETS_JQ='
+  def key: if (.id | type) == "string" then .id else tojson end;
+  def newest: sort_by([-(.v.lastUsedAt // 0), .src]);
+  ($base[0].shared // null) as $b
+  | ($base[0].accounts // []) as $synced
+  | (($b.presets // []) | map({key: key, value: .}) | from_entries) as $bb
+  | . as $root
+  | [$ids[] | . as $i | $root.byAccount[$i]? | select(. != null) | . + {synced: any($synced[]; . == $i)}] as $cats
+  | if ($cats | length) == 0 then {shared: null, moved: {}} else
+    ([$cats[] | select(.synced) | [.presets[] | key] as $have | $bb | keys[] | select(. as $k | all($have[]; . != $k))] | unique) as $gone
+    | ([$bb | to_entries[] | {k: .key, src: -1, v: .value}]
+       + [$cats | to_entries[] | .key as $src | .value.presets[] | {k: key, src: $src, v: .} | select($bb[.k] != .v)]
+       | group_by(.k)
+       | map(.[0].k as $k | ((map(select(.src >= 0)) | newest | .[0]) // .[0]) | {k: $k, v, src, inbase: ($bb | has($k))})
+       | map(select(.k as $k | all($gone[]; . != $k)))) as $all
+    | ($all | group_by([.v.name, .v.target]) | map(
+        if length < 2 or all(.[]; .inbase) then {keep: ., drop: []}
+        elif any(.[]; .inbase) then {keep: map(select(.inbase)), drop: map(select(.inbase | not))}
+        elif (map(.src) | unique | length) < 2 then {keep: ., drop: []}
+        else newest | {keep: [.[0]], drop: .[1:]} end)) as $groups
+    | ([($root.byAccount[$ids[0]].presets // [])[] | key] | to_entries | map({key: .value, value: .key}) | from_entries) as $pos
+    | ([$cats[] | select(.synced or $b == null) | select(.builtIns != $b.builtIns) | .builtIns][0] // $b.builtIns) as $bi
+    | {shared: ({presets: ([$groups[].keep[]] | sort_by([($pos[.k] // 1e9), -(.v.lastUsedAt // 0)]) | map(.v))}
+                + (if $bi != null then {builtIns: $bi} else {} end)
+                + (if $b.seededFromDraft == true or any($cats[]; .seededFromDraft == true) then {seededFromDraft: true} else {} end)),
+       moved: ($groups | map(.keep[0] as $to | .drop[] | select(.k | test("^[A-Za-z0-9_-]+$")) | {key: .k, value: {to: $to.k, name: ($to.v.name // "")}}) | from_entries)}
+  end'
+share_presets() {
+  local f="$DEFAULT_DIR/ccd-session-presets.json" shared="$DIR/presets-shared.json" plan="$DIR/presets-plan.$$"
+  local live ids base n b="" old new name files s moved
+  [ -f "$f" ] && [ -f "$ACCOUNTS" ] || return 0
+  live=$(folder_account "$DEFAULT_DIR")
+  # The account the app last ran as comes first: its list is the one you've been changing.
+  ids=$(jq -c --arg l "$live" '[.accounts[].accountUuid // empty] | map(select(. == $l)) + map(select(. != $l))' "$ACCOUNTS") || return 0
+  [ "$(jq 'length' <<< "$ids")" -ge 2 ] || return 0
+  base="$shared"; [ -s "$base" ] || base=/dev/null
+  if ! ( umask 077; jq -c --argjson ids "$ids" --slurpfile base "$base" "$PRESETS_JQ" "$f" > "$plan" ) 2>/dev/null; then
+    rm -f "$plan"; log "environments: couldn't read the app's saved environments (ccd-session-presets.json); left as they are"; return 0
+  fi
+  n=$(jq '.shared.presets | length' "$plan")
+  # Nothing saved on any account, or more than the app takes in one list (200).
+  if [ "$(jq '.shared == null' "$plan")" = true ]; then rm -f "$plan"; return 0; fi
+  if [ "$n" -gt 200 ]; then rm -f "$plan"; log "environments: $n saved environments between the accounts, more than the app keeps in one list (200); left as they are"; return 0; fi
+  if jq -e --argjson ids "$ids" --slurpfile p "$plan" --slurpfile base "$base" '. as $r | $base[0].shared == $p[0].shared and all($ids[]; . as $i | $r.byAccount[$i] == $p[0].shared and any($base[0].accounts[]?; . == $i))' "$f" >/dev/null 2>&1; then
+    rm -f "$plan"; return 0
+  fi
+  cp -p "$f" "$DIR/backups/ccd-session-presets.before-share.json"
+  while IFS=$'\t' read -r old new name; do
+    [ -n "$old" ] && [ -n "$new" ] || continue
+    files=$(grep -rlF --include='local_*.json' "$old" "$DEFAULT_DIR/claude-code-sessions/" 2>/dev/null); moved=0
+    if [ -n "$files" ]; then
+      [ -n "$b" ] || b=$(backup_dir environments)
+      while IFS= read -r s; do
+        cp -p "$s" "$b/$(basename "$s")"
+        sed -i '' "s/$old/$new/g" "$s" && moved=$((moved+1))
+      done <<< "$files"
+    fi
+    log "environments: two accounts each had \"$name\" for the same place; kept one, and pointed $moved session(s) started from the other at it${b:+ (their records as they were are in ${b#$DIR/})}"
+  done < <(jq -r '.moved | to_entries[] | [.key, .value.to, .value.name] | @tsv' "$plan")
+  if jq_write "$f" --argjson ids "$ids" --slurpfile p "$plan" 'reduce $ids[] as $i (.; .byAccount[$i] = $p[0].shared)' \
+     && ( umask 077; jq --argjson ids "$ids" '{shared, accounts: $ids}' "$plan" > "$shared.tmp.$$" ) && mv -f "$shared.tmp.$$" "$shared"; then
+    log "environments: every account has the same $n saved environment(s)"
+  fi
+  rm -f "$plan" "$shared.tmp.$$"
 }
 
 # A one-off settings fix ($DIR/prefs-patch.json), merged in the next time Claude is closed.
