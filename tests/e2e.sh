@@ -13,7 +13,7 @@ B=bbbbbbbb-0000-4000-8000-000000000002; OB=bbbbbbbb-0000-4000-8000-0000000000b2
 C=cccccccc-0000-4000-8000-000000000003; OC=cccccccc-0000-4000-8000-0000000000c3
 passed=0; failed=0
 
-cleanup() { pkill -f "$APPDIR/Contents/MacOS/Claude" 2>/dev/null; [ -n "${E2E_KEEP:-}" ] && { echo "kept $T"; return; }; rm -rf "$T"; }
+cleanup() { pkill -f "$APPDIR/Contents/MacOS/Claude" 2>/dev/null; [ -n "${ENGINE:-}" ] && kill "$ENGINE" 2>/dev/null; [ -n "${E2E_KEEP:-}" ] && { echo "kept $T"; return; }; rm -rf "$T"; }
 trap cleanup EXIT
 
 # ---- The stand-in world ----
@@ -28,6 +28,12 @@ export HOME="$H" ACCOUNT_SWITCHER_APP="$APPDIR" ACCOUNT_SWITCHER_FAST=1
 unset ACCOUNT_SWITCHER_JOB   # set in a session the relay reopened; here jobs go through the stand-in launchd
 export PATH="$H/.local/bin:$PATH"
 relay() { "$REPO/relay.sh" "$@"; }
+
+# The mod in Claude Code's own engine takes a couple of minutes and shares nothing with the
+# stand-in world (its own copy of the mod, the real home), so it runs beside the rest from the
+# start; its section below waits for it and checks what it said.
+mkdir -p "$T/enginekit"; cp -R "$REPO/mod/." "$T/enginekit/"; cp "$REPO/tests/host/mod.test.ts" "$REPO/tests/host/sequences.test.ts" "$REPO/tests/host/two-sessions.test.ts" "$T/enginekit/hooks/"
+HOME="$REAL_HOME" "$REAL_CLAUDE" plugin test "$T/enginekit" > "$T/modkit.out" 2>&1 & ENGINE=$!
 
 # A claude.ai sign-in for account $2 in Cookies file $1 (good for 20 days).
 cookies() {
@@ -758,8 +764,7 @@ section "the mod in Claude Code's own engine (claude plugin test)"
 # carries, what a hook must return. tests/host/mod.test.ts stands in for the host's services.
 # tests/host/sequences.test.ts runs every order of up to 4 of a session's events, and checks that
 # this covers any length.
-mkdir -p "$T/modkit"; cp -R "$REPO/mod/." "$T/modkit/"; cp "$REPO/tests/host/mod.test.ts" "$REPO/tests/host/sequences.test.ts" "$REPO/tests/host/two-sessions.test.ts" "$T/modkit/hooks/"
-HOME="$REAL_HOME" "$REAL_CLAUDE" plugin test "$T/modkit" > "$T/modkit.out" 2>&1
+wait "$ENGINE"
 for t in "a turn marks its session busy, and its end clears it" "a limit lists the session and the ones mid-turn, then starts the switch" "a reopened session is told why, once"; do
   check "engine: $t" grep -qF "(pass) $t" "$T/modkit.out"
 done
@@ -768,7 +773,7 @@ check "engine: every state they reach is reached within 3 events and took every 
 check "engine: every interleaving of two sessions' events holds to the model" test "$(grep -c '^(pass) two sessions [PCRLW]' "$T/modkit.out")" -ge 7500
 check "engine: and every state they reach took every event, so any length is covered" grep -qF "(pass) two sessions: every state reached, with every event, covers any length" "$T/modkit.out"
 check "engine: nothing failed" sh -c "! grep -q '^(fail)' '$T/modkit.out'"
-mv "$T/modkit/hooks/sequences.test.ts" "$T/modkit/hooks/two-sessions.test.ts" "$T/"   # the session below needs only the mod
+mkdir -p "$T/modkit"; cp -R "$REPO/mod/." "$T/modkit/"   # the session below needs only the mod
 
 section "a real Claude Code session hits a usage limit (against a stand-in API)"
 # The real claude, with the mod, started as the app starts a session on bob: with a token the

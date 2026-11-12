@@ -71,7 +71,11 @@ notify() {
 }
 die() { log "ERROR $*"; notify "$*"; echo "$*" >&2; exit 1; }
 # Fixed waits (letting a turn finish, letting the app load). ACCOUNT_SWITCHER_FAST shortens them for tests.
-pause() { if [ -n "${ACCOUNT_SWITCHER_FAST:-}" ]; then sleep 1; else sleep "$1"; fi; }
+# A fixed wait, and a wait between two looks at something; both are short for the tests
+# (ACCOUNT_SWITCHER_FAST), where the stand-in app answers at once. Loops that look again keep
+# their limit in seconds of the clock (SECONDS), so a shorter look changes no timeout.
+pause() { if [ -n "${ACCOUNT_SWITCHER_FAST:-}" ]; then sleep 0.2; else sleep "$1"; fi; }
+poll() { if [ -n "${ACCOUNT_SWITCHER_FAST:-}" ]; then sleep 0.1; else sleep "$1"; fi; }
 # run_for <seconds> <command...>: run it, killing it if it's still going after <seconds>.
 run_for() {
   local secs="$1" pid dog rc; shift
@@ -189,7 +193,7 @@ lock_take() {
   echo $$ > "$LOCK/pid"; echo "$1" > "$LOCK/what"; HAVE_LOCK=1
 }
 # Wait up to $2 seconds for the lock (the keep-alive holds it for a minute or so per account).
-lock_wait() { local n=0; until lock_take "$1"; do [ $n -ge "$2" ] && return 1; sleep 2; n=$((n+2)); done; }
+lock_wait() { local end=$((SECONDS + $2)); until lock_take "$1"; do [ $SECONDS -ge $end ] && return 1; poll 2; done; }
 lock_release() { [ -n "$HAVE_LOCK" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"; HAVE_LOCK=""; }
 # The commands that close Claude never run over each other.
 lock_or_die() { lock_take "$1" || die "$1: a switch or sign-in is running; try again when it's done"; }
@@ -217,7 +221,7 @@ folder_of() {
 instance_pid() { local pid; for pid in $(all_instances); do [ "$(folder_of "$pid")" = "$1" ] && { echo "$pid"; return; }; done; }
 default_pids() { local pid; for pid in $(all_instances); do [ "$(folder_of "$pid")" = "$DEFAULT_DIR" ] && echo "$pid"; done; }
 
-wait_gone() { local pid="$1" n=0; while kill -0 "$pid" 2>/dev/null && [ $n -lt "$2" ]; do sleep 1; n=$((n+1)); done; ! kill -0 "$pid" 2>/dev/null; }
+wait_gone() { local pid="$1" end=$((SECONDS + $2)); while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $end ]; do poll 1; done; ! kill -0 "$pid" 2>/dev/null; }
 quit_pid() { kill -TERM "$1"; wait_gone "$1" 20 || kill -KILL "$1"; }
 
 quit_default() {
@@ -261,11 +265,11 @@ update_waiting() {
   [ -n "$b" ] && [ -d "$b" ]
 }
 let_update_install() {
-  local before="$1" n=0
+  local before="$1" end=$((SECONDS + 182))
   shipit_running || update_waiting || return 0
   log "update: Claude $before closed with an update waiting; letting it install before reopening"
-  sleep 2
-  while shipit_running && [ $n -lt 180 ]; do sleep 2; n=$((n+2)); done
+  pause 2
+  while shipit_running && [ $SECONDS -lt $end ]; do poll 2; done
   local after; after=$(app_version)
   if [ "$after" != "$before" ]; then log "update: Claude $before -> $after installed while closed"; notify "Claude updated to $after."
   elif shipit_running; then log "update: ShipIt still running after 3 minutes; opening Claude $before anyway"
@@ -467,11 +471,11 @@ refresh_parked() {
   UNDO=put_back_keepalive
   for f in Cookies Cookies-journal; do [ -e "$PARK/$id/$f" ] && mv -f "$PARK/$id/$f" "$KEEP/$f"; done
   open -g -n -a "$APP" --args "--user-data-dir=$KEEP"
-  local n=0 pid=""
-  while [ $n -lt 90 ]; do
+  local end=$((SECONDS + 90)) pid=""
+  while [ $SECONDS -lt $end ]; do
     pid=$(instance_pid "$KEEP")
     [ -n "$pid" ] && [ "$(folder_account "$KEEP")" = "$id" ] && break
-    sleep 2; n=$((n+2))
+    poll 2
   done
   if [ "$(folder_account "$KEEP")" = "$id" ]; then pause 20; else log "keepalive: $(account_field "$id" name)'s sign-in did not load in the background instance"; fi
   pid=$(instance_pid "$KEEP"); [ -n "$pid" ] && quit_pid "$pid"
@@ -1331,8 +1335,8 @@ swap_to() {
   forget_rc_links
   open_app
   # 45 seconds for the new sign-in to come up (ACCOUNT_SWITCHER_FAST: 10, for the tests).
-  local n=0 max=45; [ -n "${ACCOUNT_SWITCHER_FAST:-}" ] && max=10
-  while [ "$(folder_account "$DEFAULT_DIR")" != "$target" ] && [ $n -lt $max ]; do sleep 1; n=$((n+1)); done
+  local max=45; [ -n "${ACCOUNT_SWITCHER_FAST:-}" ] && max=10; local end=$((SECONDS + max))
+  while [ "$(folder_account "$DEFAULT_DIR")" != "$target" ] && [ $SECONDS -lt $end ]; do poll 1; done
   if [ "$(folder_account "$DEFAULT_DIR")" = "$target" ]; then
     rm -f "$SWAPPING"; UNDO=""
     log "swap: $(account_field "$cur" name) -> $(account_field "$target" name)"
@@ -1381,7 +1385,7 @@ reopen_handoff() {
         and $closed + 1 >= (.at | epoch) and $now - $closed < 900) | .sessionId')
   # $1: seconds to let the app load first, when there's anything to reopen.
   [ -n "$ids" ] && [ -n "${1:-}" ] && pause "$1"
-  for id in $ids; do send_link "claude://resume?session=$id" && log "switch: reopened session $id"; sleep 3; done
+  for id in $ids; do send_link "claude://resume?session=$id" && log "switch: reopened session $id"; pause 3; done
   printf '%s' "$ids" | grep -c .
 }
 
@@ -1826,7 +1830,7 @@ cmd_signin() {
   # Signing in to another account already set up instead of <name> counts too: it's kept
   # under its own name, rather than thrown away after the wait.
   signed_in() { now=$(folder_account "$DEFAULT_DIR"); if [ -n "$id" ]; then [ "$now" = "$id" ] || { [ "$now" != "$cur" ] && [ -n "$(account_field "$now" name)" ]; }; else [ -n "$now" ] && [ "$now" != "$cur" ]; fi; }
-  while ! signed_in && [ $n -lt 600 ]; do sleep 2; n=$((n+2)); done
+  local end=$((SECONDS + 600)); while ! signed_in && [ $SECONDS -lt $end ]; do poll 2; done
   local new=""
   if signed_in; then
     new="$now"
@@ -1835,7 +1839,7 @@ cmd_signin() {
       notify "That was $(account_field "$new" name), not ${name}. Kept it as $(account_field "$new" name)."
     else log "signin: ${name} signed in"; fi
     # The app makes the account's session folder, which names its org, once the Code tab loads.
-    n=0; while [ -z "$(new_org "$new")" ] && [ $n -lt 30 ]; do sleep 2; n=$((n+2)); done
+    end=$((SECONDS + 30)); while [ -z "$(new_org "$new")" ] && [ $SECONDS -lt $end ]; do poll 2; done
     pause 8
   else log "signin: no sign-in to ${name} within 10 minutes"; fi
   quit_default
